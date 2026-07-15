@@ -16,6 +16,8 @@ class DatabaseGui : public QObject
 public:
     explicit DatabaseGui(QObject *parent = nullptr);
     
+    QString getTestName() const;
+    
 private:
     DatabaseSqlite *database_sqlite = nullptr;
     

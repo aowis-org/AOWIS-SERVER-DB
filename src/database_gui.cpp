@@ -21,7 +21,8 @@ void DatabaseGui::databaseOpened()
     
     if (!query.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS test ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT"
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "name TEXT NOT NULL DEFAULT 'test'"
             ")"))
     )
     {
@@ -34,4 +35,18 @@ void DatabaseGui::databaseOpened()
     
 }
 
-
+QString DatabaseGui::getTestName() const
+{
+    QSqlQuery query(this->database_sqlite->database());
+    
+    if (!query.exec(QStringLiteral("SELECT name FROM test LIMIT 1")))
+    {
+        qCritical() << "DATABASE ERROR:" << query.lastError().text();
+        return {};
+    }
+    
+    if (!query.next())
+        return {};
+    
+    return query.value(QStringLiteral("name")).toString();
+}
