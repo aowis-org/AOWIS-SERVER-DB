@@ -23,16 +23,19 @@ void DatabaseGui::databaseOpened()
             "CREATE TABLE IF NOT EXISTS test ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
             "name TEXT NOT NULL DEFAULT 'test'"
-            ")"))
-    )
+            ")")))
     {
-        qCritical() << query.lastError().text();
+        qCritical() << "DATABASE ERROR:" << query.lastError().text();
         return;
     }
     
     if (!query.exec(QStringLiteral("INSERT INTO test DEFAULT VALUES")))
-        qCritical() << query.lastError().text();
+    {
+        qCritical() << "DATABASE ERROR:" << query.lastError().text();
+        return;
+    }
     
+    emit signalReady();
 }
 
 QString DatabaseGui::getTestName() const

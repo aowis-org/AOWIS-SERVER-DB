@@ -25,6 +25,7 @@ private slots:
     void databaseOpened();
     
 signals:
+    void signalReady();
 };
 
 #endif // DATABASE_GUI_H
