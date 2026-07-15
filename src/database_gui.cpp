@@ -33,3 +33,5 @@ void DatabaseGui::databaseOpened()
         qCritical() << query.lastError().text();
     
 }
+
+
