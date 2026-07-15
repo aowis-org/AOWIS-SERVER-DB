@@ -19,6 +19,7 @@ set(AOWIS_SERVER_DB_COMMON_SOURCES
 qt_add_library(AOWIS-SERVER-DB-GUI STATIC
     ${AOWIS_SERVER_DB_COMMON_SOURCES}
     src/database_gui.cpp
+    src/database_gui.h
 )
 
 target_include_directories(AOWIS-SERVER-DB-GUI
