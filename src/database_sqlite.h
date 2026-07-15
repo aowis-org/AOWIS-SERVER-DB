@@ -8,7 +8,7 @@
 #include <QString>
 
 #ifdef Q_OS_WASM
-extern "C" void aowisDatabaseStorageReady(void *databaseGui, int success);
+extern "C" void aowisDatabaseStorageReady(void *databaseSqlite, int success);
 #endif
 
 class DatabaseSqlite final : public QObject
@@ -32,7 +32,7 @@ private:
     void openSqlite();
 
 #ifdef Q_OS_WASM
-    friend void aowisDatabaseStorageReady(void *databaseGui, int success);
+    friend void aowisDatabaseStorageReady(void *databaseSqlite, int success);
 #endif
     
     DatabaseConfiguration configuration;

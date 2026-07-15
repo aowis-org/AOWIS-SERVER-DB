@@ -20,6 +20,12 @@ qt_add_library(AOWIS-SERVER-DB-GUI STATIC
     ${AOWIS_SERVER_DB_COMMON_SOURCES}
     src/database_sqlite.cpp
     src/database_sqlite.h
+    src/database_gui.h src/database_gui.cpp
+)
+
+qt_add_library(AOWIS-SERVER-DB-API STATIC
+    ${AOWIS_SERVER_DB_COMMON_SOURCES}
+    src/database_api.h src/database_api.cpp
 )
 
 target_include_directories(AOWIS-SERVER-DB-GUI
@@ -33,6 +39,14 @@ target_link_libraries(AOWIS-SERVER-DB-GUI
         Qt6::Sql
 )
 
+if(EMSCRIPTEN)
+    target_link_options(AOWIS-SERVER-DB-GUI
+        INTERFACE
+            "-sFORCE_FILESYSTEM=1"
+            "-lidbfs.js"
+    )
+endif()
+
 target_compile_features(AOWIS-SERVER-DB-GUI PUBLIC cxx_std_17)
 
 target_compile_definitions(AOWIS-SERVER-DB-GUI
@@ -41,11 +55,6 @@ target_compile_definitions(AOWIS-SERVER-DB-GUI
 )
 
 add_library(AOWIS::ServerDBGUI ALIAS AOWIS-SERVER-DB-GUI)
-
-qt_add_library(AOWIS-SERVER-DB-API STATIC
-    ${AOWIS_SERVER_DB_COMMON_SOURCES}
-    src/database_api.cpp
-)
 
 target_include_directories(AOWIS-SERVER-DB-API
     PUBLIC

@@ -8,7 +8,7 @@
 #ifdef Q_OS_WASM
 #include <emscripten.h>
 
-EM_JS(void, initializePersistentStorage, (void *databaseGui), {
+EM_JS(void, initializePersistentStorage, (void *databaseSqlite), {
     if (!Module.aowisIdbfsMounted) {
         FS.mkdirTree("/aowis");
         FS.mount(IDBFS, { autoPersist: true }, "/aowis");
@@ -16,7 +16,7 @@ EM_JS(void, initializePersistentStorage, (void *databaseGui), {
     }
     
     FS.syncfs(true, function(error) {
-        Module._aowisDatabaseStorageReady(databaseGui, error ? 0 : 1);
+        Module._aowisDatabaseStorageReady(databaseSqlite, error ? 0 : 1);
     });
 });
 #endif
@@ -112,9 +112,9 @@ void DatabaseSqlite::openSqlite()
 }
 
 #ifdef Q_OS_WASM
-extern "C" EMSCRIPTEN_KEEPALIVE void aowisDatabaseStorageReady(void *databaseGui, int success)
+extern "C" EMSCRIPTEN_KEEPALIVE void aowisDatabaseStorageReady(void *databaseSqlite, int success)
 {
-    DatabaseGui *database = static_cast<DatabaseGui *>(databaseGui);
+    DatabaseSqlite *database = static_cast<DatabaseSqlite *>(databaseSqlite);
     
     if (success == 0)
     {
