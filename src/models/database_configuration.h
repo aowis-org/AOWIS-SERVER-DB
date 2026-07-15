@@ -12,11 +12,13 @@ enum class DatabaseBackend
 struct DatabaseConfiguration
 {
     DatabaseBackend backend = DatabaseBackend::SQLite;
-
-    // SQLite
+    
+    // SQLite. An empty path selects an application-specific default path.
     QString sqlite_database_path;
-
-    // PostgreSQL
+    QString sqlite_database_filename = QStringLiteral("aowis-server.sqlite3");
+    int sqlite_busy_timeout_ms = 5000;
+    
+    // PostgreSQL.
     QString postgresql_host;
     int postgresql_port = 5432;
     QString postgresql_database;
