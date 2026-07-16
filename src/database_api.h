@@ -9,7 +9,13 @@ class DatabaseApi : public QObject
 public:
     explicit DatabaseApi(QObject *parent = nullptr);
     
+    DatabaseShared *sharedDatabase() const;
+    
+private slots:
+    void databaseOpened();
+    
 signals:
+    void signalReady();
     
 };
 

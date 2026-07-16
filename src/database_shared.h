@@ -5,6 +5,9 @@
 #include <QSqlDatabase>
 #include <QString>
 
+#include <QDateTime>
+#include <QUuid>
+
 #include <optional>
 
 class DatabaseShared : public QObject
@@ -14,12 +17,14 @@ class DatabaseShared : public QObject
 public:
     explicit DatabaseShared(const QSqlDatabase &database, QObject *parent = nullptr);
     
+    bool initialize();
+    
+    QString createProject(const QString &name, const QString &description = {});
+    
     std::optional<QString> configValue(const QString &key) const;
     bool setConfigValue(const QString &key, const QString &value);
     
 private:
-    bool initTables();
-    
     QSqlDatabase database;
 };
 

@@ -2,14 +2,11 @@
 #define DATABASE_GUI_H
 
 #include <QObject>
-
-#include <QSqlError>
-#include <QSqlQuery>
-
-#include <QDebug>
+#include <QSqlDatabase>
 
 #include "database_shared.h"
 #include "database_sqlite.h"
+#include "models/database_configuration.h"
 
 class DatabaseGui : public QObject
 {
@@ -18,12 +15,12 @@ class DatabaseGui : public QObject
 public:
     explicit DatabaseGui(QObject *parent = nullptr);
     
-    QString getTestName() const;
+    void open(const DatabaseConfiguration &configuration);
+    DatabaseShared *sharedDatabase() const;
     
 private:
     DatabaseSqlite *database_sqlite = nullptr;
     DatabaseShared *database_shared = nullptr;
-    
     QSqlDatabase database;
     
 private slots:
@@ -31,6 +28,7 @@ private slots:
     
 signals:
     void signalReady();
+    void signalError(const QString &message);
 };
 
 #endif // DATABASE_GUI_H
