@@ -12,28 +12,125 @@ DatabaseShared::DatabaseShared(const QSqlDatabase &database, QObject *parent)
 bool DatabaseShared::initialize()
 {
     if (!DatabaseHelpers::execute(
-            this->database,
-            QStringLiteral(
-                "CREATE TABLE IF NOT EXISTS configs ("
-                "config_key TEXT PRIMARY KEY,"
-                "config_value TEXT NOT NULL"
-                ")"
-                ))) {
+        this->database,
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS configs ("
+            "config_key TEXT PRIMARY KEY,"
+            "config_value TEXT NOT NULL"
+            ")"
+    )))
+    {
         return false;
     }
     
     if (!DatabaseHelpers::execute(
-            this->database,
-            QStringLiteral(
-                "CREATE TABLE IF NOT EXISTS projects ("
-                "project_id TEXT NOT NULL PRIMARY KEY,"
-                "name TEXT NOT NULL,"
-                "description TEXT,"
-                "created_at BIGINT NOT NULL,"
-                "modified_at BIGINT NOT NULL,"
-                "archived_at BIGINT"
-                ")"
-                ))) {
+        this->database,
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS projects ("
+            "project_id TEXT NOT NULL PRIMARY KEY,"
+            "name TEXT NOT NULL,"
+            "description TEXT,"
+            "created_at BIGINT NOT NULL,"
+            "modified_at BIGINT NOT NULL,"
+            "archived_at BIGINT"
+            ")"
+    )))
+    {
+        return false;
+    }
+    
+    if (!DatabaseHelpers::execute(
+        this->database,
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS revisions ("
+            "revision_id TEXT NOT NULL PRIMARY KEY,"
+            "project_id TEXT NOT NULL,"
+            "parent_revision_id TEXT,"
+            "revision_number BIGINT,"
+            "state TEXT NOT NULL CHECK ("
+            "state IN ('working', 'committed')"
+            "),"
+            "title TEXT,"
+            "commit_message TEXT,"
+            "created_at BIGINT NOT NULL,"
+            "modified_at BIGINT NOT NULL,"
+            "committed_at BIGINT,"
+            "FOREIGN KEY (project_id) "
+            "REFERENCES projects(project_id) "
+            "ON DELETE CASCADE,"
+            "FOREIGN KEY (parent_revision_id) "
+            "REFERENCES revisions(revision_id) "
+            "ON DELETE RESTRICT,"
+            "CHECK ("
+            "("
+            "state = 'working' "
+            "AND revision_number IS NULL "
+            "AND committed_at IS NULL"
+            ") OR ("
+            "state = 'committed' "
+            "AND revision_number IS NOT NULL "
+            "AND committed_at IS NOT NULL"
+            ")"
+            ")"
+            ")"
+    )))
+    {
+        return false;
+    }
+    
+    if (!DatabaseHelpers::execute(
+        this->database,
+        QStringLiteral(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "revisions_one_working_per_project "
+            "ON revisions(project_id) "
+            "WHERE state = 'working'"
+    )))
+    {
+        return false;
+    }
+    
+    if (!DatabaseHelpers::execute(
+        this->database,
+        QStringLiteral(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "revisions_project_number_unique "
+            "ON revisions(project_id, revision_number) "
+            "WHERE revision_number IS NOT NULL"
+    )))
+    {
+        return false;
+    }
+    
+    if (!DatabaseHelpers::execute(
+        this->database,
+        QStringLiteral(
+            "CREATE INDEX IF NOT EXISTS "
+            "revisions_parent_revision_index "
+            "ON revisions(parent_revision_id)"
+    )))
+    {
+        return false;
+    }
+    
+    if (!DatabaseHelpers::execute(
+        this->database,
+        QStringLiteral(
+            "CREATE TABLE IF NOT EXISTS junctions ("
+            "revision_id TEXT NOT NULL,"
+            "junction_id TEXT NOT NULL,"
+            "name TEXT NOT NULL,"
+            "elevation REAL NOT NULL,"
+            "demand REAL NOT NULL,"
+            "position_x REAL NOT NULL,"
+            "position_y REAL NOT NULL,"
+            "PRIMARY KEY (revision_id, junction_id),"
+            "FOREIGN KEY (revision_id) "
+            "REFERENCES revisions(revision_id) "
+            "ON DELETE CASCADE"
+            ")"
+    )))
+    {
         return false;
     }
     
