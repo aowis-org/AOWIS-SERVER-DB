@@ -3,16 +3,18 @@
 
 #include <QObject>
 
-#include <QSqlQuery>
 #include <QSqlError>
+#include <QSqlQuery>
 
 #include <QDebug>
 
+#include "database_shared.h"
 #include "database_sqlite.h"
 
 class DatabaseGui : public QObject
 {
     Q_OBJECT
+    
 public:
     explicit DatabaseGui(QObject *parent = nullptr);
     
@@ -20,6 +22,9 @@ public:
     
 private:
     DatabaseSqlite *database_sqlite = nullptr;
+    DatabaseShared *database_shared = nullptr;
+    
+    QSqlDatabase database;
     
 private slots:
     void databaseOpened();

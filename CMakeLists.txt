@@ -12,8 +12,8 @@ qt_standard_project_setup()
 
 set(AOWIS_SERVER_DB_COMMON_SOURCES
     src/models/database_configuration.h
-    src/database.cpp
-    src/database.h
+    src/database_shared.h src/database_shared.cpp
+    src/database_helpers.h src/database_helpers.cpp
 )
 
 qt_add_library(AOWIS-SERVER-DB-GUI STATIC

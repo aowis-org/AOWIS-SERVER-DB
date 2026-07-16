@@ -10,6 +10,7 @@ public:
     explicit DatabaseApi(QObject *parent = nullptr);
     
 signals:
+    
 };
 
 #endif // DATABASE_GUI_H

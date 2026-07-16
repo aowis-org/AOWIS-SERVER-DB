@@ -5,20 +5,21 @@ DatabaseGui::DatabaseGui(QObject *parent)
     database_sqlite(new DatabaseSqlite(this))
 {
     connect(this->database_sqlite, &DatabaseSqlite::signalOpened, this, &DatabaseGui::databaseOpened);
-    connect(this->database_sqlite, &DatabaseSqlite::signalError, this, [this](const QString &message)
+    connect(this->database_sqlite, &DatabaseSqlite::signalError, this, [](const QString &message)
     {
-        QSqlQuery query(this->database_sqlite->database());
-        qCritical() << query.lastError().text();
+        qCritical() << "DATABASE ERROR:" << message;
     });
     
     DatabaseConfiguration configuration;
-    database_sqlite->open(configuration);
+    this->database_sqlite->open(configuration);
 }
 
 void DatabaseGui::databaseOpened()
 {
-    QSqlQuery query(this->database_sqlite->database());
+    this->database = this->database_sqlite->database();
+    this->database_shared = new DatabaseShared(this->database, this);
     
+    QSqlQuery query(this->database);
     if (!query.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS test ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -35,12 +36,14 @@ void DatabaseGui::databaseOpened()
         return;
     }
     
+    this->database_shared = new DatabaseShared(this->database, this);
+    
     emit signalReady();
 }
 
 QString DatabaseGui::getTestName() const
 {
-    QSqlQuery query(this->database_sqlite->database());
+    QSqlQuery query(this->database);
     
     if (!query.exec(QStringLiteral("SELECT name FROM test LIMIT 1")))
     {
