@@ -8,7 +8,11 @@
 #include <QString>
 
 #ifdef Q_OS_WASM
-extern "C" void aowisDatabaseStorageReady(void *databaseSqlite, int success);
+extern "C" void aowisDatabaseStorageReady(
+    void *databaseSqlite,
+    int success,
+    const char *databasePath
+    );
 #endif
 
 class DatabaseSqlite final : public QObject
@@ -30,13 +34,23 @@ signals:
     
 private:
     void openSqlite();
+    bool executePragma(const QString &statement);
 
 #ifdef Q_OS_WASM
-    friend void aowisDatabaseStorageReady(void *databaseSqlite, int success);
+    friend void aowisDatabaseStorageReady(
+        void *databaseSqlite,
+        int success,
+        const char *databasePath
+        );
 #endif
     
     DatabaseConfiguration configuration;
     QSqlDatabase sql_database;
+    QString connection_name;
+
+#ifdef Q_OS_WASM
+    QString wasm_database_path;
+#endif
 };
 
 #endif // DATABASE_SQLITE_H
