@@ -10,6 +10,8 @@
 
 #include <optional>
 
+#include <aowis/model/project.h>
+
 class DatabaseShared : public QObject
 {
     Q_OBJECT
@@ -19,7 +21,8 @@ public:
     
     bool initialize();
     
-    QString createProject(const QString &name, const QString &description = {});
+    QUuid createProject(const QString &name, const QString &description = {});
+    std::optional<Project> projectById(const QUuid &projectId) const;
     
     std::optional<QString> configValue(const QString &key) const;
     bool setConfigValue(const QString &key, const QString &value);

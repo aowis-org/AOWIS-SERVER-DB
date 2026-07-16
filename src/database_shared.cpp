@@ -40,9 +40,9 @@ bool DatabaseShared::initialize()
     return true;
 }
 
-QString DatabaseShared::createProject(const QString &name, const QString &description)
+QUuid DatabaseShared::createProject(const QString &name, const QString &description)
 {
-    const QString projectId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QUuid projectId = QUuid::createUuid();
     const qint64 timestamp = QDateTime::currentMSecsSinceEpoch();
     
     const bool success = DatabaseHelpers::execute(
@@ -65,7 +65,10 @@ QString DatabaseShared::createProject(const QString &name, const QString &descri
             ")"
             ),
         {
-            {QStringLiteral(":project_id"), projectId},
+            {
+                QStringLiteral(":project_id"),
+                projectId.toString(QUuid::WithoutBraces)
+            },
             {QStringLiteral(":name"), name},
             {QStringLiteral(":description"), description},
             {QStringLiteral(":created_at"), timestamp},
@@ -77,6 +80,57 @@ QString DatabaseShared::createProject(const QString &name, const QString &descri
         return {};
     
     return projectId;
+}
+
+std::optional<Project> DatabaseShared::projectById(const QUuid &projectId) const
+{
+    if (projectId.isNull())
+        return std::nullopt;
+    
+    const std::optional<QVariantMap> row = DatabaseHelpers::rowValue(
+        this->database,
+        QStringLiteral(
+            "SELECT "
+            "project_id,"
+            "name,"
+            "description,"
+            "created_at,"
+            "modified_at,"
+            "archived_at "
+            "FROM projects "
+            "WHERE project_id = :project_id"
+            ),
+        {
+            {
+                QStringLiteral(":project_id"),
+                projectId.toString(QUuid::WithoutBraces)
+            }
+        }
+    );
+    
+    if (!row.has_value())
+        return std::nullopt;
+    
+    Project project;
+    project.projectId = QUuid(row->value(QStringLiteral("project_id")).toString());
+    project.name = row->value(QStringLiteral("name")).toString();
+    project.description = row->value(QStringLiteral("description")).toString();
+    project.createdAt = QDateTime::fromMSecsSinceEpoch(row->value(QStringLiteral("created_at")).toLongLong());
+    project.modifiedAt = QDateTime::fromMSecsSinceEpoch(row->value(QStringLiteral("modified_at")).toLongLong());
+    
+    const QVariant archivedAt = row->value(QStringLiteral("archived_at"));
+    
+    if (!archivedAt.isNull())
+    {
+        project.archivedAt = QDateTime::fromMSecsSinceEpoch(
+            archivedAt.toLongLong()
+            );
+    }
+    
+    if (!project.isValid())
+        return std::nullopt;
+    
+    return project;
 }
 
 std::optional<QString> DatabaseShared::configValue(const QString &key) const

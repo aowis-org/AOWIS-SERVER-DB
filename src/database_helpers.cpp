@@ -77,3 +77,37 @@ std::optional<QString> DatabaseHelpers::stringValue(const QSqlDatabase &database
     
     return value->toString();
 }
+
+std::optional<QVariantMap> DatabaseHelpers::rowValue(
+    const QSqlDatabase &database,
+    const QString &statement,
+    const QVariantMap &bindings
+    )
+{
+    QSqlQuery query(database);
+    
+    if (!query.prepare(statement))
+    {
+        logDatabaseError(query, statement);
+        return std::nullopt;
+    }
+    
+    bindValues(query, bindings);
+    
+    if (!query.exec())
+    {
+        logDatabaseError(query, statement);
+        return std::nullopt;
+    }
+    
+    if (!query.next())
+        return std::nullopt;
+    
+    const QSqlRecord record = query.record();
+    QVariantMap values;
+    
+    for (int index = 0; index < record.count(); ++index)
+        values.insert(record.fieldName(index), query.value(index));
+    
+    return values;
+}

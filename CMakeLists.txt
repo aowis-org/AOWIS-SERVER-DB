@@ -37,6 +37,7 @@ target_link_libraries(AOWIS-SERVER-DB-GUI
     PUBLIC
         Qt6::Core
         Qt6::Sql
+        AOWIS::ServerModel
 )
 
 if(EMSCRIPTEN)

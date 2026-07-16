@@ -5,15 +5,25 @@
 #include <QString>
 #include <QVariant>
 #include <QVariantMap>
+#include <QSqlRecord>
 
 #include <optional>
+
+
 
 class DatabaseHelpers final
 {
 public:
     static bool execute(const QSqlDatabase &database, const QString &statement, const QVariantMap &bindings = {});
+    
     static std::optional<QVariant> scalarValue(const QSqlDatabase &database, const QString &statement, const QVariantMap &bindings = {});
     static std::optional<QString> stringValue(const QSqlDatabase &database, const QString &statement, const QVariantMap &bindings = {});
+    
+    static std::optional<QVariantMap> rowValue(
+        const QSqlDatabase &database,
+        const QString &statement,
+        const QVariantMap &bindings = {}
+    );
     
 private:
     DatabaseHelpers() = delete;
