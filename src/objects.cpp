@@ -181,7 +181,27 @@ bool Database::copyObjects(const QUuid &from_revision, const QUuid &to_revision,
         return false;
     query.addBindValue(uuidBytes(to_revision));
     query.addBindValue(uuidBytes(from_revision));
-    return run(query, error);
+    if (!run(query, error))
+        return false;
+    QSqlQuery members(this->database_);
+    if (!prepare(members, QStringLiteral(
+            "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
+            "SELECT ?,network_uuid,entity_uuid FROM hydraulic_network_members WHERE revision_uuid=?"), error))
+        return false;
+    members.addBindValue(uuidBytes(to_revision));
+    members.addBindValue(uuidBytes(from_revision));
+    if (!run(members, error))
+        return false;
+    QSqlQuery references(this->database_);
+    if (!prepare(references, QStringLiteral(
+            "INSERT INTO hydraulic_network_references"
+            "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "SELECT ?,network_uuid,source_uuid,target_uuid,field "
+            "FROM hydraulic_network_references WHERE revision_uuid=?"), error))
+        return false;
+    references.addBindValue(uuidBytes(to_revision));
+    references.addBindValue(uuidBytes(from_revision));
+    return run(references, error);
 }
 
 // Contains the full ordered journal (including before/after bytes) and live
@@ -249,6 +269,60 @@ std::optional<QByteArray> Database::objectManifest(const QUuid &revision_uuid, Q
     }
     appendU64(manifest, object_count);
     manifest.append(objects_bytes);
+    QSqlQuery format(this->database_);
+    if (!prepare(format, QStringLiteral(
+            "SELECT object_journal_version FROM revisions WHERE uuid=?"), error))
+        return std::nullopt;
+    format.addBindValue(uuidBytes(revision_uuid));
+    if (!run(format, error) || !format.next())
+        return std::nullopt;
+    if (format.value(0).toInt() == 1)
+        return manifest; // Byte-identical V4 manifest for old finalized hashes.
+    // V5 appends an ordered, domain-separated representation of immutable
+    // groups and their exact member-event identities.
+    QByteArray grouped("AOWIS-OBJECT-GROUPS-V1\0", 23);
+    QSqlQuery groups(this->database_);
+    if (!prepare(groups, QStringLiteral(
+            "SELECT uuid,actor_uuid,action,target_group_uuid,first_sequence,last_sequence,occurred_at_ms "
+            "FROM object_groups WHERE revision_uuid=? ORDER BY first_sequence"), error))
+        return std::nullopt;
+    groups.addBindValue(uuidBytes(revision_uuid));
+    if (!run(groups, error))
+        return std::nullopt;
+    quint64 count = 0;
+    QByteArray group_entries;
+    while (groups.next())
+    {
+        const QByteArray group_id = groups.value(0).toByteArray();
+        group_entries.append(group_id);
+        group_entries.append(groups.value(1).toByteArray());
+        appendField(group_entries, groups.value(2).toString().toUtf8());
+        group_entries.append(groups.value(3).isNull() ? QByteArray(16, '\0') : groups.value(3).toByteArray());
+        appendU64(group_entries, groups.value(4).toULongLong());
+        appendU64(group_entries, groups.value(5).toULongLong());
+        appendU64(group_entries, groups.value(6).toULongLong());
+        QSqlQuery links(this->database_);
+        if (!prepare(links, QStringLiteral(
+                "SELECT position,object_event_uuid FROM object_group_events WHERE group_uuid=? ORDER BY position"), error))
+            return std::nullopt;
+        links.addBindValue(group_id);
+        if (!run(links, error))
+            return std::nullopt;
+        QByteArray ids;
+        quint64 link_count = 0;
+        while (links.next())
+        {
+            appendU64(ids, links.value(0).toULongLong());
+            ids.append(links.value(1).toByteArray());
+            ++link_count;
+        }
+        appendU64(group_entries, link_count);
+        group_entries.append(ids);
+        ++count;
+    }
+    appendU64(grouped, count);
+    grouped.append(group_entries);
+    appendField(manifest, grouped);
     return manifest;
 }
 
@@ -351,8 +425,18 @@ bool Database::modifyObject(const OperationContext &actor, const QUuid &branch_u
 {
     if (!beginWrite(error))
         return false;
-    bool ok = modifyObjectInTransaction(actor, branch_uuid, object_uuid, kind,
-                                        bytes, expected_version, error);
+    const std::optional<BranchInfo> b = branchUnchecked(branch_uuid, error);
+    const std::optional<RevisionInfo> r = b ? revisionUnchecked(b->head_revision_uuid, error) : std::nullopt;
+    bool ok = r && !r->finalized;
+    if (!ok)
+        setError(error, QStringLiteral("Working revision not found"));
+    const qint64 before = r ? r->generation : -1;
+    if (ok)
+        ok = modifyObjectInTransaction(actor, branch_uuid, object_uuid, kind, bytes, expected_version, error);
+    if (ok)
+        ok = validateTouchedHydraulicNetworks(r->uuid, QSet<QUuid>{object_uuid}, error);
+    if (ok)
+        ok = writeObjectGroupInTransaction(*r, actor, QStringLiteral("edit"), QUuid(), before, error).has_value();
     if (ok)
         ok = commit(error);
     if (!ok)

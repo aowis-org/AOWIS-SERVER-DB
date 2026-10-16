@@ -41,10 +41,17 @@ add_library(aowis-db-core STATIC
     include/aowis/db/database.h
     include/aowis/db/identity.h
     src/identity.cpp
+    src/sessions.cpp
+    src/security_audit.cpp
+    src/security_admin.cpp
+    src/security_catalog.cpp
     src/history.cpp
     src/objects.cpp
+    src/object_groups.cpp
     src/model_codec.cpp
     src/model_persistence.cpp
+    src/model_validation.cpp
+    include/aowis/db/model_validation.h
     include/aowis/db/model_codec.h
     include/aowis/db/model_persistence.h
     src/database.cpp
@@ -59,21 +66,78 @@ target_include_directories(aowis-db-core PUBLIC
 target_link_libraries(aowis-db-core PUBLIC Qt6::Core Qt6::Sql AOWIS::Model)
 set_target_properties(aowis-db-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Trusted local database operator CLI. No network dependency.
+add_executable(aowis-db-admin src/db_admin_main.cpp)
+target_link_libraries(aowis-db-admin PRIVATE aowis-db-core)
+
+# The embedded core remains usable without Qt HttpServer/Qt Network.
+# The HTTP library is optional because many headless/embedded builds install
+# only Qt Core and SQL. No HTTP port is opened unless the executable is run.
+option(AOWIS_DB_BUILD_HTTP "Build optional REST transport and local development server" ON)
+if(AOWIS_DB_BUILD_HTTP)
+    find_package(Qt6 QUIET COMPONENTS Network HttpServer)
+    if(TARGET Qt6::Network AND TARGET Qt6::HttpServer)
+        add_library(aowis-db-http STATIC
+            include/aowis/db/http_routes.h
+            src/http_routes.cpp
+        )
+        add_library(AOWIS::DBHttp ALIAS aowis-db-http)
+        target_compile_features(aowis-db-http PUBLIC cxx_std_20)
+        target_include_directories(aowis-db-http PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+        )
+        target_link_libraries(aowis-db-http PUBLIC aowis-db-core Qt6::HttpServer Qt6::Network)
+        add_executable(aowis-db-server src/http_server_main.cpp)
+        target_link_libraries(aowis-db-server PRIVATE aowis-db-http)
+        message(STATUS "AOWIS optional HTTP server enabled")
+    else()
+        message(STATUS "AOWIS HTTP server not built (Qt6 HttpServer/Network unavailable)")
+    endif()
+endif()
+
 if(BUILD_TESTING)
-    add_executable(aowis-db-sqlite-tests tests/sqlite_test.cpp)
-    target_link_libraries(aowis-db-sqlite-tests PRIVATE aowis-db-core)
-    add_test(NAME aowis-db-sqlite COMMAND aowis-db-sqlite-tests)
-    add_executable(aowis-db-migration-tests tests/sqlite_migration_test.cpp)
-    target_link_libraries(aowis-db-migration-tests PRIVATE aowis-db-core)
-    add_test(NAME aowis-db-migration COMMAND aowis-db-migration-tests)
-    add_executable(aowis-db-history-tests tests/history_test.cpp)
-    target_link_libraries(aowis-db-history-tests PRIVATE aowis-db-core)
-    add_test(NAME aowis-db-history COMMAND aowis-db-history-tests)
-    add_executable(aowis-db-objects-tests tests/objects_test.cpp)
-    target_link_libraries(aowis-db-objects-tests PRIVATE aowis-db-core)
-    add_test(NAME aowis-db-objects COMMAND aowis-db-objects-tests)
-    add_executable(aowis-db-model-tests tests/model_persistence_test.cpp)
-    target_link_libraries(aowis-db-model-tests PRIVATE aowis-db-core)
-    add_test(NAME aowis-db-model COMMAND aowis-db-model-tests)
-    set_tests_properties(aowis-db-sqlite aowis-db-migration aowis-db-history aowis-db-objects aowis-db-model PROPERTIES LABELS "aowis;database")
+    # Register each DB test in one place: the aggregate build target automatically
+    # includes new tests, so CTest never finds an executable the script omitted.
+    function(aowis_add_db_test target test_name source_file)
+        add_executable(${target} ${source_file})
+        target_link_libraries(${target} PRIVATE aowis-db-core)
+        add_test(NAME ${test_name} COMMAND ${target})
+        set_tests_properties(${test_name} PROPERTIES LABELS "aowis;database")
+        set_property(GLOBAL APPEND PROPERTY AOWIS_DB_TEST_EXECUTABLES ${target})
+    endfunction()
+
+    aowis_add_db_test(aowis-db-sqlite-tests aowis-db-sqlite tests/sqlite_test.cpp)
+    aowis_add_db_test(aowis-db-migration-tests aowis-db-migration tests/sqlite_migration_test.cpp)
+    aowis_add_db_test(aowis-db-history-tests aowis-db-history tests/history_test.cpp)
+    aowis_add_db_test(aowis-db-objects-tests aowis-db-objects tests/objects_test.cpp)
+    aowis_add_db_test(aowis-db-model-tests aowis-db-model tests/model_persistence_test.cpp)
+    aowis_add_db_test(aowis-db-object-groups-tests aowis-db-object-groups tests/object_groups_test.cpp)
+    aowis_add_db_test(aowis-db-model-validation-tests aowis-db-model-validation tests/model_validation_test.cpp)
+    aowis_add_db_test(aowis-db-model-object-guard-tests aowis-db-model-object-guard tests/model_object_guard_test.cpp)
+    aowis_add_db_test(aowis-db-model-membership-tests aowis-db-model-membership tests/model_membership_index_test.cpp)
+    aowis_add_db_test(aowis-db-model-references-tests aowis-db-model-references tests/model_reference_index_test.cpp)
+    aowis_add_db_test(aowis-db-model-save-indexed-tests aowis-db-model-save-indexed tests/model_save_indexed_test.cpp)
+    aowis_add_db_test(aowis-db-model-reference-deltas-tests aowis-db-model-reference-deltas tests/model_reference_delta_test.cpp)
+    aowis_add_db_test(aowis-db-model-incremental-groups-tests aowis-db-model-incremental-groups tests/model_incremental_groups_test.cpp)
+    aowis_add_db_test(aowis-db-model-local-structure-tests aowis-db-model-local-structure tests/model_local_structure_test.cpp)
+    aowis_add_db_test(aowis-db-model-local-links-tests aowis-db-model-local-links tests/model_local_links_test.cpp)
+    aowis_add_db_test(aowis-db-model-local-resources-tests aowis-db-model-local-resources tests/model_local_resources_test.cpp)
+    aowis_add_db_test(aowis-db-sessions-tests aowis-db-sessions tests/sessions_test.cpp)
+    aowis_add_db_test(aowis-db-security-audit-tests aowis-db-security-audit tests/security_audit_test.cpp)
+    aowis_add_db_test(aowis-db-security-admin-tests aowis-db-security-admin tests/security_admin_test.cpp)
+    aowis_add_db_test(aowis-db-security-catalog-tests aowis-db-security-catalog tests/security_catalog_test.cpp)
+    if(TARGET aowis-db-http)
+        aowis_add_db_test(aowis-db-http-tests aowis-db-http tests/http_test.cpp)
+        target_link_libraries(aowis-db-http-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-mutations-tests aowis-db-http-mutations tests/http_mutations_test.cpp)
+        target_link_libraries(aowis-db-http-mutations-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-sessions-tests aowis-db-http-sessions tests/http_sessions_test.cpp)
+        target_link_libraries(aowis-db-http-sessions-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-security-catalog-tests aowis-db-http-security-catalog tests/http_security_catalog_test.cpp)
+        target_link_libraries(aowis-db-http-security-catalog-tests PRIVATE aowis-db-http)
+    endif()
+
+    get_property(aowis_db_test_executables GLOBAL PROPERTY AOWIS_DB_TEST_EXECUTABLES)
+    add_custom_target(aowis-db-tests DEPENDS ${aowis_db_test_executables})
 endif()

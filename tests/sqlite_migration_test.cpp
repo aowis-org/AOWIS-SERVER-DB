@@ -136,7 +136,8 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::UserInfo> root_user = db.bootstrapAdministrator(QStringLiteral("operator"), &error);
     REQUIRE(root_user.has_value());
     const OperationContext root{root_user->uuid};
-    // This path upgrades V1 all the way to the current V4 object/history schema.
+    // This fixture starts at V1. Its final schema version must match V10,
+    // including the audit journal (rather than stopping at the old V8).
     {
         QSqlDatabase inspection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
                                                              QStringLiteral("schema-inspection"));
@@ -144,8 +145,14 @@ int main(int argc, char **argv)
         REQUIRE(inspection.open());
         QSqlQuery pragma(inspection);
         REQUIRE(pragma.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(pragma.next() && pragma.value(0).toInt() == 4);
+        REQUIRE(pragma.next() && pragma.value(0).toInt() == 10);
         pragma.finish();
+        QSqlQuery audit_table(inspection);
+        REQUIRE(audit_table.exec(QStringLiteral(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name='security_audit_events'")));
+        REQUIRE(audit_table.next() && audit_table.value(0).toInt() == 1);
+        audit_table.finish();
         inspection.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("schema-inspection"));

@@ -5,9 +5,11 @@
 #include <aowis/model/hydraulic/network_hydraulic.h>
 
 #include <optional>
+#include <functional>
 
 #include <QByteArray>
 #include <QSqlDatabase>
+#include <QSet>
 #include <QString>
 #include <QUuid>
 #include <QVector>
@@ -15,6 +17,37 @@
 
 namespace aowis::db
 {
+
+// Bearer token is returned exactly once and never stored in plaintext.
+struct IssuedSession
+{
+    QUuid uuid;
+    QUuid user_uuid;
+    QByteArray bearer_token; // 64 lowercase hexadecimal characters (256 bits)
+    qint64 expires_at_ms = 0;
+};
+
+// An append-only administration event. The hash includes the previous event
+// hash, so audit history is verified independently of project revisions.
+struct SecurityAuditEvent
+{
+    QUuid uuid;
+    QUuid actor_uuid;
+    QUuid subject_uuid;
+    QString action;
+    qint64 sequence = 0;
+    qint64 occurred_at_ms = 0;
+    QByteArray previous_sha256;
+    QByteArray chain_sha256;
+};
+
+struct SecurityAuditReport
+{
+    bool valid = false;
+    qint64 checked_events = 0;
+    qint64 failed_sequence = 0;
+    QString error;
+};
 
 struct ProjectInfo
 {
@@ -104,6 +137,30 @@ struct ObjectChange
     qint64 after_version = 0;
 };
 
+// A batch is one user-visible action. Edits are applied in vector order, all
+// within a single SQLite transaction; all expected versions must match.
+// For deletion, set content to std::nullopt (kind may be empty).
+struct ObjectEdit
+{
+    QUuid object_uuid;
+    QString kind;
+    std::optional<QByteArray> content;
+    qint64 expected_version = -1;
+};
+
+struct ObjectGroup
+{
+    QUuid uuid;
+    QUuid revision_uuid;
+    QUuid actor_uuid;
+    QUuid target_group_uuid; // For undo/redo; null for forward edits.
+    QString action; // edit / undo / redo
+    qint64 first_sequence = 0;
+    qint64 last_sequence = 0;
+    qint64 occurred_at_ms = 0;
+    QVector<QUuid> object_event_uuids;
+};
+
 struct IntegrityReport
 {
     bool valid = false;
@@ -134,6 +191,56 @@ public:
     // this method. Refuses any subsequent call, even by an administrator.
     std::optional<UserInfo> bootstrapAdministrator(const QString &username, QString *error = nullptr);
 
+    // Session issuance/revocation are restricted to system administrators.
+    // No HTTP route exposes these operations. A trusted local host can
+    // provision the first credentials after administrator bootstrap.
+    std::optional<IssuedSession> issueSession(const OperationContext &admin,
+        const QUuid &user_uuid, qint64 lifetime_seconds, QString *error = nullptr);
+    bool revokeSession(const OperationContext &admin, const QUuid &session_uuid,
+        QString *error = nullptr);
+    bool disableUser(const OperationContext &admin, const QUuid &user_uuid,
+        QString *error = nullptr);
+    bool enableUser(const OperationContext &admin, const QUuid &user_uuid,
+        QString *error = nullptr);
+    bool removeGroupMember(const OperationContext &admin, const QUuid &membership_uuid,
+        QString *error = nullptr);
+    bool revokeRolePermission(const OperationContext &admin, const QUuid &grant_uuid,
+        QString *error = nullptr);
+    bool revokeRoleAssignment(const OperationContext &admin, const QUuid &assignment_uuid,
+        QString *error = nullptr);
+    // Bearer tokens are credentials; resolve to a context, never trust an
+    // HTTP-supplied user UUID. Do not return error details to remote clients.
+    std::optional<OperationContext> authenticateSession(const QByteArray &bearer_token,
+        QString *error = nullptr) const;
+
+    // Requires security.audit.read at system scope. Pagination is by durable
+    // sequence (exclusive lower bound), not by mutable offsets.
+    QVector<SecurityAuditEvent> securityAudit(const OperationContext &actor,
+        qint64 after_sequence, int limit, QString *error = nullptr) const;
+    SecurityAuditReport verifySecurityAudit(const OperationContext &actor) const;
+
+    // Administrative catalog: stable UUID keyset pages, sorted by UUID.
+    // Empty results are valid; use error to distinguish them from failures.
+    // All require the system-level security.manage permission. Only active
+    // memberships/grants are shown unless include_inactive is requested.
+    QVector<UserInfo> securityUsers(const OperationContext &actor,
+        const SecurityListOptions &options = {}, QString *error = nullptr) const;
+    QVector<GroupInfo> securityGroups(const OperationContext &actor,
+        const SecurityListOptions &options = {}, QString *error = nullptr) const;
+    QVector<RoleInfo> securityRoles(const OperationContext &actor,
+        const SecurityListOptions &options = {}, QString *error = nullptr) const;
+    QVector<PermissionInfo> securityPermissions(const OperationContext &actor,
+        const SecurityListOptions &options = {}, QString *error = nullptr) const;
+    QVector<GroupMembershipInfo> securityGroupMembers(const OperationContext &actor,
+        const QUuid &group_uuid, const SecurityListOptions &options = {},
+        QString *error = nullptr) const;
+    QVector<RolePermissionGrantInfo> securityRolePermissions(const OperationContext &actor,
+        const QUuid &role_uuid, const SecurityListOptions &options = {},
+        QString *error = nullptr) const;
+    QVector<RoleAssignmentInfo> securityRoleAssignments(const OperationContext &actor,
+        PrincipalKind kind, const QUuid &principal_uuid,
+        const SecurityListOptions &options = {}, QString *error = nullptr) const;
+
     std::optional<UserInfo> createUser(const OperationContext &actor, const QString &username, QString *error = nullptr);
     std::optional<GroupInfo> createGroup(const OperationContext &actor, const QString &name, QString *error = nullptr);
     std::optional<RoleInfo> createRole(const OperationContext &actor, const QString &key, QString *error = nullptr);
@@ -158,8 +265,8 @@ public:
     std::optional<BranchInfo> branch(const OperationContext &actor, const QUuid &branch_uuid, QString *error = nullptr) const;
     std::optional<RevisionInfo> revision(const OperationContext &actor, const QUuid &revision_uuid, QString *error = nullptr) const;
 
-    // Temporary opaque canonical-snapshot boundary. Model serialization and
-    // operation-history logging are separate forthcoming work.
+    // Legacy opaque whole-snapshot path; object-mode revisions use typed
+    // persistence and the separate grouped object journal.
     bool replaceWorkingSnapshot(const OperationContext &actor, const QUuid &branch_uuid,
                                 qint64 expected_generation, const QByteArray &canonical_snapshot,
                                 QString *error = nullptr);
@@ -180,8 +287,8 @@ public:
                               const QUuid &revision_uuid, const QUuid &network_uuid,
                               QString *error = nullptr) const;
 
-    // Initial object-level persistence. Objects use externally supplied canonical
-    // bytes; full AOWIS Model serialization is still a separate step.
+    // Low-level object persistence accepts canonical bytes. Typed AOWIS Model
+    // codecs and grouped object history are provided in this library.
     // expected_version=-1 means the UUID must not have been used in this revision.
     // Object mutations are serialized by SQLite, but do not require the caller
     // to supply the branch-wide revision generation.
@@ -194,6 +301,20 @@ public:
                    qint64 expected_version, QString *error = nullptr);
     bool deleteObject(const OperationContext &actor, const QUuid &branch_uuid,
                       const QUuid &object_uuid, qint64 expected_version, QString *error = nullptr);
+    // Full atomic batch with branch-generation CAS. Returns the durable
+    // action UUID. New edits after undo invalidate the redo stack.
+    std::optional<QUuid> commitObjectGroup(const OperationContext &actor,
+                             const QUuid &branch_uuid, qint64 expected_generation,
+                             const QVector<ObjectEdit> &edits, QString *error = nullptr);
+    QVector<ObjectGroup> objectGroupsForRevision(const OperationContext &actor,
+                             const QUuid &revision_uuid, QString *error = nullptr) const;
+    std::optional<QUuid> undoObjectGroup(const OperationContext &actor,
+                             const QUuid &branch_uuid, qint64 expected_generation,
+                             QString *error = nullptr);
+    std::optional<QUuid> redoObjectGroup(const OperationContext &actor,
+                             const QUuid &branch_uuid, qint64 expected_generation,
+                             QString *error = nullptr);
+
     QVector<ObjectChange> objectHistoryForRevision(const OperationContext &actor,
                          const QUuid &revision_uuid, QString *error = nullptr) const;
 
@@ -219,11 +340,42 @@ private:
     bool migrateSecurityV2(QString *error);
     bool migrateHistoryV3(QString *error);
     bool migrateObjectsV4(QString *error);
+    bool migrateObjectGroupsV5(QString *error);
+    bool migrateHydraulicMembershipV6(QString *error);
+    bool migrateHydraulicReferencesV7(QString *error);
+    bool migrateSessionsV8(QString *error);
+    bool migrateSecurityAuditV9(QString *error);
+    bool migrateSecurityAdminV10(QString *error);
+    bool writeSecurityAuditEvent(const QUuid &actor_uuid, const QString &action,
+                                 const QUuid &subject_uuid, QString *error);
+    bool auditedSecurityMutation(const QUuid &actor_uuid, const QString &action,
+                                 const QUuid &subject_uuid, const std::function<bool()> &mutation,
+                                 QString *error);
+    std::optional<QUuid> compensateObjectGroup(const OperationContext &actor,
+                      const QUuid &branch_uuid, qint64 expected_generation, bool redo,
+                      QString *error);
     // The manifest includes the exact object-change journal digest, so it is
     // covered by the existing V2 finalized SHA-256 revision chain.
+    // Internal reads do not require project.read: an actor authorized to edit
+    // must still have their resulting hydraulic graph validated atomically.
+    std::optional<NetworkHydraulic> loadHydraulicNetworkUnchecked(
+        const QUuid &revision_uuid, const QUuid &network_uuid, QString *error) const;
+    bool validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
+                                          const QSet<QUuid> &touched_uuids,
+                                          QString *error) const;
     std::optional<QByteArray> objectManifest(const QUuid &revision_uuid, QString *error) const;
     std::optional<int> objectMode(const QUuid &revision_uuid, QString *error) const;
     bool copyObjects(const QUuid &from_revision, const QUuid &to_revision, QString *error);
+    bool replaceNetworkMembership(const QUuid &revision_uuid, const QUuid &network_uuid,
+                                  const QSet<QUuid> &entity_uuids, QString *error) const;
+    bool replaceHydraulicReferences(const QUuid &revision_uuid,
+                                    const NetworkHydraulic &network, QString *error) const;
+    bool canSkipHydraulicRevalidation(const QUuid &revision_uuid,
+                                      const QUuid &entity_uuid, QString *error) const;
+    std::optional<QUuid> writeObjectGroupInTransaction(const RevisionInfo &revision,
+                            const OperationContext &actor, const QString &action,
+                            const QUuid &target_uuid, qint64 before_generation,
+                            QString *error);
     bool modifyObject(const OperationContext &actor, const QUuid &branch_uuid,
                       const QUuid &object_uuid, const QString &kind,
                       const std::optional<QByteArray> &bytes, qint64 expected_version,

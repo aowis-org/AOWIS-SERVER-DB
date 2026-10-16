@@ -11,7 +11,7 @@ namespace aowis::db
 {
 namespace
 {
-constexpr int schema_version = 4;
+constexpr int schema_version = 10;
 constexpr int digest_length = 32;
 
 QByteArray uuidBytes(const QUuid &uuid)
@@ -144,6 +144,59 @@ bool Database::openSqlite(const QString &file_path, QString *error)
         close();
         return false;
     }
+
+    // A schema version can be set even when a database has been damaged or
+    // incompletely upgraded. Do not silently accept a V9 database without its
+    // security audit table and immutability triggers.
+    QString audit_schema_error;
+    {
+        QSqlQuery audit_schema(this->database_);
+        if (!audit_schema.exec(QStringLiteral(
+                "SELECT sequence,uuid,actor_uuid,subject_uuid,action,occurred_at_ms,"
+                "previous_sha256,chain_sha256 FROM security_audit_events LIMIT 0")))
+        {
+            audit_schema_error = QStringLiteral("SQLite V9 audit schema is missing or incomplete: %1")
+                                     .arg(audit_schema.lastError().text());
+        }
+        else
+        {
+            audit_schema.finish();
+            if (!audit_schema.exec(QStringLiteral(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN "
+                    "('security_audit_readonly_update','security_audit_readonly_delete')")) ||
+                !audit_schema.next() || audit_schema.value(0).toInt() != 2)
+            {
+                audit_schema_error = QStringLiteral(
+                    "SQLite V9 security audit immutability triggers are missing");
+            }
+        }
+    }
+    if (!audit_schema_error.isEmpty())
+    {
+        setError(error, audit_schema_error);
+        close();
+        return false;
+    }
+    // Without these V10 authorization columns and guards, a damaged database
+    // could restore previously revoked access.
+    QSqlQuery grant_schema(this->database_);
+    const bool valid_columns = grant_schema.exec(QStringLiteral(
+        "SELECT m.revoked_at_ms,m.revoked_by_uuid,"
+        "p.revoked_at_ms,p.revoked_by_uuid,a.revoked_at_ms,a.revoked_by_uuid "
+        "FROM group_memberships m,role_permissions p,role_assignments a LIMIT 0"));
+    grant_schema.finish();
+    const bool valid_guards = grant_schema.exec(QStringLiteral(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ("
+        "'group_membership_revoke_only','group_membership_no_delete',"
+        "'role_permission_revoke_only','role_permission_no_delete',"
+        "'role_assignment_revoke_only','role_assignment_no_delete','role_assignment_valid')")) &&
+        grant_schema.next() && grant_schema.value(0).toInt() == 7;
+    if (!valid_columns || !valid_guards)
+    {
+        setError(error, QStringLiteral("SQLite V10 security grant schema is incomplete"));
+        close();
+        return false;
+    }
     return true;
 }
 
@@ -196,6 +249,9 @@ bool Database::migrate(QString *error)
         return false;
     }
     const int current = version.value(0).toInt();
+    // V10 renames and drops grant tables. Release the active PRAGMA cursor
+    // before running any DDL; SQLite otherwise reports SQLITE_LOCKED on DROP.
+    version.finish();
     if (current > schema_version)
     {
         setError(error, QStringLiteral("Database schema is newer than this library"));
@@ -203,12 +259,24 @@ bool Database::migrate(QString *error)
     }
     if (current == schema_version)
         return true;
+    if (current == 9)
+        return migrateSecurityAdminV10(error);
+    if (current == 8)
+        return migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
+    if (current == 7)
+        return migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
+    if (current == 6)
+        return migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
+    if (current == 5)
+        return migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
+    if (current == 4)
+        return migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
     if (current == 3)
-        return migrateObjectsV4(error);
+        return migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
     if (current == 2)
-        return migrateHistoryV3(error) && migrateObjectsV4(error);
+        return migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
     if (current == 1)
-        return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error);
+        return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
     if (current != 0 || !beginWrite(error))
         return false;
 
@@ -326,7 +394,7 @@ bool Database::migrate(QString *error)
         rollback();
         return false;
     }
-    return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error);
+    return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error);
 }
 
 std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &actor_uuid, const QString &name, QString *error)

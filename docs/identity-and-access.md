@@ -40,7 +40,7 @@ example `project.model.write`). These are seeded in schema v2:
 - `project.revision.finalize`: finalize the working revision.
 - `project.permissions.manage`: reserved for future delegated administration.
 - `project.history.read`: reserved for future operation-log browsing.
-- `security.audit.read`: reserved for future audit-log browsing.
+- `security.audit.read`: read and verify the system audit chain (schema V9).
 
 `system.administrator` is assigned all built-in permissions by default.
 `project.owner` is a stable built-in project-scoped role (all `project.*`
@@ -73,10 +73,11 @@ fabricated historical identity. If a working v1 revision is finalized after
 migration, its unknown creator is represented by the null UUID in V2 hashing,
 while the finalizing actor is recorded normally.
 
-Model-edit events, undo/redo, group removal, permission revocation, user
-self-service, logins, credentials, auditing, and security event logs are not
-implemented in this stage. Do not mistake finalization attribution for a
-complete edit history.
+This section describes the historical V2 identity foundation. Subsequent
+stages implement model-edit history, grouped undo/redo, HTTP sessions, and a
+separate V9 security-administration audit journal. Group removal, permission
+revocation, self-service login and external identity providers are still not
+implemented. See `security-audit-v20.md` for scope and limitations.
 
 As before, SQLite administrators can bypass triggers and modify the database.
 The integrity chain is designed to reveal ordinary tampering, not to defend

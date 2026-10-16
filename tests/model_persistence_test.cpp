@@ -186,6 +186,9 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::RevisionInfo> current = database.revision(actor, project->working_revision_uuid, &error);
     REQUIRE(current.has_value() && current->generation == 19); // network root + 18 entity kinds
     REQUIRE(database.objects(actor, project->working_revision_uuid, &error).size() == 19);
+    REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error).size() == 1);
+    REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error)
+                .first().object_event_uuids.size() == 19);
     REQUIRE(database.object(actor, project->working_revision_uuid, pipe.uuid, &error)->kind == QStringLiteral("hydraulic.pipe"));
     REQUIRE(!database.saveHydraulicNetwork(actor, project->main_branch_uuid, 0, network, &error));
     NetworkHydraulic conflicting = network;
@@ -195,6 +198,7 @@ int main(int argc, char **argv)
     REQUIRE(database.revision(actor, project->working_revision_uuid, &error)->generation == current->generation);
     REQUIRE(database.saveHydraulicNetwork(actor, project->main_branch_uuid, current->generation, network, &error));
     REQUIRE(database.revision(actor, project->working_revision_uuid, &error)->generation == current->generation);
+    REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error).size() == 1);
 
     HydraulicNodeJunction updated = junction;
     updated.elevation_m = 123.456789;
@@ -202,6 +206,7 @@ int main(int argc, char **argv)
     const std::optional<NetworkHydraulic> after_edit = database.loadHydraulicNetwork(actor, project->working_revision_uuid, network.uuid, &error);
     REQUIRE(after_edit.has_value() && after_edit->nodes_junctions[0].elevation_m == updated.elevation_m);
     REQUIRE(!aowis::db::putHydraulicEntity(database, actor, project->main_branch_uuid, updated, 1, &error));
+    REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error).size() == 2);
 
     NetworkHydraulic smaller = *after_edit;
     smaller.links_valves.clear();
@@ -209,6 +214,9 @@ int main(int argc, char **argv)
     REQUIRE(database.saveHydraulicNetwork(actor, project->main_branch_uuid, generation, smaller, &error));
     REQUIRE(database.object(actor, project->working_revision_uuid, valve.uuid, &error)->deleted);
     REQUIRE(database.loadHydraulicNetwork(actor, project->working_revision_uuid, network.uuid, &error)->links_valves.isEmpty());
+    REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error).size() == 3);
+    REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error)
+                .last().object_event_uuids.size() == 2);
 
     const qint64 final_generation = database.revision(actor, project->working_revision_uuid, &error)->generation;
     const std::optional<aowis::db::Finalization> finalized = database.finalize(

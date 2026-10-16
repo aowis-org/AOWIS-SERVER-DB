@@ -1,6 +1,8 @@
 #include <aowis/db/database.h>
 #include <aowis/model/uuid.h>
 
+#include "builtin_identity_ids.h"
+
 #include <QDateTime>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -82,7 +84,7 @@ constexpr BuiltinPermission permissions[] = {
     {"project.revision.finalize", "01a14202-2800-7fdc-a21e-938f38efa7e5"},
     {"project.permissions.manage", "01a14202-2800-7988-a929-46a425533b5e"},
     {"project.history.read", "01a14202-2800-71d0-9e6c-c95cd0afc981"},
-    {"security.audit.read", "01a14202-2800-731d-a688-db84f1d900b5"}
+    {"security.audit.read", internal::security_audit_read_permission_uuid}
 };
 
 QUuid pinnedUuid(const char *uuid)
@@ -303,6 +305,8 @@ std::optional<UserInfo> Database::bootstrapAdministrator(const QString &username
         }
     }
     if (ok)
+        ok = writeSecurityAuditEvent(user.uuid, QStringLiteral("administrator.bootstrap"), user.uuid, error);
+    if (ok)
         ok = commit(error);
     if (!ok)
     {
@@ -341,10 +345,12 @@ bool Database::hasPermission(const OperationContext &actor, const QString &permi
             (a.principal_kind='user' AND a.principal_uuid=u.uuid) OR
             (a.principal_kind='group' AND EXISTS (
                 SELECT 1 FROM group_memberships m JOIN groups g ON m.group_uuid=g.uuid
-                WHERE m.user_uuid=u.uuid AND m.group_uuid=a.principal_uuid AND g.disabled_at_ms IS NULL)))
-        JOIN role_permissions rp ON rp.role_uuid=a.role_uuid
+                WHERE m.user_uuid=u.uuid AND m.group_uuid=a.principal_uuid
+                  AND m.revoked_at_ms IS NULL AND g.disabled_at_ms IS NULL)))
+        JOIN role_permissions rp ON rp.role_uuid=a.role_uuid AND rp.revoked_at_ms IS NULL
         JOIN permissions p ON p.uuid=rp.permission_uuid
-        WHERE u.uuid=? AND u.disabled_at_ms IS NULL AND p.key=? AND (
+        WHERE u.uuid=? AND u.disabled_at_ms IS NULL AND a.revoked_at_ms IS NULL
+          AND p.key=? AND (
             a.scope_kind='system' OR
             (a.scope_kind='project' AND a.scope_uuid=?) OR
             (a.scope_kind='branch' AND a.scope_uuid=?)) LIMIT 1
@@ -384,7 +390,9 @@ std::optional<UserInfo> Database::createUser(const OperationContext &actor, cons
     query.addBindValue(uuidBytes(result.uuid));
     query.addBindValue(result.username);
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-    return run(query, error) ? std::optional<UserInfo>(result) : std::nullopt;
+    const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("user.create"),
+        result.uuid, [&]() { return run(query, error); }, error);
+    return saved ? std::optional<UserInfo>(result) : std::nullopt;
 }
 
 std::optional<GroupInfo> Database::createGroup(const OperationContext &actor, const QString &name, QString *error)
@@ -403,7 +411,9 @@ std::optional<GroupInfo> Database::createGroup(const OperationContext &actor, co
     query.addBindValue(uuidBytes(result.uuid));
     query.addBindValue(result.name);
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-    return run(query, error) ? std::optional<GroupInfo>(result) : std::nullopt;
+    const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("group.create"),
+        result.uuid, [&]() { return run(query, error); }, error);
+    return saved ? std::optional<GroupInfo>(result) : std::nullopt;
 }
 
 std::optional<RoleInfo> Database::createRole(const OperationContext &actor, const QString &key, QString *error)
@@ -421,7 +431,9 @@ std::optional<RoleInfo> Database::createRole(const OperationContext &actor, cons
         return std::nullopt;
     query.addBindValue(uuidBytes(result.uuid));
     query.addBindValue(result.key);
-    return run(query, error) ? std::optional<RoleInfo>(result) : std::nullopt;
+    const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("role.create"),
+        result.uuid, [&]() { return run(query, error); }, error);
+    return saved ? std::optional<RoleInfo>(result) : std::nullopt;
 }
 
 std::optional<PermissionInfo> Database::createPermission(const OperationContext &actor, const QString &key, QString *error)
@@ -439,7 +451,9 @@ std::optional<PermissionInfo> Database::createPermission(const OperationContext 
         return std::nullopt;
     query.addBindValue(uuidBytes(result.uuid));
     query.addBindValue(result.key);
-    return run(query, error) ? std::optional<PermissionInfo>(result) : std::nullopt;
+    const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("permission.create"),
+        result.uuid, [&]() { return run(query, error); }, error);
+    return saved ? std::optional<PermissionInfo>(result) : std::nullopt;
 }
 
 std::optional<RoleInfo> Database::role(const OperationContext &actor, const QString &key, QString *error) const
@@ -484,7 +498,9 @@ std::optional<QUuid> Database::addGroupMember(const OperationContext &actor, con
     query.addBindValue(uuidBytes(user_uuid));
     query.addBindValue(uuidBytes(actor.actor_uuid));
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-    return run(query, error) ? std::optional<QUuid>(uuid) : std::nullopt;
+    const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("group.member.add"),
+        uuid, [&]() { return run(query, error); }, error);
+    return saved ? std::optional<QUuid>(uuid) : std::nullopt;
 }
 
 std::optional<QUuid> Database::grantRolePermission(const OperationContext &actor,
@@ -501,7 +517,9 @@ std::optional<QUuid> Database::grantRolePermission(const OperationContext &actor
     query.addBindValue(uuidBytes(uuid));
     query.addBindValue(uuidBytes(role_uuid));
     query.addBindValue(uuidBytes(permission_uuid));
-    return run(query, error) ? std::optional<QUuid>(uuid) : std::nullopt;
+    const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("role.permission.grant"),
+        uuid, [&]() { return run(query, error); }, error);
+    return saved ? std::optional<QUuid>(uuid) : std::nullopt;
 }
 
 std::optional<QUuid> Database::assignRole(const OperationContext &actor, PrincipalKind kind,
@@ -530,7 +548,9 @@ std::optional<QUuid> Database::assignRole(const OperationContext &actor, Princip
     query.addBindValue(scope.kind == AccessScopeKind::System ? QVariant() : QVariant(uuidBytes(scope.resource_uuid)));
     query.addBindValue(uuidBytes(actor.actor_uuid));
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-    return run(query, error) ? std::optional<QUuid>(uuid) : std::nullopt;
+    const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("role.assign"),
+        uuid, [&]() { return run(query, error); }, error);
+    return saved ? std::optional<QUuid>(uuid) : std::nullopt;
 }
 
 std::optional<ProjectCreation> Database::createProject(const OperationContext &actor,

@@ -82,7 +82,7 @@ project persistence**: project descriptions, external attachment file contents,
 other non-network model domains, domain-reference validation, grouped object
 undo/redo, and model-level merge semantics are still outstanding.
 
-No HTTP API, user authentication, password/session handling, model validation,
+No production HTTP API, user authentication, password/session handling, model validation,
 model-aware validation, grouped object changes, object undo/redo, merge
 handling, or PostgreSQL backend is implemented yet. Authorization is implemented but must be supplied
 with trusted, externally authenticated actor contexts.
@@ -108,9 +108,9 @@ the existing V2 chain authenticates that manifest.
 This is a deliberately transitional *whole-snapshot* implementation. It has
 O(snapshot size) storage per edit, and undo/redo reject divergent state rather
 than attempting semantic merges. V4 starts incremental per-object storage and a separate object history,
-but full reversible grouped change sets are still to be implemented. Older edits from before the schema-v3 migration
+but grouped changes and object-level undo/redo are now implemented (V6). Older edits from before the schema-v3 migration
 cannot be reconstructed into journal events, and only working-revision edits
-are undoable. User/security audit events remain future work.
+are undoable. Security administration events are now audited separately in schema V9.
 
 ## Share the repository for development
 
@@ -138,3 +138,102 @@ The low-level object API still accepts caller-supplied bytes for compatibility.
 Prefer the V5 typed API for hydraulic networks and entities. See
 [model-persistence.md](docs/model-persistence.md) for the binary contract,
 serialization coverage, migration limitations and current risks.
+
+## Grouped persistence and undo/redo: V6
+
+Use `commitObjectGroup(actor, branch, expected_generation, edits)` to apply
+multiple optimistic-versioned object changes as one durable action. The
+operation rolls back completely on any failure. `undoObjectGroup` and
+`redoObjectGroup` persist inverse/forward changes without deleting prior
+history. Typed whole-network saves, single-object puts and deletes now produce
+undoable groups when they change state. A new V5 SQLite schema migration
+protects grouped history; the finalized manifest covers it without changing
+old V4 hashes. See [object-history-v6.md](docs/object-history-v6.md) for
+exact semantics and limitations.
+
+## Hydraulic model reference validation (V7)
+
+`saveHydraulicNetwork` checks non-null inter-entity references, typed UUID
+relationships (nodes, links, patterns, curves, controls, demand points and
+MSX), plus pipe-position and assigned-junction constraints before committing.
+Use `validateHydraulicNetwork` to retrieve individual diagnostics. Incomplete
+drafts with null link endpoints remain valid. Low-level object writes and
+object-level undo/redo are **not yet** transactionally validated as full models.
+See [model-validation-v7.md](docs/model-validation-v7.md).
+
+## Transactional hydraulic reference validation (V8)
+
+Indexed hydraulic entity edits, low-level grouped object commits, and grouped
+undo/redo validate the final network graph before committing. Invalid changes
+roll back both state and history. See
+[docs/model-object-integrity-v8.md](docs/model-object-integrity-v8.md).
+
+## Indexed network membership (V9; SQLite schema version 6)
+
+`hydraulic_network_members` maps each indexed hydraulic entity to its owning
+network within a revision. A low-level edit now uses indexed ownership lookup
+and reconstructs only the affected network, rather than scanning every root
+and all unrelated model objects. The migration backfills existing finalized
+and working revisions without modifying their hashed snapshots. See
+[model-membership-v9.md](docs/model-membership-v9.md) for details and limits.
+
+## V10 reference index
+
+Schema V7 maintains a derived reverse-reference index for hydraulic networks.
+Simple pipe/junction attribute edits can skip whole-network reconstruction when
+all reference-sensitive fields are unchanged. See [V10 notes](docs/model-references-v10.md).
+
+Full-network SQLite saves use bounded indexed lookups limited to the affected
+network, without scanning objects from unrelated networks. See
+[model-indexed-save-v11.md](docs/model-indexed-save-v11.md).
+
+## Optional development HTTP transport (V17)
+
+When Qt6 HttpServer and Network are installed, CMake additionally builds
+`aowis-db-http`, the local-only `aowis-db-server` executable, and the
+`aowis-db-http` network test. It does not change the SQLite core or require
+HTTP for embedded deployments (`-DAOWIS_DB_BUILD_HTTP=OFF` disables it).
+Read [docs/http-foundation-v17.md](docs/http-foundation-v17.md) for the
+current endpoints, authentication boundary, setup, and security limitations.
+This is a local development transport, **not** an internet-facing service.
+
+## V18 REST model and history operations
+
+The optional HTTP adapter now supports full typed hydraulic network reads and
+atomic saves, generic non-hydraulic grouped object writes, and persistent
+object-group undo/redo and history reads. All requests use the same core
+permissions and transactions as embedded applications. See
+[docs/http-model-and-history-v18.md](docs/http-model-and-history-v18.md)
+for endpoint contracts, request size limits, and the current security boundary.
+
+## V19 persistent HTTP sessions (SQLite schema V8)
+
+The single static development bearer token has been removed. The HTTP server
+now resolves random, per-user bearer sessions through the DB core. Only the
+SHA-256 token digest is persisted, with expiry and revocation; disabling a user
+blocks all their sessions. A local operator can provision sessions through
+`aowis-db-admin` and the server remains bound to loopback. See
+[docs/http-sessions-v19.md](docs/http-sessions-v19.md) for provisioning,
+security boundaries and limitations. Existing revision hashes are unchanged.
+
+## Security administration audit (schema V9)
+
+Security mutations now append hash-linked audit records atomically. Authorized
+operators can page and verify the journal through the C++ API or via
+`aowis-db-admin audit` / `aowis-db-admin audit-verify`. See
+[docs/security-audit-v20.md](docs/security-audit-v20.md). Existing revision
+hashes and model data are unaffected.
+
+## Security administration lifecycle (V21)
+
+Grants and memberships can now be revoked and later re-granted using fresh
+UUIDs, without deleting the original relationships. Disabled users can be
+reactivated, but must receive new sessions. All successful changes are atomic
+with the security audit chain. See [security-admin-v21](docs/security-admin-v21.md).
+
+## Security administration catalog (V22)
+
+Administrative catalog reads are available through the C++ `Database` API
+and authenticated, system-admin-only HTTP GET routes. Pages use UUID cursors
+and include revoked grants only when explicitly requested. See
+[docs/security-catalog-v22.md](docs/security-catalog-v22.md).

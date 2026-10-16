@@ -166,3 +166,14 @@ this foundation replaces GUI editing.
 See [model-persistence.md](model-persistence.md). V5 reuses the existing V4
 object store and V2 finalized revision chain. No database-schema migration or
 historical revision re-hashing is required.
+
+## Schema V5: grouped object journal (V6 feature)
+
+Object groups associate one or more ordered immutable `object_events` with
+one intent transaction. `revisions.object_journal_version` keeps all finalized
+V4 object manifests byte-for-byte unchanged (default 1) while version 2
+appends a deterministic group-history encoding. Newly finalized grouped edits
+therefore bind authorship, undo/redo targeting, membership order and contents
+into their SHA-256 snapshot digest and revision DAG hash. Historical hashes
+are never modified. Undo and redo are append-only compensating actions with
+optimistic concurrency checks. See [object-history-v6.md](object-history-v6.md).

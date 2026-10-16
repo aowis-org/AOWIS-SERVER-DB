@@ -71,8 +71,9 @@ requires later stages. `NetworkHydraulic` is currently the only full-model
 aggregate handled here. Do not claim this stores an entire AOWIS project with
 all associated assets.
 
-A full-network save is atomic but involves linear scans of the referenced
-object set and may be expensive for large networks. Granular entity updates
+A full-network save is atomic and scans only the affected network's entity set
+through indexed lookups (see [V11 indexed saves](model-indexed-save-v11.md)).
+It can still be expensive for large individual networks. Granular entity updates
 avoid whole-network writes, but the future GUI needs to group complex edits
 into one transaction with referential validation. The record bytes are stable
 for the pinned codec version, and schema compatibility is checked at build

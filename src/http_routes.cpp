@@ -1,0 +1,808 @@
+#include <aowis/db/http_routes.h>
+#include <aowis/db/model_codec.h>
+
+#include <QHttpServerResponse>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QSet>
+#include <QUrlQuery>
+#include <utility>
+
+namespace aowis::db
+{
+namespace
+{
+using Status = QHttpServerResponse::StatusCode;
+
+QString uuidString(const QUuid &uuid)
+{
+    return uuid.toString(QUuid::WithoutBraces);
+}
+
+std::optional<QUuid> parseUuid(const QString &text)
+{
+    const QUuid uuid(text);
+    if (uuid.isNull())
+        return std::nullopt;
+    if (uuidString(uuid).compare(text, Qt::CaseInsensitive) != 0)
+        return std::nullopt;
+    return uuid;
+}
+
+QHttpServerResponse jsonError(Status code, const QString &message)
+{
+    return QHttpServerResponse(QJsonObject{{QStringLiteral("error"), message}}, code);
+}
+
+QHttpServerResponse unauthorized()
+{
+    return jsonError(Status::Unauthorized, QStringLiteral("Authentication required"));
+}
+
+QHttpServerResponse unavailable()
+{
+    // Do not disclose the existence of projects/branches without read access.
+    return jsonError(Status::NotFound, QStringLiteral("Resource not found or unavailable"));
+}
+
+std::optional<QJsonObject> jsonBody(const QHttpServerRequest &request, qsizetype max_bytes = 65536)
+{
+    const QByteArray body = request.body();
+    if (body.isEmpty() || body.size() > max_bytes)
+        return std::nullopt;
+    QJsonParseError error;
+    const QJsonDocument document = QJsonDocument::fromJson(body, &error);
+    if (error.error != QJsonParseError::NoError || !document.isObject())
+        return std::nullopt;
+    return document.object();
+}
+
+std::optional<SecurityListOptions> securityListOptions(const QHttpServerRequest &request)
+{
+    SecurityListOptions options;
+    QSet<QString> seen;
+    const QUrlQuery query(request.url());
+    for (const QPair<QString, QString> &item : query.queryItems())
+    {
+        if (seen.contains(item.first))
+            return std::nullopt;
+        seen.insert(item.first);
+        if (item.first == QStringLiteral("limit"))
+        {
+            bool valid = false;
+            const int limit = item.second.toInt(&valid);
+            if (!valid || limit < 1 || limit > 200 || QString::number(limit) != item.second)
+                return std::nullopt;
+            options.limit = limit;
+        }
+        else if (item.first == QStringLiteral("after_uuid"))
+        {
+            const std::optional<QUuid> uuid = parseUuid(item.second);
+            if (!uuid)
+                return std::nullopt;
+            options.after_uuid = *uuid;
+        }
+        else if (item.first == QStringLiteral("include_inactive"))
+        {
+            if (item.second != QStringLiteral("true") && item.second != QStringLiteral("false"))
+                return std::nullopt;
+            options.include_inactive = item.second == QStringLiteral("true");
+        }
+        else
+            return std::nullopt;
+    }
+    return options;
+}
+
+QJsonObject catalogUserJson(const UserInfo &item)
+{
+    return {{QStringLiteral("uuid"), uuidString(item.uuid)},
+            {QStringLiteral("username"), item.username},
+            {QStringLiteral("disabled"), item.disabled}};
+}
+
+QJsonObject catalogGroupJson(const GroupInfo &item)
+{
+    return {{QStringLiteral("uuid"), uuidString(item.uuid)},
+            {QStringLiteral("name"), item.name},
+            {QStringLiteral("disabled"), item.disabled}};
+}
+
+QJsonObject catalogRoleJson(const RoleInfo &item)
+{
+    return {{QStringLiteral("uuid"), uuidString(item.uuid)},
+            {QStringLiteral("key"), item.key},
+            {QStringLiteral("builtin"), item.builtin}};
+}
+
+QJsonObject catalogPermissionJson(const PermissionInfo &item)
+{
+    return {{QStringLiteral("uuid"), uuidString(item.uuid)},
+            {QStringLiteral("key"), item.key},
+            {QStringLiteral("builtin"), item.builtin}};
+}
+
+QJsonObject membershipJson(const GroupMembershipInfo &item)
+{
+    return {{QStringLiteral("uuid"), uuidString(item.uuid)},
+            {QStringLiteral("group_uuid"), uuidString(item.group_uuid)},
+            {QStringLiteral("user_uuid"), uuidString(item.user_uuid)},
+            {QStringLiteral("created_by_uuid"), uuidString(item.created_by_uuid)},
+            {QStringLiteral("created_at_ms"), QString::number(item.created_at_ms)},
+            {QStringLiteral("revoked"), item.revoked}};
+}
+
+QJsonObject grantJson(const RolePermissionGrantInfo &item)
+{
+    return {{QStringLiteral("uuid"), uuidString(item.uuid)},
+            {QStringLiteral("role_uuid"), uuidString(item.role_uuid)},
+            {QStringLiteral("permission_uuid"), uuidString(item.permission_uuid)},
+            {QStringLiteral("revoked"), item.revoked}};
+}
+
+QJsonObject assignmentJson(const RoleAssignmentInfo &item)
+{
+    QString scope_kind = QStringLiteral("system");
+    if (item.scope.kind == AccessScopeKind::Project)
+        scope_kind = QStringLiteral("project");
+    else if (item.scope.kind == AccessScopeKind::Branch)
+        scope_kind = QStringLiteral("branch");
+    return {{QStringLiteral("uuid"), uuidString(item.uuid)},
+            {QStringLiteral("principal_kind"), item.principal_kind == PrincipalKind::User ?
+                QStringLiteral("user") : QStringLiteral("group")},
+            {QStringLiteral("principal_uuid"), uuidString(item.principal_uuid)},
+            {QStringLiteral("role_uuid"), uuidString(item.role_uuid)},
+            {QStringLiteral("scope_kind"), scope_kind},
+            {QStringLiteral("scope_uuid"), item.scope.kind == AccessScopeKind::System ?
+                QJsonValue(QJsonValue::Null) : QJsonValue(uuidString(item.scope.resource_uuid))},
+            {QStringLiteral("created_by_uuid"), uuidString(item.created_by_uuid)},
+            {QStringLiteral("created_at_ms"), QString::number(item.created_at_ms)},
+            {QStringLiteral("revoked"), item.revoked}};
+}
+
+QJsonObject projectJson(const ProjectInfo &project)
+{
+    return {{QStringLiteral("uuid"), uuidString(project.uuid)},
+            {QStringLiteral("name"), project.name},
+            {QStringLiteral("created_by_uuid"), uuidString(project.created_by_uuid)}};
+}
+
+QJsonObject branchJson(const BranchInfo &branch)
+{
+    return {{QStringLiteral("uuid"), uuidString(branch.uuid)},
+            {QStringLiteral("project_uuid"), uuidString(branch.project_uuid)},
+            {QStringLiteral("name"), branch.name},
+            {QStringLiteral("head_revision_uuid"), uuidString(branch.head_revision_uuid)},
+            {QStringLiteral("created_by_uuid"), uuidString(branch.created_by_uuid)}};
+}
+
+QJsonObject revisionJson(const RevisionInfo &revision)
+{
+    QJsonArray parents;
+    for (const QUuid &parent : revision.parent_revision_uuids)
+        parents.append(uuidString(parent));
+    // 64-bit values are decimal strings to avoid precision loss in JSON.
+    return {{QStringLiteral("uuid"), uuidString(revision.uuid)},
+            {QStringLiteral("project_uuid"), uuidString(revision.project_uuid)},
+            {QStringLiteral("branch_uuid"), uuidString(revision.branch_uuid)},
+            {QStringLiteral("number"), QString::number(revision.number)},
+            {QStringLiteral("generation"), QString::number(revision.generation)},
+            {QStringLiteral("finalized"), revision.finalized},
+            {QStringLiteral("parent_revision_uuids"), parents},
+            {QStringLiteral("created_by_uuid"), uuidString(revision.created_by_uuid)},
+            {QStringLiteral("finalized_by_uuid"), uuidString(revision.finalized_by_uuid)},
+            {QStringLiteral("hash_version"), revision.hash_version},
+            {QStringLiteral("snapshot_sha256"), QString::fromLatin1(revision.snapshot_sha256.toHex())},
+            {QStringLiteral("chain_sha256"), QString::fromLatin1(revision.chain_sha256.toHex())}};
+}
+
+std::optional<qint64> expectedGeneration(const QJsonObject &object)
+{
+    const QJsonValue generation = object.value(QStringLiteral("expected_generation"));
+    if (!generation.isString())
+        return std::nullopt;
+    const QString text = generation.toString();
+    bool ok = false;
+    const qint64 value = text.toLongLong(&ok);
+    if (!ok || value < 0 || QString::number(value) != text)
+        return std::nullopt;
+    return value;
+}
+
+// Require canonical padded base64. Qt's permissive decoder otherwise accepts
+// malformed input, making payloads ambiguous to clients and audit tools.
+std::optional<QByteArray> decodeBase64(const QJsonValue &value, qsizetype max_bytes)
+{
+    if (!value.isString())
+        return std::nullopt;
+    const QByteArray encoded = value.toString().toLatin1();
+    if (encoded.size() > ((max_bytes + 2) / 3) * 4)
+        return std::nullopt;
+    const QByteArray decoded = QByteArray::fromBase64(encoded);
+    if (decoded.size() > max_bytes || decoded.toBase64() != encoded)
+        return std::nullopt;
+    return decoded;
+}
+
+std::optional<qint64> expectedVersion(const QJsonValue &value)
+{
+    if (!value.isString())
+        return std::nullopt;
+    const QString text = value.toString();
+    bool ok = false;
+    const qint64 version = text.toLongLong(&ok);
+    if (!ok || version < -1 || QString::number(version) != text)
+        return std::nullopt;
+    return version;
+}
+
+QJsonObject objectGroupJson(const ObjectGroup &group)
+{
+    QJsonArray events;
+    for (const QUuid &uuid : group.object_event_uuids)
+        events.append(uuidString(uuid));
+    return {{QStringLiteral("uuid"), uuidString(group.uuid)},
+            {QStringLiteral("revision_uuid"), uuidString(group.revision_uuid)},
+            {QStringLiteral("actor_uuid"), uuidString(group.actor_uuid)},
+            {QStringLiteral("target_group_uuid"), group.target_group_uuid.isNull()
+                ? QJsonValue(QJsonValue::Null) : QJsonValue(uuidString(group.target_group_uuid))},
+            {QStringLiteral("action"), group.action},
+            {QStringLiteral("first_sequence"), QString::number(group.first_sequence)},
+            {QStringLiteral("last_sequence"), QString::number(group.last_sequence)},
+            {QStringLiteral("occurred_at_ms"), QString::number(group.occurred_at_ms)},
+            {QStringLiteral("object_event_uuids"), events}};
+}
+
+QJsonObject workingGeneration(const Database &database, const OperationContext &actor,
+                              const QUuid &branch_uuid)
+{
+    const std::optional<BranchInfo> branch = database.branch(actor, branch_uuid);
+    if (!branch)
+        return {};
+    const std::optional<RevisionInfo> revision = database.revision(actor, branch->head_revision_uuid);
+    if (!revision)
+        return {};
+    return {{QStringLiteral("revision_uuid"), uuidString(revision->uuid)},
+            {QStringLiteral("generation"), QString::number(revision->generation)}};
+}
+
+} // namespace
+
+HttpRoutes::HttpRoutes(Database &database, Authenticate authenticate)
+    : database_(database), authenticate_(std::move(authenticate))
+{
+}
+
+std::optional<OperationContext> HttpRoutes::actorFor(const QHttpServerRequest &request) const
+{
+    if (!this->authenticate_)
+        return std::nullopt;
+    const std::optional<OperationContext> actor = this->authenticate_(request);
+    if (!actor || actor->actor_uuid.isNull())
+        return std::nullopt;
+    return actor;
+}
+
+bool HttpRoutes::registerOn(QHttpServer &server)
+{
+    const QHttpServerRequest::Methods get = QHttpServerRequest::Method::Get;
+    const QHttpServerRequest::Methods post = QHttpServerRequest::Method::Post;
+    const QHttpServerRequest::Methods put = QHttpServerRequest::Method::Put;
+
+    // A health check intentionally contains no database or identity details.
+    if (!server.route(QStringLiteral("/api/v1/health"), get, []() {
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("status"), QStringLiteral("ok")}});
+    }))
+        return false;
+
+    // Security catalog routes are deliberately read-only. They never expose
+    // bearer tokens and require system-level security.manage; project owners
+    // do not acquire this permission through project ownership.
+    if (!server.route(QStringLiteral("/api/v1/admin/users"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<SecurityListOptions> options = securityListOptions(request);
+        if (!options)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid catalog query"));
+        QString error;
+        const QVector<UserInfo> records = this->database_.securityUsers(*actor, *options, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Catalog read failed"));
+        QJsonArray items;
+        for (const UserInfo &item : records)
+            items.append(catalogUserJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("users"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/groups"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<SecurityListOptions> options = securityListOptions(request);
+        if (!options)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid catalog query"));
+        QString error;
+        const QVector<GroupInfo> records = this->database_.securityGroups(*actor, *options, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Catalog read failed"));
+        QJsonArray items;
+        for (const GroupInfo &item : records)
+            items.append(catalogGroupJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("groups"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/roles"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<SecurityListOptions> options = securityListOptions(request);
+        if (!options)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid catalog query"));
+        QString error;
+        const QVector<RoleInfo> records = this->database_.securityRoles(*actor, *options, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Catalog read failed"));
+        QJsonArray items;
+        for (const RoleInfo &item : records)
+            items.append(catalogRoleJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("roles"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/permissions"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<SecurityListOptions> options = securityListOptions(request);
+        if (!options)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid catalog query"));
+        QString error;
+        const QVector<PermissionInfo> records = this->database_.securityPermissions(*actor, *options, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Catalog read failed"));
+        QJsonArray items;
+        for (const PermissionInfo &item : records)
+            items.append(catalogPermissionJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("permissions"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/groups/<arg>/members"), get,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<QUuid> uuid = parseUuid(id);
+        const std::optional<SecurityListOptions> options = securityListOptions(request);
+        if (!uuid || !options)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid catalog query or UUID"));
+        QString error;
+        const QVector<GroupMembershipInfo> records = this->database_.securityGroupMembers(*actor, *uuid, *options, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Catalog read failed"));
+        QJsonArray items;
+        for (const GroupMembershipInfo &item : records)
+            items.append(membershipJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("memberships"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/roles/<arg>/permissions"), get,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<QUuid> uuid = parseUuid(id);
+        const std::optional<SecurityListOptions> options = securityListOptions(request);
+        if (!uuid || !options)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid catalog query or UUID"));
+        QString error;
+        const QVector<RolePermissionGrantInfo> records = this->database_.securityRolePermissions(*actor, *uuid, *options, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Catalog read failed"));
+        QJsonArray items;
+        for (const RolePermissionGrantInfo &item : records)
+            items.append(grantJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("grants"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/principals/<arg>/<arg>/assignments"), get,
+                      [this](const QString &kind, const QString &id,
+                             const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<QUuid> uuid = parseUuid(id);
+        const std::optional<SecurityListOptions> options = securityListOptions(request);
+        if (!uuid || !options || (kind != QStringLiteral("user") && kind != QStringLiteral("group")))
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid catalog query or principal"));
+        QString error;
+        const QVector<RoleAssignmentInfo> records = this->database_.securityRoleAssignments(
+            *actor, kind == QStringLiteral("user") ? PrincipalKind::User : PrincipalKind::Group,
+            *uuid, *options, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Catalog read failed"));
+        QJsonArray items;
+        for (const RoleAssignmentInfo &item : records)
+            items.append(assignmentJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("assignments"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/projects"), get, [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        QString error;
+        const QVector<ProjectInfo> items = this->database_.projects(*actor, &error);
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Project listing failed"));
+        QJsonArray projects;
+        for (const ProjectInfo &item : items)
+            projects.append(projectJson(item));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("projects"), projects}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/projects"), post, [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QJsonObject> body = jsonBody(request);
+        if (!body || !body->value(QStringLiteral("name")).isString())
+            return jsonError(Status::BadRequest, QStringLiteral("Expected JSON object with project name"));
+        const QString name = body->value(QStringLiteral("name")).toString();
+        if (name.trimmed().isEmpty() || name.size() > 256)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid project name"));
+        QString error;
+        const std::optional<ProjectCreation> result = this->database_.createProject(*actor, name, &error);
+        if (!result)
+            return jsonError(Status::Forbidden, QStringLiteral("Project creation denied or failed"));
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("project_uuid"), uuidString(result->project_uuid)},
+            {QStringLiteral("main_branch_uuid"), uuidString(result->main_branch_uuid)},
+            {QStringLiteral("working_revision_uuid"), uuidString(result->working_revision_uuid)}}, Status::Created);
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/projects/<arg>"), get,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> uuid = parseUuid(id);
+        if (!uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid project UUID"));
+        const std::optional<ProjectInfo> result = this->database_.project(*actor, *uuid);
+        return result ? QHttpServerResponse(projectJson(*result)) : unavailable();
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/projects/<arg>/branches"), get,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> uuid = parseUuid(id);
+        if (!uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid project UUID"));
+        // Confirm read access before returning an empty collection.
+        if (!this->database_.project(*actor, *uuid))
+            return unavailable();
+        QString error;
+        const QVector<BranchInfo> result = this->database_.branches(*actor, *uuid, &error);
+        if (!error.isEmpty())
+            return unavailable();
+        QJsonArray items;
+        for (const BranchInfo &branch : result)
+            items.append(branchJson(branch));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("branches"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/branches/<arg>/revisions"), get,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> uuid = parseUuid(id);
+        if (!uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid branch UUID"));
+        if (!this->database_.branch(*actor, *uuid))
+            return unavailable();
+        QString error;
+        const QVector<RevisionInfo> result = this->database_.revisions(*actor, *uuid, &error);
+        if (!error.isEmpty())
+            return unavailable();
+        QJsonArray items;
+        for (const RevisionInfo &revision : result)
+            items.append(revisionJson(revision));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("revisions"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/revisions/<arg>"), get,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> uuid = parseUuid(id);
+        if (!uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid revision UUID"));
+        const std::optional<RevisionInfo> result = this->database_.revision(*actor, *uuid);
+        return result ? QHttpServerResponse(revisionJson(*result)) : unavailable();
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/revisions/<arg>/objects/<arg>"), get,
+                      [this](const QString &revision_id, const QString &object_id,
+                             const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> revision_uuid = parseUuid(revision_id);
+        const std::optional<QUuid> object_uuid = parseUuid(object_id);
+        if (!revision_uuid || !object_uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid object or revision UUID"));
+        const std::optional<ModelObject> object = this->database_.object(*actor, *revision_uuid, *object_uuid);
+        if (!object)
+            return unavailable();
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("uuid"), uuidString(object->uuid)},
+            {QStringLiteral("kind"), object->kind},
+            {QStringLiteral("content_base64"), QString::fromLatin1(object->content.toBase64())},
+            {QStringLiteral("version"), QString::number(object->version)},
+            {QStringLiteral("deleted"), object->deleted}});
+    }))
+        return false;
+
+    // The typed network representation contains every nested Model field.
+    // Binary encoding is versioned in ModelCodec; HTTP uses canonical base64
+    // transport rather than attempting lossy JSON floating-point conversion.
+    if (!server.route(QStringLiteral("/api/v1/revisions/<arg>/networks/<arg>"), get,
+                      [this](const QString &revision_id, const QString &network_id,
+                             const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> revision_uuid = parseUuid(revision_id);
+        const std::optional<QUuid> network_uuid = parseUuid(network_id);
+        if (!revision_uuid || !network_uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid revision or network UUID"));
+        QString error;
+        const std::optional<NetworkHydraulic> network = this->database_.loadHydraulicNetwork(
+            *actor, *revision_uuid, *network_uuid, &error);
+        if (!network)
+            return unavailable();
+        const QByteArray encoded = ModelCodec<NetworkHydraulic>::encode(*network);
+        if (encoded.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Network encoding failed"));
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("revision_uuid"), uuidString(*revision_uuid)},
+            {QStringLiteral("network_uuid"), uuidString(network->uuid)},
+            {QStringLiteral("codec"), QStringLiteral("aowis.model.network_hydraulic.v1")},
+            {QStringLiteral("content_base64"), QString::fromLatin1(encoded.toBase64())}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/branches/<arg>/networks/<arg>"), put,
+                      [this](const QString &branch_id, const QString &network_id,
+                             const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> branch_uuid = parseUuid(branch_id);
+        const std::optional<QUuid> network_uuid = parseUuid(network_id);
+        const std::optional<QJsonObject> body = jsonBody(request, 8 * 1024 * 1024);
+        if (!branch_uuid || !network_uuid || !body)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid network request"));
+        const std::optional<qint64> generation = expectedGeneration(*body);
+        if (!generation || body->value(QStringLiteral("codec")).toString() !=
+                               QStringLiteral("aowis.model.network_hydraulic.v1"))
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid codec or expected_generation"));
+        const std::optional<QByteArray> bytes = decodeBase64(body->value(QStringLiteral("content_base64")),
+                                                              6 * 1024 * 1024);
+        if (!bytes || bytes->isEmpty())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid network content_base64"));
+        QString error;
+        const std::optional<NetworkHydraulic> network = ModelCodec<NetworkHydraulic>::decode(*bytes, &error);
+        if (!network || network->uuid != *network_uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid network data or mismatched UUID"));
+        if (!this->database_.saveHydraulicNetwork(*actor, *branch_uuid, *generation, *network, &error))
+            return jsonError(Status::Conflict, QStringLiteral("Network edit denied, invalid, or conflicted"));
+        QJsonObject result{{QStringLiteral("network_uuid"), uuidString(*network_uuid)}};
+        const QJsonObject generation_info = workingGeneration(this->database_, *actor, *branch_uuid);
+        for (const QString &key : generation_info.keys())
+            result.insert(key, generation_info.value(key));
+        return QHttpServerResponse(result);
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/branches/<arg>/object-groups"), post,
+                      [this](const QString &branch_id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> branch_uuid = parseUuid(branch_id);
+        const std::optional<QJsonObject> body = jsonBody(request, 8 * 1024 * 1024);
+        if (!branch_uuid || !body)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid group request"));
+        const std::optional<qint64> generation = expectedGeneration(*body);
+        const QJsonValue edits_value = body->value(QStringLiteral("edits"));
+        if (!generation || !edits_value.isArray())
+            return jsonError(Status::BadRequest, QStringLiteral("Expected decimal-string generation and edits array"));
+        const QJsonArray values = edits_value.toArray();
+        if (values.isEmpty() || values.size() > 128)
+            return jsonError(Status::BadRequest, QStringLiteral("Expected 1..128 object edits"));
+        // Check existing kinds as well as incoming ones. Otherwise a client
+        // could rename an indexed hydraulic entity or delete it without
+        // passing typed network validation.
+        const std::optional<BranchInfo> current_branch = this->database_.branch(*actor, *branch_uuid);
+        if (!current_branch)
+            return unavailable();
+        QVector<ObjectEdit> edits;
+        QSet<QUuid> ids;
+        qsizetype total_bytes = 0;
+        for (const QJsonValue &value : values)
+        {
+            if (!value.isObject())
+                return jsonError(Status::BadRequest, QStringLiteral("Invalid object edit"));
+            const QJsonObject entry = value.toObject();
+            const std::optional<QUuid> uuid = parseUuid(entry.value(QStringLiteral("uuid")).toString());
+            const std::optional<qint64> version = expectedVersion(entry.value(QStringLiteral("expected_version")));
+            if (!uuid || !version || ids.contains(*uuid))
+                return jsonError(Status::BadRequest, QStringLiteral("Invalid or repeated object UUID/version"));
+            ids.insert(*uuid);
+            const std::optional<ModelObject> current = this->database_.object(
+                *actor, current_branch->head_revision_uuid, *uuid);
+            if (current && current->kind.startsWith(QStringLiteral("hydraulic."), Qt::CaseInsensitive))
+                return jsonError(Status::BadRequest, QStringLiteral("Use typed hydraulic-network endpoint"));
+            const bool deleted = entry.value(QStringLiteral("delete")).toBool(false);
+            const QString kind = entry.value(QStringLiteral("kind")).toString();
+            // Generic transport must not bypass typed hydraulic codec validation.
+            if (kind.startsWith(QStringLiteral("hydraulic."), Qt::CaseInsensitive))
+                return jsonError(Status::BadRequest, QStringLiteral("Use typed hydraulic-network endpoint"));
+            ObjectEdit edit;
+            edit.object_uuid = *uuid;
+            edit.expected_version = *version;
+            if (deleted)
+            {
+                if (entry.contains(QStringLiteral("content_base64")) || entry.value(QStringLiteral("delete")) != QJsonValue(true))
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid deletion edit"));
+            }
+            else
+            {
+                if (kind.isEmpty() || kind.size() > 128 ||
+                    !entry.value(QStringLiteral("delete")).isUndefined())
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid object kind or operation"));
+                const std::optional<QByteArray> bytes = decodeBase64(entry.value(QStringLiteral("content_base64")),
+                                                                      1024 * 1024);
+                if (!bytes)
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid object content_base64"));
+                total_bytes += bytes->size();
+                if (total_bytes > 6 * 1024 * 1024)
+                    return jsonError(Status::BadRequest, QStringLiteral("Object batch exceeds payload limit"));
+                edit.kind = kind;
+                edit.content = *bytes;
+            }
+            edits.append(edit);
+        }
+        QString error;
+        const std::optional<QUuid> group_uuid = this->database_.commitObjectGroup(
+            *actor, *branch_uuid, *generation, edits, &error);
+        if (!group_uuid)
+            return jsonError(Status::Conflict, QStringLiteral("Object edit denied, invalid, or conflicted"));
+        QJsonObject result{{QStringLiteral("group_uuid"), uuidString(*group_uuid)}};
+        const QJsonObject generation_info = workingGeneration(this->database_, *actor, *branch_uuid);
+        for (const QString &key : generation_info.keys())
+            result.insert(key, generation_info.value(key));
+        return QHttpServerResponse(result, Status::Created);
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/revisions/<arg>/object-groups"), get,
+                      [this](const QString &revision_id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> revision_uuid = parseUuid(revision_id);
+        if (!revision_uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid revision UUID"));
+        if (!this->database_.revision(*actor, *revision_uuid))
+            return unavailable();
+        QString error;
+        const QVector<ObjectGroup> groups = this->database_.objectGroupsForRevision(*actor, *revision_uuid, &error);
+        if (!error.isEmpty())
+            return unavailable();
+        QJsonArray items;
+        for (const ObjectGroup &group : groups)
+            items.append(objectGroupJson(group));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("groups"), items}});
+    }))
+        return false;
+
+    const std::function<bool(const QString &, bool)> registerCompensation =
+        [this, &server, post](const QString &route, bool redo) {
+        return server.route(route, post,
+            [this, redo](const QString &branch_id, const QHttpServerRequest &request) {
+                const std::optional<OperationContext> actor = actorFor(request);
+                if (!actor)
+                    return unauthorized();
+                const std::optional<QUuid> branch_uuid = parseUuid(branch_id);
+                const std::optional<QJsonObject> body = jsonBody(request);
+                if (!branch_uuid || !body)
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid request"));
+                const std::optional<qint64> generation = expectedGeneration(*body);
+                if (!generation)
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid expected_generation"));
+                QString error;
+                const std::optional<QUuid> group = redo
+                    ? this->database_.redoObjectGroup(*actor, *branch_uuid, *generation, &error)
+                    : this->database_.undoObjectGroup(*actor, *branch_uuid, *generation, &error);
+                if (!group)
+                    return jsonError(Status::Conflict, QStringLiteral("Undo/redo denied or conflicted"));
+                QJsonObject result{{QStringLiteral("target_group_uuid"), uuidString(*group)}};
+                const QJsonObject generation_info = workingGeneration(this->database_, *actor, *branch_uuid);
+                for (const QString &key : generation_info.keys())
+                    result.insert(key, generation_info.value(key));
+                return QHttpServerResponse(result);
+            });
+    };
+    if (!registerCompensation(QStringLiteral("/api/v1/branches/<arg>/undo"), false) ||
+        !registerCompensation(QStringLiteral("/api/v1/branches/<arg>/redo"), true))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/branches/<arg>/finalize"), post,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> uuid = parseUuid(id);
+        const std::optional<QJsonObject> body = jsonBody(request);
+        if (!uuid || !body)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid request"));
+        const std::optional<qint64> generation = expectedGeneration(*body);
+        if (!generation || !body->value(QStringLiteral("title")).isString())
+            return jsonError(Status::BadRequest, QStringLiteral("Expected title and decimal-string expected_generation"));
+        QString error;
+        const std::optional<Finalization> result = this->database_.finalize(
+            *actor, *uuid, *generation, body->value(QStringLiteral("title")).toString(),
+            body->value(QStringLiteral("message")).toString(), &error);
+        if (!result)
+            return jsonError(Status::Conflict, QStringLiteral("Revision finalization denied or conflicted"));
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("finalized_revision_uuid"), uuidString(result->finalized_revision_uuid)},
+            {QStringLiteral("new_working_revision_uuid"), uuidString(result->new_working_revision_uuid)},
+            {QStringLiteral("snapshot_sha256"), QString::fromLatin1(result->snapshot_sha256.toHex())},
+            {QStringLiteral("chain_sha256"), QString::fromLatin1(result->chain_sha256.toHex())}});
+    }))
+        return false;
+
+    return true;
+}
+
+} // namespace aowis::db

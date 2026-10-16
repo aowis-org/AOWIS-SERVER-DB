@@ -3,6 +3,7 @@
 
 #include <aowis/db/database.h>
 #include <aowis/db/model_codec.h>
+#include <aowis/db/model_validation.h>
 
 namespace aowis::db
 {

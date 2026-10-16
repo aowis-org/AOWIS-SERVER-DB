@@ -1,13 +1,15 @@
 #include <aowis/db/model_persistence.h>
+#include <aowis/db/model_validation.h>
 
 #include <QDataStream>
 #include <QHash>
 #include <QSet>
 #include <QIODevice>
-#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
+
+#include <cmath>
 
 namespace aowis::db
 {
@@ -55,6 +57,96 @@ void assignError(QString *error, const QString &message)
 QByteArray uuidBytes(const QUuid &uuid)
 {
     return uuid.toRfc4122();
+}
+
+// Read only objects relevant to one incoming network rather than scanning
+// all objects in the revision. The composite revision/object primary key is
+// used for each bounded IN batch (well below older SQLite variable limits).
+// Call only inside the save's BEGIN IMMEDIATE transaction.
+bool fetchObjectsForNetworkSave(const QSqlDatabase &database,
+                                const QUuid &revision_uuid,
+                                const QSet<QUuid> &wanted,
+                                QHash<QUuid, ModelObject> &result,
+                                QString *error)
+{
+    constexpr qsizetype batch_size = 300;
+    const QList<QUuid> ids = wanted.values();
+    for (qsizetype offset = 0; offset < ids.size(); offset += batch_size)
+    {
+        const qsizetype count = qMin(batch_size, ids.size() - offset);
+        QString placeholders;
+        for (qsizetype i = 0; i < count; ++i)
+            placeholders += i == 0 ? QStringLiteral("?") : QStringLiteral(",?");
+        QSqlQuery query(database);
+        if (!query.prepare(QStringLiteral(
+                "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
+                "WHERE revision_uuid=? AND object_uuid IN (%1)").arg(placeholders)))
+        {
+            assignError(error, query.lastError().text());
+            return false;
+        }
+        query.addBindValue(uuidBytes(revision_uuid));
+        for (qsizetype i = 0; i < count; ++i)
+            query.addBindValue(uuidBytes(ids.at(offset + i)));
+        if (!query.exec())
+        {
+            assignError(error, query.lastError().text());
+            return false;
+        }
+        while (query.next())
+        {
+            const ModelObject item{QUuid::fromRfc4122(query.value(0).toByteArray()),
+                                   query.value(1).toString(), query.value(2).toByteArray(),
+                                   query.value(3).toLongLong(), query.value(4).toBool()};
+            result.insert(item.uuid, item);
+        }
+    }
+    return true;
+}
+
+// Derived ownership is indexed by (revision_uuid, entity_uuid). Checking all
+// incoming UUIDs (including the root) also catches accidental collisions with
+// another network's entity, even if the object payload was tombstoned.
+bool checkIncomingNetworkOwnership(const QSqlDatabase &database,
+                                   const QUuid &revision_uuid,
+                                   const QUuid &network_uuid,
+                                   const QSet<QUuid> &incoming,
+                                   QString *error)
+{
+    constexpr qsizetype batch_size = 300;
+    const QList<QUuid> ids = incoming.values();
+    for (qsizetype offset = 0; offset < ids.size(); offset += batch_size)
+    {
+        const qsizetype count = qMin(batch_size, ids.size() - offset);
+        QString placeholders;
+        for (qsizetype i = 0; i < count; ++i)
+            placeholders += i == 0 ? QStringLiteral("?") : QStringLiteral(",?");
+        QSqlQuery query(database);
+        if (!query.prepare(QStringLiteral(
+                "SELECT network_uuid FROM hydraulic_network_members "
+                "WHERE revision_uuid=? AND entity_uuid IN (%1)").arg(placeholders)))
+        {
+            assignError(error, query.lastError().text());
+            return false;
+        }
+        query.addBindValue(uuidBytes(revision_uuid));
+        for (qsizetype i = 0; i < count; ++i)
+            query.addBindValue(uuidBytes(ids.at(offset + i)));
+        if (!query.exec())
+        {
+            assignError(error, query.lastError().text());
+            return false;
+        }
+        while (query.next())
+        {
+            if (QUuid::fromRfc4122(query.value(0).toByteArray()) != network_uuid)
+            {
+                assignError(error, QStringLiteral("Model object UUID is owned by another network"));
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void clearLists(NetworkHydraulic &network)
@@ -560,12 +652,332 @@ bool restoreList(QList<T> &target, const QList<QUuid> &uuids,
 
 } // namespace
 
+// Schema v6 is a derived index: it does not change canonical stored objects or
+// any finalized revision digest. Backfill every existing revision (including
+// finalized ones) before installing the immutability triggers.
+bool Database::migrateHydraulicMembershipV6(QString *error)
+{
+    if (!beginWrite(error))
+        return false;
+    const QString create = QStringLiteral(
+        "CREATE TABLE hydraulic_network_members ("
+        "revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,"
+        "network_uuid BLOB NOT NULL,"
+        "entity_uuid BLOB NOT NULL,"
+        "PRIMARY KEY(revision_uuid,entity_uuid),"
+        "FOREIGN KEY(revision_uuid,network_uuid) "
+        "REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT,"
+        "FOREIGN KEY(revision_uuid,entity_uuid) "
+        "REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT) WITHOUT ROWID");
+    if (!exec(create, error) || !exec(QStringLiteral(
+            "CREATE INDEX hydraulic_members_by_network ON "
+            "hydraulic_network_members(revision_uuid,network_uuid)"), error))
+    {
+        rollback();
+        return false;
+    }
+    QSqlQuery roots(this->database_);
+    if (!roots.exec(QStringLiteral(
+            "SELECT revision_uuid,object_uuid,content FROM revision_objects "
+            "WHERE kind='hydraulic.network' AND deleted=0")))
+    {
+        assignError(error, roots.lastError().text());
+        rollback();
+        return false;
+    }
+    QSqlQuery insert(this->database_);
+    if (!insert.prepare(QStringLiteral(
+            "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
+            "VALUES (?,?,?)")))
+    {
+        assignError(error, insert.lastError().text());
+        rollback();
+        return false;
+    }
+    while (roots.next())
+    {
+        const QByteArray revision_bytes = roots.value(0).toByteArray();
+        const QByteArray network_bytes = roots.value(1).toByteArray();
+        const std::optional<NetworkIndex> index = decodeIndex(roots.value(2).toByteArray(), error);
+        if (!index || uuidBytes(index->metadata.uuid) != network_bytes)
+        {
+            if (index)
+                assignError(error, QStringLiteral("Invalid hydraulic root during membership migration"));
+            rollback();
+            return false;
+        }
+        const QSet<QUuid> members = referencedIds(*index);
+        for (const QUuid &member : members)
+        {
+            insert.bindValue(0, revision_bytes);
+            insert.bindValue(1, network_bytes);
+            insert.bindValue(2, uuidBytes(member));
+            if (!insert.exec())
+            {
+                assignError(error, insert.lastError().text());
+                rollback();
+                return false;
+            }
+        }
+    }
+    roots.finish();
+    const char *const triggers[] = {
+        R"SQL(CREATE TRIGGER finalized_hydraulic_member_insert BEFORE INSERT ON hydraulic_network_members
+            WHEN (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized'
+            BEGIN SELECT RAISE(ABORT,'finalized network membership is immutable'); END)SQL",
+        R"SQL(CREATE TRIGGER finalized_hydraulic_member_delete BEFORE DELETE ON hydraulic_network_members
+            WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
+            BEGIN SELECT RAISE(ABORT,'finalized network membership is immutable'); END)SQL",
+        R"SQL(CREATE TRIGGER hydraulic_member_update_block BEFORE UPDATE ON hydraulic_network_members
+            BEGIN SELECT RAISE(ABORT,'network membership must be replaced transactionally'); END)SQL"
+    };
+    for (const char *statement : triggers)
+    {
+        if (!exec(QString::fromUtf8(statement), error))
+        {
+            rollback();
+            return false;
+        }
+    }
+    if (!exec(QStringLiteral("PRAGMA user_version=6"), error) || !commit(error))
+    {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+// Schema V7 adds a derived reverse-reference index, never included in
+// canonical revision hashes. The migration backfills finalized and working
+// revisions before installing immutability triggers.
+bool Database::migrateHydraulicReferencesV7(QString *error)
+{
+    if (!beginWrite(error))
+        return false;
+    if (!exec(QStringLiteral(
+            "CREATE TABLE hydraulic_network_references ("
+            "revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,"
+            "network_uuid BLOB NOT NULL,"
+            "source_uuid BLOB NOT NULL CHECK(length(source_uuid)=16),"
+            "target_uuid BLOB NOT NULL CHECK(length(target_uuid)=16),"
+            "field TEXT NOT NULL,"
+            "PRIMARY KEY(revision_uuid,network_uuid,source_uuid,target_uuid,field),"
+            "FOREIGN KEY(revision_uuid,network_uuid) "
+            "REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT) WITHOUT ROWID"), error) ||
+        !exec(QStringLiteral(
+            "CREATE INDEX hydraulic_references_by_target "
+            "ON hydraulic_network_references(revision_uuid,target_uuid)"), error))
+    {
+        rollback();
+        return false;
+    }
+
+    QSqlQuery roots(this->database_);
+    if (!roots.exec(QStringLiteral(
+            "SELECT revision_uuid,object_uuid FROM revision_objects "
+            "WHERE kind='hydraulic.network' AND deleted=0")))
+    {
+        assignError(error, roots.lastError().text());
+        rollback();
+        return false;
+    }
+    while (roots.next())
+    {
+        const QUuid revision_uuid = QUuid::fromRfc4122(roots.value(0).toByteArray());
+        const QUuid network_uuid = QUuid::fromRfc4122(roots.value(1).toByteArray());
+        const std::optional<NetworkHydraulic> network =
+            loadHydraulicNetworkUnchecked(revision_uuid, network_uuid, error);
+        if (!network || !replaceHydraulicReferences(revision_uuid, *network, error))
+        {
+            rollback();
+            return false;
+        }
+    }
+    roots.finish();
+    const char *const triggers[] = {
+        R"SQL(CREATE TRIGGER finalized_hydraulic_reference_insert
+            BEFORE INSERT ON hydraulic_network_references
+            WHEN (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized'
+            BEGIN SELECT RAISE(ABORT,'finalized hydraulic references are immutable'); END)SQL",
+        R"SQL(CREATE TRIGGER finalized_hydraulic_reference_delete
+            BEFORE DELETE ON hydraulic_network_references
+            WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
+            BEGIN SELECT RAISE(ABORT,'finalized hydraulic references are immutable'); END)SQL",
+        R"SQL(CREATE TRIGGER hydraulic_reference_update_block
+            BEFORE UPDATE ON hydraulic_network_references
+            BEGIN SELECT RAISE(ABORT,'hydraulic references cannot be updated'); END)SQL"
+    };
+    for (const char *statement : triggers)
+    {
+        if (!exec(QString::fromUtf8(statement), error))
+        {
+            rollback();
+            return false;
+        }
+    }
+    if (!exec(QStringLiteral("PRAGMA user_version=7"), error) || !commit(error))
+    {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+// References are derived from the validated Model graph, not authoritative
+// revision content. Preserve unchanged rows when a save only modifies scalar
+// properties (or when a multi-object edit changes other parts of the graph).
+//
+// A key encodes fixed-width source/target UUIDs followed by the UTF-8 field
+// path. This is unambiguous even when field paths contain arbitrary Unicode.
+// All work is performed inside the caller's BEGIN IMMEDIATE transaction.
+bool Database::replaceHydraulicReferences(const QUuid &revision_uuid,
+                                          const NetworkHydraulic &network,
+                                          QString *error) const
+{
+    const QByteArray revision_bytes = uuidBytes(revision_uuid);
+    const QByteArray network_bytes = uuidBytes(network.uuid);
+    QSet<QByteArray> wanted;
+    for (const HydraulicReference &reference : hydraulicReferences(network))
+    {
+        QByteArray key = uuidBytes(reference.source_uuid);
+        key.append(uuidBytes(reference.target_uuid));
+        key.append(reference.field.toUtf8());
+        wanted.insert(key);
+    }
+
+    QSet<QByteArray> previous;
+    QSqlQuery existing(this->database_);
+    if (!existing.prepare(QStringLiteral(
+            "SELECT source_uuid,target_uuid,field FROM hydraulic_network_references "
+            "WHERE revision_uuid=? AND network_uuid=?")))
+    {
+        assignError(error, existing.lastError().text());
+        return false;
+    }
+    existing.addBindValue(revision_bytes);
+    existing.addBindValue(network_bytes);
+    if (!existing.exec())
+    {
+        assignError(error, existing.lastError().text());
+        return false;
+    }
+    while (existing.next())
+    {
+        QByteArray key = existing.value(0).toByteArray();
+        key.append(existing.value(1).toByteArray());
+        key.append(existing.value(2).toString().toUtf8());
+        previous.insert(key);
+    }
+    existing.finish();
+
+    if (wanted == previous)
+        return true;
+
+    QSqlQuery remove(this->database_);
+    if (!remove.prepare(QStringLiteral(
+            "DELETE FROM hydraulic_network_references WHERE revision_uuid=? "
+            "AND network_uuid=? AND source_uuid=? AND target_uuid=? AND field=?")))
+    {
+        assignError(error, remove.lastError().text());
+        return false;
+    }
+    for (const QByteArray &key : previous)
+    {
+        if (wanted.contains(key))
+            continue;
+        remove.bindValue(0, revision_bytes);
+        remove.bindValue(1, network_bytes);
+        remove.bindValue(2, key.left(16));
+        remove.bindValue(3, key.mid(16, 16));
+        remove.bindValue(4, QString::fromUtf8(key.constData() + 32, key.size() - 32));
+        if (!remove.exec())
+        {
+            assignError(error, remove.lastError().text());
+            return false;
+        }
+    }
+
+    QSqlQuery insert(this->database_);
+    if (!insert.prepare(QStringLiteral(
+            "INSERT INTO hydraulic_network_references "
+            "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES(?,?,?,?,?)")))
+    {
+        assignError(error, insert.lastError().text());
+        return false;
+    }
+    for (const QByteArray &key : wanted)
+    {
+        if (previous.contains(key))
+            continue;
+        insert.bindValue(0, revision_bytes);
+        insert.bindValue(1, network_bytes);
+        insert.bindValue(2, key.left(16));
+        insert.bindValue(3, key.mid(16, 16));
+        insert.bindValue(4, QString::fromUtf8(key.constData() + 32, key.size() - 32));
+        if (!insert.exec())
+        {
+            assignError(error, insert.lastError().text());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Must be invoked inside an existing write transaction. The primary key
+// enforces exactly one owning root per entity, including multi-root groups.
+bool Database::replaceNetworkMembership(const QUuid &revision_uuid,
+                                        const QUuid &network_uuid,
+                                        const QSet<QUuid> &entity_uuids,
+                                        QString *error) const
+{
+    QSqlQuery remove(this->database_);
+    if (!remove.prepare(QStringLiteral(
+            "DELETE FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")))
+    {
+        assignError(error, remove.lastError().text());
+        return false;
+    }
+    remove.addBindValue(uuidBytes(revision_uuid));
+    remove.addBindValue(uuidBytes(network_uuid));
+    if (!remove.exec())
+    {
+        assignError(error, remove.lastError().text());
+        return false;
+    }
+    QSqlQuery insert(this->database_);
+    if (!insert.prepare(QStringLiteral(
+            "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
+            "VALUES(?,?,?)")))
+    {
+        assignError(error, insert.lastError().text());
+        return false;
+    }
+    for (const QUuid &member : entity_uuids)
+    {
+        insert.bindValue(0, uuidBytes(revision_uuid));
+        insert.bindValue(1, uuidBytes(network_uuid));
+        insert.bindValue(2, uuidBytes(member));
+        if (!insert.exec())
+        {
+            assignError(error, insert.lastError().text());
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Database::saveHydraulicNetwork(const OperationContext &actor,
                                    const QUuid &branch_uuid,
                                    qint64 expected_generation,
                                    const NetworkHydraulic &network,
                                    QString *error)
 {
+    const ModelValidationReport validation = validateHydraulicNetwork(network);
+    if (!validation.valid())
+    {
+        assignError(error, validation.summary());
+        return false;
+    }
     NetworkIndex index;
     QVector<StoredRecord> requested;
     if (!buildRecords(network, index, requested, error) || !beginWrite(error))
@@ -602,70 +1014,55 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
             }
         }
 
-        QHash<QUuid, ModelObject> existing;
-        QSqlQuery query(this->database_);
-        if (!query.prepare(QStringLiteral(
-            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects WHERE revision_uuid=?")))
-        {
-            assignError(error, query.lastError().text()); break;
-        }
-        query.addBindValue(uuidBytes(revision->uuid));
-        if (!query.exec())
-        {
-            assignError(error, query.lastError().text()); break;
-        }
-        while (query.next())
-        {
-            const ModelObject item{QUuid::fromRfc4122(query.value(0).toByteArray()),
-                query.value(1).toString(), query.value(2).toByteArray(),
-                query.value(3).toLongLong(), query.value(4).toBool()};
-            existing.insert(item.uuid, item);
-        }
-        query.finish();
-
+        // Inspect only this root to determine its previous member UUIDs.
+        // All subsequent object and ownership lookups use indexed primary keys.
         QSet<QUuid> old_ids;
-        if (existing.contains(network.uuid) && !existing[network.uuid].deleted)
+        QSqlQuery root(this->database_);
+        if (!root.prepare(QStringLiteral(
+                "SELECT kind,content FROM revision_objects "
+                "WHERE revision_uuid=? AND object_uuid=? AND deleted=0")))
         {
-            const ModelObject &old_root = existing[network.uuid];
-            if (old_root.kind != QStringLiteral("hydraulic.network"))
+            assignError(error, root.lastError().text()); break;
+        }
+        root.addBindValue(uuidBytes(revision->uuid));
+        root.addBindValue(uuidBytes(network.uuid));
+        if (!root.exec())
+        {
+            assignError(error, root.lastError().text()); break;
+        }
+        if (root.next())
+        {
+            if (root.value(0).toString() != QStringLiteral("hydraulic.network"))
             {
                 assignError(error, QStringLiteral("UUID already used by another object type")); break;
             }
-            const std::optional<NetworkIndex> previous = decodeIndex(old_root.content, error);
-            if (!previous || previous->metadata.uuid != network.uuid) break;
+            const std::optional<NetworkIndex> previous = decodeIndex(root.value(1).toByteArray(), error);
+            if (!previous || previous->metadata.uuid != network.uuid)
+            {
+                if (previous)
+                    assignError(error, QStringLiteral("Corrupted hydraulic network identity"));
+                break;
+            }
             old_ids = referencedIds(*previous);
         }
+        root.finish();
 
         QSet<QUuid> new_ids;
-        for (const StoredRecord &item : requested) new_ids.insert(item.uuid);
+        for (const StoredRecord &item : requested)
+            new_ids.insert(item.uuid);
+        if (!checkIncomingNetworkOwnership(this->database_, revision->uuid,
+                                           network.uuid, new_ids, error))
+            break;
 
-        // In a multi-network project, a model entity must not be reachable
-        // from two independently editable network roots. Never steal an
-        // existing entity UUID merely because its kind happens to match.
-        bool foreign_reference = false;
-        for (const ModelObject &stored : existing)
-        {
-            if (stored.deleted || stored.uuid == network.uuid ||
-                stored.kind != QStringLiteral("hydraulic.network"))
-                continue;
-            const std::optional<NetworkIndex> foreign = decodeIndex(stored.content, error);
-            if (!foreign || foreign->metadata.uuid != stored.uuid)
-            {
-                assignError(error, QStringLiteral("Corrupted foreign network root"));
-                foreign_reference = true; break;
-            }
-            const QSet<QUuid> foreign_ids = referencedIds(*foreign);
-            for (const QUuid &foreign_uuid : foreign_ids)
-            {
-                if (new_ids.contains(foreign_uuid) || foreign_uuid == network.uuid)
-                {
-                    assignError(error, QStringLiteral("Model object UUID is owned by another network"));
-                    foreign_reference = true; break;
-                }
-            }
-            if (foreign_reference) break;
-        }
-        if (foreign_reference) break;
+        // Include previous members for version-checked deletions, even when
+        // they are absent from the new incoming root. Objects from unrelated
+        // networks (and unrelated generic records) are never deserialized.
+        QSet<QUuid> relevant_ids = new_ids;
+        relevant_ids.unite(old_ids);
+        QHash<QUuid, ModelObject> existing;
+        if (!fetchObjectsForNetworkSave(this->database_, revision->uuid,
+                                        relevant_ids, existing, error))
+            break;
 
         bool write_failed = false;
         for (const StoredRecord &item : requested)
@@ -703,6 +1100,23 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
             }
         }
         if (write_failed) break;
+        const std::optional<RevisionInfo> after = revisionUnchecked(revision->uuid, error);
+        if (!after) break;
+        if (after->generation != expected_generation)
+        {
+            // saveHydraulicNetwork has already validated the complete typed
+            // input; keep the derived ownership index in the same transaction.
+            // Membership is derived from the root UUID lists. Scalar edits
+            // and list reordering do not alter ownership, so avoid deleting
+            // and reinserting every member of a large network on those saves.
+            const QSet<QUuid> new_members = referencedIds(index);
+            if (old_ids != new_members &&
+                !replaceNetworkMembership(revision->uuid, network.uuid, new_members, error))
+                break;
+            if (!replaceHydraulicReferences(revision->uuid, network, error)) break;
+            if (!writeObjectGroupInTransaction(*revision, actor, QStringLiteral("edit"),
+                                               QUuid(), expected_generation, error)) break;
+        }
         ok = true;
     } while (false);
     if (ok) ok = commit(error);
@@ -718,19 +1132,101 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetwork(
     if (!revision || !requirePermission(actor, QStringLiteral("project.read"),
                                          AccessScope::branch(revision->branch_uuid), error))
         return std::nullopt;
-    const QVector<ModelObject> visible = objects(actor, revision_uuid, error);
-    QHash<QUuid, ModelObject> rows;
-    for (const ModelObject &row : visible) rows.insert(row.uuid, row);
-    if (!rows.contains(network_uuid) || rows[network_uuid].kind != QStringLiteral("hydraulic.network"))
+    return loadHydraulicNetworkUnchecked(revision_uuid, network_uuid, error);
+}
+
+std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
+    const QUuid &revision_uuid, const QUuid &network_uuid, QString *error) const
+{
+    // Fetch only the root, then the rows belonging to this network. Other
+    // networks in the same revision are never deserialized on a local edit.
+    QSqlQuery root(this->database_);
+    if (!root.prepare(QStringLiteral(
+            "SELECT content FROM revision_objects WHERE revision_uuid=? AND object_uuid=? "
+            "AND kind='hydraulic.network' AND deleted=0")))
+    {
+        assignError(error, root.lastError().text());
+        return std::nullopt;
+    }
+    root.addBindValue(uuidBytes(revision_uuid));
+    root.addBindValue(uuidBytes(network_uuid));
+    if (!root.exec())
+    {
+        assignError(error, root.lastError().text());
+        return std::nullopt;
+    }
+    if (!root.next())
     {
         assignError(error, QStringLiteral("Hydraulic network is not stored in this revision"));
         return std::nullopt;
     }
-    const std::optional<NetworkIndex> index = decodeIndex(rows[network_uuid].content, error);
+    const std::optional<NetworkIndex> index = decodeIndex(root.value(0).toByteArray(), error);
+    root.finish();
     if (!index || index->metadata.uuid != network_uuid)
     {
-        assignError(error, QStringLiteral("Hydraulic network identity mismatch"));
+        if (index)
+            assignError(error, QStringLiteral("Hydraulic network identity mismatch"));
         return std::nullopt;
+    }
+    const QSet<QUuid> references = referencedIds(*index);
+    QHash<QUuid, ModelObject> rows;
+    QSqlQuery members(this->database_);
+    if (!members.prepare(QStringLiteral(
+            "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
+            "FROM hydraulic_network_members m JOIN revision_objects o "
+            "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
+            "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+    {
+        assignError(error, members.lastError().text());
+        return std::nullopt;
+    }
+    members.addBindValue(uuidBytes(revision_uuid));
+    members.addBindValue(uuidBytes(network_uuid));
+    if (!members.exec())
+    {
+        assignError(error, members.lastError().text());
+        return std::nullopt;
+    }
+    while (members.next())
+    {
+        const QUuid uuid = QUuid::fromRfc4122(members.value(0).toByteArray());
+        if (!references.contains(uuid))
+            continue; // Root changed, membership index not committed yet.
+        rows.insert(uuid, ModelObject{uuid, members.value(1).toString(),
+                    members.value(2).toByteArray(), members.value(3).toLongLong(),
+                    members.value(4).toBool()});
+    }
+    members.finish();
+    // Only root edits may introduce new referenced UUIDs before the membership
+    // index is synchronized. Indexed edits normally need zero extra queries.
+    QSqlQuery newly_referenced(this->database_);
+    if (!newly_referenced.prepare(QStringLiteral(
+            "SELECT kind,content,version,deleted FROM revision_objects "
+            "WHERE revision_uuid=? AND object_uuid=?")))
+    {
+        assignError(error, newly_referenced.lastError().text());
+        return std::nullopt;
+    }
+    for (const QUuid &uuid : references)
+    {
+        if (rows.contains(uuid))
+            continue;
+        newly_referenced.bindValue(0, uuidBytes(revision_uuid));
+        newly_referenced.bindValue(1, uuidBytes(uuid));
+        if (!newly_referenced.exec())
+        {
+            assignError(error, newly_referenced.lastError().text());
+            return std::nullopt;
+        }
+        if (!newly_referenced.next())
+        {
+            assignError(error, QStringLiteral("Missing referenced hydraulic entity"));
+            return std::nullopt;
+        }
+        rows.insert(uuid, ModelObject{uuid, newly_referenced.value(0).toString(),
+                    newly_referenced.value(1).toByteArray(),
+                    newly_referenced.value(2).toLongLong(), newly_referenced.value(3).toBool()});
+        newly_referenced.finish();
     }
     NetworkHydraulic result = index->metadata;
     QSet<QUuid> seen{network_uuid};
@@ -771,6 +1267,851 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetwork(
     if (!restoreList(result.map_labels, index->map_labels, QStringLiteral("hydraulic.map_label"),
                      rows, seen, error)) return std::nullopt;
     return result;
+}
+
+// Compare the fields which the Model reference validator actually observes,
+// without reconstructing every entity in the network. The partial network is
+// deliberately used ONLY to collect outgoing references, never to judge their
+// validity (targets are not loaded). Root-owned options and MSX are excluded.
+template<typename T>
+std::optional<QVector<HydraulicReference>> outgoingReferences(
+    const QByteArray &content, const QUuid &entity_uuid,
+    QList<T> NetworkHydraulic::*collection)
+{
+    const std::optional<T> value = ModelCodec<T>::decode(content);
+    if (!value || value->uuid != entity_uuid)
+        return std::nullopt;
+    NetworkHydraulic partial;
+    (partial.*collection).append(*value);
+    QVector<HydraulicReference> result;
+    for (const HydraulicReference &reference : hydraulicReferences(partial))
+        if (reference.source_uuid == entity_uuid)
+            result.append(reference);
+    return result;
+}
+
+bool sameOutgoingReferences(const QVector<HydraulicReference> &before,
+                            const QVector<HydraulicReference> &after)
+{
+    if (before.size() != after.size())
+        return false;
+    for (qsizetype i = 0; i < before.size(); ++i)
+    {
+        if (before[i].source_uuid != after[i].source_uuid ||
+            before[i].target_uuid != after[i].target_uuid ||
+            before[i].field != after[i].field)
+            return false;
+    }
+    return true;
+}
+
+template<typename T>
+bool unchangedValidationFields(const QByteArray &before, const QByteArray &after,
+                               const QUuid &entity_uuid,
+                               QList<T> NetworkHydraulic::*collection)
+{
+    const std::optional<QVector<HydraulicReference>> old_references =
+        outgoingReferences(before, entity_uuid, collection);
+    const std::optional<QVector<HydraulicReference>> new_references =
+        outgoingReferences(after, entity_uuid, collection);
+    return old_references && new_references &&
+           sameOutgoingReferences(*old_references, *new_references);
+}
+
+// An assigned-junction demand point additionally depends on the attachment
+// mode and pipe endpoints. Those endpoints cannot change in the fast path,
+// and the mode must remain the same. Pipe position itself is validated here.
+bool unchangedDemandPointConstraints(const QByteArray &before,
+                                     const QByteArray &after,
+                                     const QUuid &entity_uuid)
+{
+    const std::optional<HydraulicDemandPoint> old_point =
+        ModelCodec<HydraulicDemandPoint>::decode(before);
+    const std::optional<HydraulicDemandPoint> new_point =
+        ModelCodec<HydraulicDemandPoint>::decode(after);
+    if (!old_point || !new_point || old_point->uuid != entity_uuid ||
+        new_point->uuid != entity_uuid ||
+        old_point->attachment.type != new_point->attachment.type ||
+        old_point->attachment.pipe_allocation_mode != new_point->attachment.pipe_allocation_mode)
+        return false;
+    if (new_point->attachment.type == HydraulicDemandPointAttachmentType::Pipe)
+    {
+        if (!std::isfinite(new_point->attachment.pipe_position) ||
+            new_point->attachment.pipe_position < 0.0 ||
+            new_point->attachment.pipe_position > 1.0)
+            return false;
+    }
+    return unchangedValidationFields(before, after, entity_uuid,
+                                      &NetworkHydraulic::demand_points);
+}
+
+// No fast-path for roots, insertions, deletions, or rule premises (their
+// node-vs-link discriminator can change the expected target type). For other
+// existing objects, stable IDs and outgoing references preserve all graph
+// constraints checked by NetworkReferenceValidator. Unknown kinds fall back.
+bool referenceNeutralEntityEdit(const QString &kind, const QByteArray &before,
+                                const QByteArray &after, const QUuid &entity_uuid)
+{
+    if (kind == QStringLiteral("hydraulic.demand_point"))
+        return unchangedDemandPointConstraints(before, after, entity_uuid);
+#define AOWIS_CHECK_ENTITY(TYPE, FIELD) \
+    if (kind == HydraulicObjectKind<TYPE>::value()) \
+        return unchangedValidationFields(before, after, entity_uuid, &NetworkHydraulic::FIELD);
+    AOWIS_CHECK_ENTITY(HydraulicPipeMaterial, pipe_materials)
+    AOWIS_CHECK_ENTITY(HydraulicPatternTime, patterns_time)
+    AOWIS_CHECK_ENTITY(HydraulicCurveTankVolume, curves_tank_volume)
+    AOWIS_CHECK_ENTITY(HydraulicCurvePumpHead, curves_pump_head)
+    AOWIS_CHECK_ENTITY(HydraulicCurvePumpEfficiency, curves_pump_efficiency)
+    AOWIS_CHECK_ENTITY(HydraulicCurveValveHeadloss, curves_valve_headloss)
+    AOWIS_CHECK_ENTITY(HydraulicCurveValveCharacteristic, curves_valve_characteristic)
+    AOWIS_CHECK_ENTITY(HydraulicCurveGeneric, curves_generic)
+    AOWIS_CHECK_ENTITY(HydraulicNodeReservoir, nodes_reservoirs)
+    AOWIS_CHECK_ENTITY(HydraulicNodeJunction, nodes_junctions)
+    AOWIS_CHECK_ENTITY(HydraulicNodeTank, nodes_tanks)
+    AOWIS_CHECK_ENTITY(HydraulicLinkPipe, links_pipes)
+    AOWIS_CHECK_ENTITY(HydraulicLinkPump, links_pumps)
+    AOWIS_CHECK_ENTITY(HydraulicLinkValve, links_valves)
+    AOWIS_CHECK_ENTITY(HydraulicControlSimple, controls_simple)
+    AOWIS_CHECK_ENTITY(HydraulicMapLabel, map_labels)
+#undef AOWIS_CHECK_ENTITY
+    return false;
+}
+
+// After an edit, the latest immutable object event supplies the exact prior
+// bytes. This includes undo and redo; a missing or malformed event is always
+// a reason to run full validation, never a reason to accept an edit.
+bool Database::canSkipHydraulicRevalidation(const QUuid &revision_uuid,
+                                            const QUuid &entity_uuid,
+                                            QString *error) const
+{
+    QSqlQuery current(this->database_);
+    if (!current.prepare(QStringLiteral(
+            "SELECT kind,content,deleted FROM revision_objects "
+            "WHERE revision_uuid=? AND object_uuid=?")))
+    {
+        assignError(error, current.lastError().text());
+        return false;
+    }
+    current.addBindValue(uuidBytes(revision_uuid));
+    current.addBindValue(uuidBytes(entity_uuid));
+    if (!current.exec())
+    {
+        assignError(error, current.lastError().text());
+        return false;
+    }
+    if (!current.next() || current.value(2).toBool())
+        return false;
+    const QString kind = current.value(0).toString();
+    const QByteArray updated = current.value(1).toByteArray();
+    current.finish();
+    QSqlQuery previous(this->database_);
+    if (!previous.prepare(QStringLiteral(
+            "SELECT before_content,before_deleted FROM object_events "
+            "WHERE revision_uuid=? AND object_uuid=? ORDER BY sequence DESC LIMIT 1")))
+    {
+        assignError(error, previous.lastError().text());
+        return false;
+    }
+    previous.addBindValue(uuidBytes(revision_uuid));
+    previous.addBindValue(uuidBytes(entity_uuid));
+    if (!previous.exec())
+    {
+        assignError(error, previous.lastError().text());
+        return false;
+    }
+    if (!previous.next() || previous.value(1).toBool() || previous.value(0).isNull())
+        return false;
+    return referenceNeutralEntityEdit(kind, previous.value(0).toByteArray(),
+                                      updated, entity_uuid);
+}
+
+// A deliberately bounded structural fast path for existing links' endpoints,
+// typed link resources (materials, curves and patterns), and demand-point
+// attachments. Every new link reference must resolve to an object of the
+// expected kind in the same indexed hydraulic network. The old reverse-
+// reference index identifies untouched demand points that may depend on a
+// moved PIPE endpoint; pump/valve resource changes have no such dependency.
+enum class LocalStructureCheck { NotApplicable, Accepted, SqlError };
+
+struct LocalStructureEdit
+{
+    QUuid uuid;
+    QUuid network_uuid;
+    QString kind;
+    QByteArray before;
+    QByteArray after;
+};
+
+bool locallyOwnedObject(const QSqlDatabase &database, const QUuid &revision_uuid,
+                        const QUuid &network_uuid, const QUuid &object_uuid,
+                        QString &kind, QByteArray &content, QString *error)
+{
+    QSqlQuery query(database);
+    if (!query.prepare(QStringLiteral(
+            "SELECT o.kind,o.content FROM hydraulic_network_members AS m "
+            "JOIN revision_objects AS o ON o.revision_uuid=m.revision_uuid "
+            "AND o.object_uuid=m.entity_uuid "
+            "WHERE m.revision_uuid=? AND m.network_uuid=? AND m.entity_uuid=? "
+            "AND o.deleted=0")))
+    {
+        assignError(error, query.lastError().text());
+        return false;
+    }
+    query.addBindValue(uuidBytes(revision_uuid));
+    query.addBindValue(uuidBytes(network_uuid));
+    query.addBindValue(uuidBytes(object_uuid));
+    if (!query.exec())
+    {
+        assignError(error, query.lastError().text());
+        return false;
+    }
+    if (!query.next())
+        return false;
+    kind = query.value(0).toString();
+    content = query.value(1).toByteArray();
+    return true;
+}
+
+bool localTargetType(const QSqlDatabase &database, const QUuid &revision_uuid,
+                     const QUuid &network_uuid, const QUuid &target_uuid,
+                     const QSet<QString> &allowed, QString *error)
+{
+    if (target_uuid.isNull())
+        return true; // Incomplete draft references are explicitly supported.
+    QString kind;
+    QByteArray content;
+    return locallyOwnedObject(database, revision_uuid, network_uuid,
+                              target_uuid, kind, content, error) && allowed.contains(kind);
+}
+
+bool localDemandPointConstraints(const QSqlDatabase &database,
+                                 const QUuid &revision_uuid, const QUuid &network_uuid,
+                                 const HydraulicDemandPoint &point, QString *error)
+{
+    const HydraulicDemandPointAttachment &attachment = point.attachment;
+    if (attachment.type == HydraulicDemandPointAttachmentType::Junction)
+        return localTargetType(database, revision_uuid, network_uuid,
+                               attachment.junction_uuid, {QStringLiteral("hydraulic.junction")}, error);
+    if (attachment.type != HydraulicDemandPointAttachmentType::Pipe)
+        return true;
+    if (!std::isfinite(attachment.pipe_position) || attachment.pipe_position < 0.0 ||
+        attachment.pipe_position > 1.0)
+        return false;
+    if (!localTargetType(database, revision_uuid, network_uuid, attachment.pipe_uuid,
+                         {QStringLiteral("hydraulic.pipe")}, error))
+        return false;
+    if (attachment.pipe_allocation_mode != HydraulicDemandPointPipeAllocationMode::AssignedJunction)
+        return true;
+    if (!localTargetType(database, revision_uuid, network_uuid,
+                         attachment.pipe_assigned_junction_uuid,
+                         {QStringLiteral("hydraulic.junction")}, error))
+        return false;
+    if (attachment.pipe_uuid.isNull() || attachment.pipe_assigned_junction_uuid.isNull())
+        return true;
+    QString pipe_kind;
+    QByteArray pipe_content;
+    if (!locallyOwnedObject(database, revision_uuid, network_uuid, attachment.pipe_uuid,
+                            pipe_kind, pipe_content, error))
+        return false;
+    const std::optional<HydraulicLinkPipe> pipe = ModelCodec<HydraulicLinkPipe>::decode(pipe_content);
+    return pipe && pipe->uuid == attachment.pipe_uuid &&
+           (pipe->node_uuid_from == attachment.pipe_assigned_junction_uuid ||
+            pipe->node_uuid_to == attachment.pipe_assigned_junction_uuid);
+}
+
+// Only the attachment references are allowed to change on the local point path.
+// Demand-pattern references must stay identical (and were already validated).
+QVector<HydraulicReference> nonAttachmentReferences(const QVector<HydraulicReference> &references)
+{
+    QVector<HydraulicReference> result;
+    for (const HydraulicReference &reference : references)
+        if (!reference.field.contains(QStringLiteral(".attachment.")))
+            result.append(reference);
+    return result;
+}
+
+// The V12 delta writer, scoped to one touched source instead of reconstructing
+// a network-sized desired reference set. Only call after ALL local validation
+// succeeds and within the caller's ongoing write transaction.
+bool updateLocalReferenceSource(const QSqlDatabase &database, const QUuid &revision_uuid,
+                                const QUuid &network_uuid, const QUuid &source_uuid,
+                                const QVector<HydraulicReference> &desired,
+                                QString *error)
+{
+    QSet<QByteArray> wanted;
+    for (const HydraulicReference &ref : desired)
+    {
+        QByteArray key = uuidBytes(ref.target_uuid);
+        key.append(ref.field.toUtf8());
+        wanted.insert(key);
+    }
+    QSqlQuery existing(database);
+    if (!existing.prepare(QStringLiteral(
+            "SELECT target_uuid,field FROM hydraulic_network_references "
+            "WHERE revision_uuid=? AND network_uuid=? AND source_uuid=?")))
+    {
+        assignError(error, existing.lastError().text());
+        return false;
+    }
+    existing.addBindValue(uuidBytes(revision_uuid));
+    existing.addBindValue(uuidBytes(network_uuid));
+    existing.addBindValue(uuidBytes(source_uuid));
+    if (!existing.exec())
+    {
+        assignError(error, existing.lastError().text());
+        return false;
+    }
+    QSet<QByteArray> previous;
+    while (existing.next())
+    {
+        QByteArray key = existing.value(0).toByteArray();
+        key.append(existing.value(1).toString().toUtf8());
+        previous.insert(key);
+    }
+    existing.finish();
+    if (previous == wanted)
+        return true;
+    QSqlQuery remove(database);
+    QSqlQuery insert(database);
+    if (!remove.prepare(QStringLiteral(
+            "DELETE FROM hydraulic_network_references WHERE revision_uuid=? "
+            "AND network_uuid=? AND source_uuid=? AND target_uuid=? AND field=?")) ||
+        !insert.prepare(QStringLiteral(
+            "INSERT INTO hydraulic_network_references "
+            "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "VALUES(?,?,?,?,?)")))
+    {
+        assignError(error, remove.lastError().isValid() ? remove.lastError().text()
+                                                         : insert.lastError().text());
+        return false;
+    }
+    for (const QByteArray &key : previous)
+    {
+        if (wanted.contains(key))
+            continue;
+        remove.bindValue(0, uuidBytes(revision_uuid));
+        remove.bindValue(1, uuidBytes(network_uuid));
+        remove.bindValue(2, uuidBytes(source_uuid));
+        remove.bindValue(3, key.left(16));
+        remove.bindValue(4, QString::fromUtf8(key.constData() + 16, key.size() - 16));
+        if (!remove.exec())
+        {
+            assignError(error, remove.lastError().text());
+            return false;
+        }
+    }
+    for (const QByteArray &key : wanted)
+    {
+        if (previous.contains(key))
+            continue;
+        insert.bindValue(0, uuidBytes(revision_uuid));
+        insert.bindValue(1, uuidBytes(network_uuid));
+        insert.bindValue(2, uuidBytes(source_uuid));
+        insert.bindValue(3, key.left(16));
+        insert.bindValue(4, QString::fromUtf8(key.constData() + 16, key.size() - 16));
+        if (!insert.exec())
+        {
+            assignError(error, insert.lastError().text());
+            return false;
+        }
+    }
+    return true;
+}
+
+LocalStructureCheck checkLocalPipeAndAttachments(const QSqlDatabase &database,
+                                                 const QUuid &revision_uuid,
+                                                 const QSet<QUuid> &touched_uuids,
+                                                 QString *error)
+{
+    QVector<LocalStructureEdit> edits;
+    QSet<QUuid> changed_pipes;
+    QSqlQuery state(database);
+    QSqlQuery owner(database);
+    QSqlQuery previous(database);
+    if (!state.prepare(QStringLiteral(
+            "SELECT kind,content,deleted FROM revision_objects "
+            "WHERE revision_uuid=? AND object_uuid=?")) ||
+        !owner.prepare(QStringLiteral(
+            "SELECT network_uuid FROM hydraulic_network_members "
+            "WHERE revision_uuid=? AND entity_uuid=?")) ||
+        !previous.prepare(QStringLiteral(
+            "SELECT before_content,before_deleted FROM object_events "
+            "WHERE revision_uuid=? AND object_uuid=? ORDER BY sequence DESC LIMIT 1")))
+    {
+        assignError(error, QStringLiteral("Cannot prepare local structural validation queries"));
+        return LocalStructureCheck::SqlError;
+    }
+    for (const QUuid &id : touched_uuids)
+    {
+        state.bindValue(0, uuidBytes(revision_uuid));
+        state.bindValue(1, uuidBytes(id));
+        owner.bindValue(0, uuidBytes(revision_uuid));
+        owner.bindValue(1, uuidBytes(id));
+        previous.bindValue(0, uuidBytes(revision_uuid));
+        previous.bindValue(1, uuidBytes(id));
+        if (!state.exec() || !owner.exec() || !previous.exec())
+        {
+            assignError(error, QStringLiteral("Cannot query local structural validation data"));
+            return LocalStructureCheck::SqlError;
+        }
+        if (!state.next() || state.value(2).toBool() || !owner.next() ||
+            !previous.next() || previous.value(1).toBool() || previous.value(0).isNull())
+            return LocalStructureCheck::NotApplicable;
+        const QString kind = state.value(0).toString();
+        if (kind != QStringLiteral("hydraulic.pipe") &&
+            kind != QStringLiteral("hydraulic.pump") &&
+            kind != QStringLiteral("hydraulic.valve") &&
+            kind != QStringLiteral("hydraulic.demand_point"))
+            return LocalStructureCheck::NotApplicable;
+        LocalStructureEdit edit{id, QUuid::fromRfc4122(owner.value(0).toByteArray()),
+                                kind, previous.value(0).toByteArray(), state.value(1).toByteArray()};
+        if (kind == QStringLiteral("hydraulic.pipe"))
+        {
+            const std::optional<HydraulicLinkPipe> before = ModelCodec<HydraulicLinkPipe>::decode(edit.before);
+            const std::optional<HydraulicLinkPipe> after = ModelCodec<HydraulicLinkPipe>::decode(edit.after);
+            if (!before || !after || before->uuid != id || after->uuid != id)
+                return LocalStructureCheck::NotApplicable;
+            // Material changes do not affect an attached demand point's
+            // assigned endpoint; only endpoint moves require reverse scans.
+            if (before->node_uuid_from != after->node_uuid_from ||
+                before->node_uuid_to != after->node_uuid_to)
+                changed_pipes.insert(id);
+        }
+        else if (kind == QStringLiteral("hydraulic.pump"))
+        {
+            const std::optional<HydraulicLinkPump> before = ModelCodec<HydraulicLinkPump>::decode(edit.before);
+            const std::optional<HydraulicLinkPump> after = ModelCodec<HydraulicLinkPump>::decode(edit.after);
+            if (!before || !after || before->uuid != id || after->uuid != id)
+                return LocalStructureCheck::NotApplicable;
+        }
+        else if (kind == QStringLiteral("hydraulic.valve"))
+        {
+            const std::optional<HydraulicLinkValve> before = ModelCodec<HydraulicLinkValve>::decode(edit.before);
+            const std::optional<HydraulicLinkValve> after = ModelCodec<HydraulicLinkValve>::decode(edit.after);
+            if (!before || !after || before->uuid != id || after->uuid != id)
+                return LocalStructureCheck::NotApplicable;
+        }
+        else
+        {
+            const std::optional<HydraulicDemandPoint> before = ModelCodec<HydraulicDemandPoint>::decode(edit.before);
+            const std::optional<HydraulicDemandPoint> after = ModelCodec<HydraulicDemandPoint>::decode(edit.after);
+            if (!before || !after || before->uuid != id || after->uuid != id)
+                return LocalStructureCheck::NotApplicable;
+            const std::optional<QVector<HydraulicReference>> old_refs =
+                outgoingReferences(edit.before, id, &NetworkHydraulic::demand_points);
+            const std::optional<QVector<HydraulicReference>> new_refs =
+                outgoingReferences(edit.after, id, &NetworkHydraulic::demand_points);
+            if (!old_refs || !new_refs ||
+                !sameOutgoingReferences(nonAttachmentReferences(*old_refs),
+                                        nonAttachmentReferences(*new_refs)))
+                return LocalStructureCheck::NotApplicable;
+        }
+        edits.append(edit);
+        state.finish();
+        owner.finish();
+        previous.finish();
+    }
+
+    const QSet<QString> node_kinds{QStringLiteral("hydraulic.junction"),
+                                   QStringLiteral("hydraulic.reservoir"),
+                                   QStringLiteral("hydraulic.tank")};
+    const QSet<QString> material_kinds{QStringLiteral("hydraulic.pipe_material")};
+    const QSet<QString> pattern_kinds{QStringLiteral("hydraulic.pattern_time")};
+    const QSet<QString> pump_head_kinds{QStringLiteral("hydraulic.curve_pump_head")};
+    const QSet<QString> pump_efficiency_kinds{QStringLiteral("hydraulic.curve_pump_efficiency")};
+    const QSet<QString> valve_headloss_kinds{QStringLiteral("hydraulic.curve_valve_headloss")};
+    const QSet<QString> valve_characteristic_kinds{QStringLiteral("hydraulic.curve_valve_characteristic")};
+    for (const LocalStructureEdit &edit : edits)
+    {
+        if (edit.kind == QStringLiteral("hydraulic.pipe"))
+        {
+            const std::optional<HydraulicLinkPipe> pipe = ModelCodec<HydraulicLinkPipe>::decode(edit.after);
+            if (!pipe || pipe->uuid != edit.uuid ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pipe->node_uuid_from, node_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pipe->node_uuid_to, node_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pipe->material_uuid, material_kinds, error))
+                return LocalStructureCheck::NotApplicable;
+        }
+        else if (edit.kind == QStringLiteral("hydraulic.pump"))
+        {
+            const std::optional<HydraulicLinkPump> pump = ModelCodec<HydraulicLinkPump>::decode(edit.after);
+            if (!pump || pump->uuid != edit.uuid ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pump->node_uuid_from, node_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pump->node_uuid_to, node_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pump->head_curve_uuid, pump_head_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pump->speed_pattern_uuid, pattern_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pump->efficiency_curve_uuid, pump_efficiency_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 pump->price_pattern_uuid, pattern_kinds, error))
+                return LocalStructureCheck::NotApplicable;
+        }
+        else if (edit.kind == QStringLiteral("hydraulic.valve"))
+        {
+            const std::optional<HydraulicLinkValve> valve = ModelCodec<HydraulicLinkValve>::decode(edit.after);
+            if (!valve || valve->uuid != edit.uuid ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 valve->node_uuid_from, node_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 valve->node_uuid_to, node_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 valve->head_loss_curve_uuid, valve_headloss_kinds, error) ||
+                !localTargetType(database, revision_uuid, edit.network_uuid,
+                                 valve->characteristic_curve_uuid, valve_characteristic_kinds, error))
+                return LocalStructureCheck::NotApplicable;
+        }
+        else
+        {
+            const std::optional<HydraulicDemandPoint> point = ModelCodec<HydraulicDemandPoint>::decode(edit.after);
+            if (!point || !localDemandPointConstraints(database, revision_uuid,
+                                                        edit.network_uuid, *point, error))
+                return LocalStructureCheck::NotApplicable;
+        }
+    }
+
+    // Previously indexed demand points attached to a changed pipe must still
+    // be valid in the *final* transactional state, even when they weren't part
+    // of this group. This closes the endpoint/assigned-junction dependency.
+    QSqlQuery dependents(database);
+    if (!dependents.prepare(QStringLiteral(
+            "SELECT DISTINCT r.source_uuid,r.network_uuid FROM hydraulic_network_references AS r "
+            "WHERE r.revision_uuid=? AND r.target_uuid=? "
+            "AND r.field LIKE 'demand_point%attachment.pipe_uuid'")))
+    {
+        assignError(error, dependents.lastError().text());
+        return LocalStructureCheck::SqlError;
+    }
+    for (const QUuid &pipe_uuid : changed_pipes)
+    {
+        dependents.bindValue(0, uuidBytes(revision_uuid));
+        dependents.bindValue(1, uuidBytes(pipe_uuid));
+        if (!dependents.exec())
+        {
+            assignError(error, dependents.lastError().text());
+            return LocalStructureCheck::SqlError;
+        }
+        while (dependents.next())
+        {
+            const QUuid point_uuid = QUuid::fromRfc4122(dependents.value(0).toByteArray());
+            const QUuid network_uuid = QUuid::fromRfc4122(dependents.value(1).toByteArray());
+            QString kind;
+            QByteArray content;
+            if (!locallyOwnedObject(database, revision_uuid, network_uuid, point_uuid,
+                                    kind, content, error) || kind != QStringLiteral("hydraulic.demand_point"))
+                return LocalStructureCheck::NotApplicable;
+            const std::optional<HydraulicDemandPoint> point = ModelCodec<HydraulicDemandPoint>::decode(content);
+            if (!point || point->uuid != point_uuid ||
+                !localDemandPointConstraints(database, revision_uuid, network_uuid, *point, error))
+                return LocalStructureCheck::NotApplicable;
+        }
+        dependents.finish();
+    }
+
+    // No broad index rebuild: update only the touched source UUIDs. An SQL
+    // failure aborts the whole transaction via the caller's rollback path.
+    for (const LocalStructureEdit &edit : edits)
+    {
+        std::optional<QVector<HydraulicReference>> refs;
+        if (edit.kind == QStringLiteral("hydraulic.pipe"))
+            refs = outgoingReferences(edit.after, edit.uuid, &NetworkHydraulic::links_pipes);
+        else if (edit.kind == QStringLiteral("hydraulic.pump"))
+            refs = outgoingReferences(edit.after, edit.uuid, &NetworkHydraulic::links_pumps);
+        else if (edit.kind == QStringLiteral("hydraulic.valve"))
+            refs = outgoingReferences(edit.after, edit.uuid, &NetworkHydraulic::links_valves);
+        else
+            refs = outgoingReferences(edit.after, edit.uuid, &NetworkHydraulic::demand_points);
+        if (!refs || !updateLocalReferenceSource(database, revision_uuid,
+                                                  edit.network_uuid, edit.uuid, *refs, error))
+            return LocalStructureCheck::SqlError;
+    }
+    return LocalStructureCheck::Accepted;
+}
+
+// Called with a BEGIN IMMEDIATE transaction already active, after the final
+// object state has been written. The caller rolls back *all* object changes and
+// journal records when this validation fails.
+bool Database::validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
+                                                 const QSet<QUuid> &touched_uuids,
+                                                 QString *error) const
+{
+    if (touched_uuids.isEmpty())
+        return true;
+
+    // A lookup by (revision,entity) finds the owning root in O(log N),
+    // without scanning and deserializing every root in the project.
+    QSqlQuery owner(this->database_);
+    if (!owner.prepare(QStringLiteral(
+            "SELECT network_uuid FROM hydraulic_network_members "
+            "WHERE revision_uuid=? AND entity_uuid=?")))
+    {
+        assignError(error, owner.lastError().text());
+        return false;
+    }
+    QSqlQuery touched_row(this->database_);
+    if (!touched_row.prepare(QStringLiteral(
+            "SELECT kind,content,deleted FROM revision_objects "
+            "WHERE revision_uuid=? AND object_uuid=?")))
+    {
+        assignError(error, touched_row.lastError().text());
+        return false;
+    }
+    QHash<QUuid, QSet<QUuid>> changed_roots;
+    QSet<QUuid> affected;
+    for (const QUuid &uuid : touched_uuids)
+    {
+        touched_row.bindValue(0, uuidBytes(revision_uuid));
+        touched_row.bindValue(1, uuidBytes(uuid));
+        if (!touched_row.exec())
+        {
+            assignError(error, touched_row.lastError().text());
+            return false;
+        }
+        if (touched_row.next() &&
+            touched_row.value(0).toString() == QStringLiteral("hydraulic.network"))
+        {
+            QSet<QUuid> new_members;
+            if (!touched_row.value(2).toBool())
+            {
+                const std::optional<NetworkIndex> index =
+                    decodeIndex(touched_row.value(1).toByteArray(), error);
+                if (!index || index->metadata.uuid != uuid)
+                {
+                    if (index)
+                        assignError(error, QStringLiteral("Corrupted hydraulic network identity"));
+                    return false;
+                }
+                new_members = referencedIds(*index);
+            }
+            changed_roots.insert(uuid, new_members);
+            affected.insert(uuid);
+        }
+        touched_row.finish();
+        owner.bindValue(0, uuidBytes(revision_uuid));
+        owner.bindValue(1, uuidBytes(uuid));
+        if (!owner.exec())
+        {
+            assignError(error, owner.lastError().text());
+            return false;
+        }
+        if (owner.next())
+            affected.insert(QUuid::fromRfc4122(owner.value(0).toByteArray()));
+        owner.finish();
+    }
+
+    // A root-index rewrite may detach entities only when they are tombstoned
+    // by the same transaction. The previously committed membership table is
+    // authoritative for the old root index and survives failed edits.
+    QSqlQuery old_members(this->database_);
+    if (!old_members.prepare(QStringLiteral(
+            "SELECT entity_uuid FROM hydraulic_network_members "
+            "WHERE revision_uuid=? AND network_uuid=?")))
+    {
+        assignError(error, old_members.lastError().text());
+        return false;
+    }
+    QSqlQuery entity(this->database_);
+    if (!entity.prepare(QStringLiteral(
+            "SELECT deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")))
+    {
+        assignError(error, entity.lastError().text());
+        return false;
+    }
+    for (QHash<QUuid, QSet<QUuid>>::const_iterator root = changed_roots.cbegin();
+         root != changed_roots.cend(); ++root)
+    {
+        old_members.bindValue(0, uuidBytes(revision_uuid));
+        old_members.bindValue(1, uuidBytes(root.key()));
+        if (!old_members.exec())
+        {
+            assignError(error, old_members.lastError().text());
+            return false;
+        }
+        while (old_members.next())
+        {
+            const QUuid member = QUuid::fromRfc4122(old_members.value(0).toByteArray());
+            if (root.value().contains(member))
+                continue;
+            // Atomic transfer between two changed roots is allowed; the
+            // final membership uniqueness constraint remains authoritative.
+            bool transferred = false;
+            for (QHash<QUuid, QSet<QUuid>>::const_iterator other = changed_roots.cbegin();
+                 other != changed_roots.cend(); ++other)
+            {
+                if (other.key() != root.key() && other.value().contains(member))
+                {
+                    transferred = true;
+                    break;
+                }
+            }
+            if (transferred)
+                continue;
+            entity.bindValue(0, uuidBytes(revision_uuid));
+            entity.bindValue(1, uuidBytes(member));
+            if (!entity.exec())
+            {
+                assignError(error, entity.lastError().text());
+                return false;
+            }
+            if (entity.next() && !entity.value(0).toBool())
+            {
+                assignError(error, QStringLiteral(
+                    "Cannot remove an entity from the network index without deleting it"));
+                return false;
+            }
+            entity.finish();
+        }
+        old_members.finish();
+    }
+
+    // The unchanged parts of the model were validated when last committed.
+    // Existing objects whose validation-sensitive fields did not change cannot
+    // invalidate those constraints, even when multiple such edits are grouped.
+    // All touched IDs must belong to an indexed network; the conservative
+    // full validator handles any root/structural edit or unknown object kind.
+    // Past a small batch, one full-network pass is cheaper than 2 SQL reads
+    // and a typed mini-validator per touched entity.
+    constexpr qsizetype max_incremental_entities = 32;
+    if (changed_roots.isEmpty() && !affected.isEmpty() &&
+        touched_uuids.size() <= max_incremental_entities)
+    {
+        bool all_reference_neutral = true;
+        for (const QUuid &entity_uuid : touched_uuids)
+        {
+            owner.bindValue(0, uuidBytes(revision_uuid));
+            owner.bindValue(1, uuidBytes(entity_uuid));
+            if (!owner.exec())
+            {
+                assignError(error, owner.lastError().text());
+                return false;
+            }
+            const bool indexed = owner.next();
+            owner.finish();
+            if (!indexed || !canSkipHydraulicRevalidation(revision_uuid, entity_uuid, error))
+            {
+                all_reference_neutral = false;
+                break;
+            }
+        }
+        if (all_reference_neutral)
+            return true;
+        const LocalStructureCheck local = checkLocalPipeAndAttachments(
+            this->database_, revision_uuid, touched_uuids, error);
+        if (local == LocalStructureCheck::Accepted)
+            return true;
+        if (local == LocalStructureCheck::SqlError)
+            return false;
+    }
+
+    // Validate the final transactional state, not transient intermediate edits.
+    for (const QUuid &network_uuid : affected)
+    {
+        if (changed_roots.contains(network_uuid))
+        {
+            QSqlQuery state(this->database_);
+            if (!state.prepare(QStringLiteral(
+                    "SELECT deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")))
+            {
+                assignError(error, state.lastError().text());
+                return false;
+            }
+            state.addBindValue(uuidBytes(revision_uuid));
+            state.addBindValue(uuidBytes(network_uuid));
+            if (!state.exec() || !state.next())
+            {
+                assignError(error, QStringLiteral("Changed network root missing"));
+                return false;
+            }
+            if (state.value(0).toBool())
+                continue;
+        }
+        const std::optional<NetworkHydraulic> network =
+            loadHydraulicNetworkUnchecked(revision_uuid, network_uuid, error);
+        if (!network)
+            return false;
+        const ModelValidationReport report = validateHydraulicNetwork(*network);
+        if (!report.valid())
+        {
+            assignError(error, QStringLiteral("Hydraulic network %1: %2")
+                .arg(network_uuid.toString(QUuid::WithoutBraces), report.summary()));
+            return false;
+        }
+        if (!replaceHydraulicReferences(revision_uuid, *network, error))
+            return false;
+    }
+
+    // Delete references for roots removed in this transaction as well.
+    QSqlQuery delete_references(this->database_);
+    if (!delete_references.prepare(QStringLiteral(
+            "DELETE FROM hydraulic_network_references WHERE revision_uuid=? AND network_uuid=?")))
+    {
+        assignError(error, delete_references.lastError().text());
+        return false;
+    }
+    for (QHash<QUuid, QSet<QUuid>>::const_iterator root = changed_roots.cbegin();
+         root != changed_roots.cend(); ++root)
+    {
+        if (!root.value().isEmpty())
+            continue;
+        QSqlQuery state(this->database_);
+        if (!state.prepare(QStringLiteral(
+                "SELECT deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")))
+        {
+            assignError(error, state.lastError().text());
+            return false;
+        }
+        state.addBindValue(uuidBytes(revision_uuid));
+        state.addBindValue(uuidBytes(root.key()));
+        if (!state.exec() || !state.next())
+        {
+            assignError(error, QStringLiteral("Changed network root missing"));
+            return false;
+        }
+        if (state.value(0).toBool())
+        {
+            delete_references.bindValue(0, uuidBytes(revision_uuid));
+            delete_references.bindValue(1, uuidBytes(root.key()));
+            if (!delete_references.exec())
+            {
+                assignError(error, delete_references.lastError().text());
+                return false;
+            }
+        }
+    }
+
+    // Clear all changed roots first, so moving an entity between two roots
+    // in one atomic group has no artificial transient UNIQUE violation.
+    QSqlQuery remove(this->database_);
+    if (!remove.prepare(QStringLiteral(
+            "DELETE FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")))
+    {
+        assignError(error, remove.lastError().text());
+        return false;
+    }
+    for (QHash<QUuid, QSet<QUuid>>::const_iterator root = changed_roots.cbegin();
+         root != changed_roots.cend(); ++root)
+    {
+        remove.bindValue(0, uuidBytes(revision_uuid));
+        remove.bindValue(1, uuidBytes(root.key()));
+        if (!remove.exec())
+        {
+            assignError(error, remove.lastError().text());
+            return false;
+        }
+    }
+    for (QHash<QUuid, QSet<QUuid>>::const_iterator root = changed_roots.cbegin();
+         root != changed_roots.cend(); ++root)
+    {
+        if (!replaceNetworkMembership(revision_uuid, root.key(), root.value(), error))
+            return false;
+    }
+    return true;
 }
 
 } // namespace aowis::db

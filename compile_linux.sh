@@ -16,5 +16,10 @@ fi
 
 cmake -S "${PROJECT_DIR}" -B "${BUILD_DIR}" -G Ninja -DBUILD_TESTING=OFF \
     -DAOWIS_MODEL_SOURCE_DIR="${PROJECT_DIR}/external/AOWIS-SERVER-MODEL"
-cmake --build "${BUILD_DIR}" --target aowis-db-core --parallel
-printf 'AOWIS DB core library built successfully.\n'
+# Ninja handles incremental rebuilds from the source/header dependency graph.
+# Patch ZIP files must provide fresh mtimes on changed source files; never
+# clean all build objects merely because the source tree has changed.
+# BUILD_TESTING=OFF above keeps this target set small: core library, local
+# administration CLI and the optional HTTP server. Ninja remains incremental.
+cmake --build "${BUILD_DIR}" --parallel
+printf 'AOWIS DB library and enabled tools built successfully.\n' 
