@@ -2,6 +2,7 @@
 #define AOWIS_DB_DATABASE_H
 
 #include <aowis/db/identity.h>
+#include <aowis/model/hydraulic/network_hydraulic.h>
 
 #include <optional>
 
@@ -169,6 +170,16 @@ public:
                                          const QString &message, QString *error = nullptr);
     IntegrityReport verifyProject(const OperationContext &actor, const QUuid &project_uuid) const;
 
+    // Atomic, generation-checked complete network synchronization. Each changed
+    // object produces its own V4 immutable object-history event. Network root
+    // stores the ordered entity UUID lists for lossless reconstruction.
+    bool saveHydraulicNetwork(const OperationContext &actor, const QUuid &branch_uuid,
+                              qint64 expected_generation, const NetworkHydraulic &network,
+                              QString *error = nullptr);
+    std::optional<NetworkHydraulic> loadHydraulicNetwork(const OperationContext &actor,
+                              const QUuid &revision_uuid, const QUuid &network_uuid,
+                              QString *error = nullptr) const;
+
     // Initial object-level persistence. Objects use externally supplied canonical
     // bytes; full AOWIS Model serialization is still a separate step.
     // expected_version=-1 means the UUID must not have been used in this revision.
@@ -214,6 +225,11 @@ private:
     std::optional<int> objectMode(const QUuid &revision_uuid, QString *error) const;
     bool copyObjects(const QUuid &from_revision, const QUuid &to_revision, QString *error);
     bool modifyObject(const OperationContext &actor, const QUuid &branch_uuid,
+                      const QUuid &object_uuid, const QString &kind,
+                      const std::optional<QByteArray> &bytes, qint64 expected_version,
+                      QString *error);
+    // Must be called inside an existing BEGIN IMMEDIATE transaction.
+    bool modifyObjectInTransaction(const OperationContext &actor, const QUuid &branch_uuid,
                       const QUuid &object_uuid, const QString &kind,
                       const std::optional<QByteArray> &bytes, qint64 expected_version,
                       QString *error);

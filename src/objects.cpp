@@ -349,15 +349,30 @@ bool Database::modifyObject(const OperationContext &actor, const QUuid &branch_u
                              const std::optional<QByteArray> &bytes, qint64 expected_version,
                              QString *error)
 {
-    if (object_uuid.isNull() || expected_version < -1 || !beginWrite(error))
+    if (!beginWrite(error))
+        return false;
+    bool ok = modifyObjectInTransaction(actor, branch_uuid, object_uuid, kind,
+                                        bytes, expected_version, error);
+    if (ok)
+        ok = commit(error);
+    if (!ok)
+        rollback();
+    return ok;
+}
+
+bool Database::modifyObjectInTransaction(const OperationContext &actor, const QUuid &branch_uuid,
+                             const QUuid &object_uuid, const QString &kind,
+                             const std::optional<QByteArray> &bytes, qint64 expected_version,
+                             QString *error)
+{
+    if (object_uuid.isNull() || expected_version < -1)
     {
-        setError(error, QStringLiteral("Invalid object UUID/version or database transaction failed"));
+        setError(error, QStringLiteral("Invalid object UUID or version"));
         return false;
     }
     if (!requirePermission(actor, QStringLiteral("project.model.write"),
                            AccessScope::branch(branch_uuid), error))
     {
-        rollback();
         return false;
     }
     const std::optional<BranchInfo> branch_info = branchUnchecked(branch_uuid, error);
@@ -366,13 +381,11 @@ bool Database::modifyObject(const OperationContext &actor, const QUuid &branch_u
     if (!revision || revision->finalized)
     {
         setError(error, QStringLiteral("Working revision not found"));
-        rollback();
         return false;
     }
     const std::optional<int> mode = objectMode(revision->uuid, error);
     if (!mode)
     {
-        rollback();
         return false;
     }
     if (*mode == 0)
@@ -382,43 +395,37 @@ bool Database::modifyObject(const OperationContext &actor, const QUuid &branch_u
                 "SELECT EXISTS(SELECT 1 FROM snapshots WHERE revision_uuid=?) OR "
                 "EXISTS(SELECT 1 FROM operation_events WHERE revision_uuid=?)"), error))
         {
-            rollback();
-            return false;
+                return false;
         }
         legacy.addBindValue(uuidBytes(revision->uuid));
         legacy.addBindValue(uuidBytes(revision->uuid));
         if (!run(legacy, error) || !legacy.next() || legacy.value(0).toBool())
         {
             setError(error, QStringLiteral("Existing legacy snapshots cannot be mixed with object-mode writes"));
-            rollback();
-            return false;
+                return false;
         }
         QSqlQuery enable(this->database_);
         if (!prepare(enable, QStringLiteral(
                 "UPDATE revisions SET object_mode=1 WHERE uuid=? AND object_mode=0"), error))
         {
-            rollback();
-            return false;
+                return false;
         }
         enable.addBindValue(uuidBytes(revision->uuid));
         if (!run(enable, error) || enable.numRowsAffected() != 1)
         {
-            rollback();
-            return false;
+                return false;
         }
     }
     QSqlQuery current(this->database_);
     if (!prepare(current, QStringLiteral(
             "SELECT kind,content,version,deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?"), error))
     {
-        rollback();
         return false;
     }
     current.addBindValue(uuidBytes(revision->uuid));
     current.addBindValue(uuidBytes(object_uuid));
     if (!run(current, error))
     {
-        rollback();
         return false;
     }
     const bool existed = current.next();
@@ -432,7 +439,6 @@ bool Database::modifyObject(const OperationContext &actor, const QUuid &branch_u
         (bytes && existed && !before_deleted && before_content.toByteArray() == *bytes))
     {
         setError(error, QStringLiteral("Object version conflict, invalid kind, or no state change"));
-        rollback();
         return false;
     }
     QSqlQuery query(this->database_);
@@ -501,10 +507,6 @@ bool Database::modifyObject(const OperationContext &actor, const QUuid &branch_u
             ok = run(query, error);
         }
     }
-    if (ok)
-        ok = commit(error);
-    if (!ok)
-        rollback();
     return ok;
 }
 

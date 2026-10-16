@@ -37,7 +37,7 @@ See [docs/architecture.md](docs/architecture.md) and
 
 ## Build and test
 
-Requirements: CMake 3.21+, a C++20 compiler, Qt 6 Core/Sql, the Qt SQLite SQL
+Requirements: CMake 3.21+, a C++20 compiler, Qt 6 Core/Sql, Python 3 for schema compatibility checks, the Qt SQLite SQL
 plugin, and the initialized `external/AOWIS-SERVER-MODEL` Git submodule. The Model's existing `createUuidV7()` function is used for IDs.
 
 ```bash
@@ -66,13 +66,21 @@ that actor's UUID to all project APIs. Remote callers must be authenticated by
 the future server (not implemented yet). Database files in schema V1/V2/V3 are
 upgraded transactionally to V4 without changing existing finalized hashes.
 
-The core persists the project/branch/revision lifecycle, legacy whole-snapshot
-bytes, and now UUID-keyed opaque model-object records. It does not yet
-serialize actual AOWIS Model structures. The
-`replaceWorkingSnapshot` boundary is temporary: callers are responsible for
-supplying deterministic serialization of the *entire* project state, including
-managed attachments, once the Model serializer is implemented. Arbitrary test
-bytes are **not** a valid production project format.
+The core persists project/branch/revision history, legacy whole snapshots,
+and UUID-keyed object records. **V5 now encodes and reconstructs the entire
+`NetworkHydraulic` structure** with nested metadata, simulation options,
+water-quality/MSX configuration, curves, controls, pipe materials, meters,
+demand points and the 18 entity collections, preserving order and UUIDs.
+`saveHydraulicNetwork` stores each top-level entity separately and records
+per-entity changes in one SQLite transaction. Individual entity updates use
+`putHydraulicEntity` with an expected object version, and can be read through
+`loadHydraulicEntity`. The previous `replaceWorkingSnapshot` interface remains
+only for legacy-mode revisions.
+
+This is typed hydraulic-network persistence, **not yet production-ready full
+project persistence**: project descriptions, external attachment file contents,
+other non-network model domains, domain-reference validation, grouped object
+undo/redo, and model-level merge semantics are still outstanding.
 
 No HTTP API, user authentication, password/session handling, model validation,
 model-aware validation, grouped object changes, object undo/redo, merge
@@ -126,7 +134,7 @@ manifest of the complete object set **and edit journal**, while preserving
 previously finalized hashes. Objects are copied into a new working revision
 after finalization and when branching.
 
-The object bytes are still caller-supplied: this is **not** full typed AOWIS
-Model serialization, field validation, or model-aware undo/redo. Legacy
-whole-snapshot undo and redo remain supported for legacy-mode revisions.
-See [architecture.md](docs/architecture.md) for formats and limitations.
+The low-level object API still accepts caller-supplied bytes for compatibility.
+Prefer the V5 typed API for hydraulic networks and entities. See
+[model-persistence.md](docs/model-persistence.md) for the binary contract,
+serialization coverage, migration limitations and current risks.

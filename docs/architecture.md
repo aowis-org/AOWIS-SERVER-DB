@@ -1,4 +1,4 @@
-# Persistence architecture and contracts (v4 object persistence foundation)
+# Persistence architecture and contracts (v5 typed hydraulic persistence)
 
 ## Stable vocabulary
 
@@ -160,3 +160,9 @@ reversible object-level undo/redo. Existing whole-snapshot undo/redo remains
 available only for legacy snapshot-mode revisions. A subsequent stage must
 add atomic model-aware operation groups and object-history undo/redo before
 this foundation replaces GUI editing.
+
+## Typed model persistence: V5
+
+See [model-persistence.md](model-persistence.md). V5 reuses the existing V4
+object store and V2 finalized revision chain. No database-schema migration or
+historical revision re-hashing is required.

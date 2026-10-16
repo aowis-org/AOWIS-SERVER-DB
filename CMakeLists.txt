@@ -18,12 +18,35 @@ if(NOT TARGET AOWIS::Model)
                      "${CMAKE_CURRENT_BINARY_DIR}/aowis-server-model")
 endif()
 
+# Reject Model layout changes until the binary codec is consciously evolved.
+# Preventing silent field loss takes priority over blindly accepting a new
+# submodule revision that the existing decoder cannot represent.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_codec.py"
+        "${AOWIS_MODEL_SOURCE_DIR}/include/aowis/model"
+        "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields_v1.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
+    RESULT_VARIABLE AOWIS_MODEL_CODEC_CHECK_RESULT
+    OUTPUT_VARIABLE AOWIS_MODEL_CODEC_CHECK_OUTPUT
+    ERROR_VARIABLE AOWIS_MODEL_CODEC_CHECK_ERROR
+)
+if(NOT AOWIS_MODEL_CODEC_CHECK_RESULT EQUAL 0)
+    message(FATAL_ERROR "Model serialization schema check failed:\n${AOWIS_MODEL_CODEC_CHECK_ERROR}")
+endif()
+message(STATUS "${AOWIS_MODEL_CODEC_CHECK_OUTPUT}")
+
 add_library(aowis-db-core STATIC
     include/aowis/db/database.h
     include/aowis/db/identity.h
     src/identity.cpp
     src/history.cpp
     src/objects.cpp
+    src/model_codec.cpp
+    src/model_persistence.cpp
+    include/aowis/db/model_codec.h
+    include/aowis/db/model_persistence.h
     src/database.cpp
 )
 add_library(AOWIS::DB ALIAS aowis-db-core)
@@ -49,5 +72,8 @@ if(BUILD_TESTING)
     add_executable(aowis-db-objects-tests tests/objects_test.cpp)
     target_link_libraries(aowis-db-objects-tests PRIVATE aowis-db-core)
     add_test(NAME aowis-db-objects COMMAND aowis-db-objects-tests)
-    set_tests_properties(aowis-db-sqlite aowis-db-migration aowis-db-history aowis-db-objects PROPERTIES LABELS "aowis;database")
+    add_executable(aowis-db-model-tests tests/model_persistence_test.cpp)
+    target_link_libraries(aowis-db-model-tests PRIVATE aowis-db-core)
+    add_test(NAME aowis-db-model COMMAND aowis-db-model-tests)
+    set_tests_properties(aowis-db-sqlite aowis-db-migration aowis-db-history aowis-db-objects aowis-db-model PROPERTIES LABELS "aowis;database")
 endif()
