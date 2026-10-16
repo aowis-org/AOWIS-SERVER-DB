@@ -27,6 +27,34 @@ struct IssuedSession
     qint64 expires_at_ms = 0;
 };
 
+// Introspection of one active bearer session; never contains credentials.
+// One-time reset authority issued by a trusted administrator. The secret is
+// returned once; only a domain-separated SHA-256 digest is stored.
+struct IssuedRecoveryToken
+{
+    QUuid uuid;
+    QUuid user_uuid;
+    QByteArray token; // 64 lowercase hex characters (256 random bits)
+    qint64 expires_at_ms = 0;
+};
+
+struct ActiveSession
+{
+    QUuid uuid;
+    QUuid user_uuid;
+    qint64 expires_at_ms = 0;
+};
+
+// Safe self-service session metadata. Never contains bearer tokens, hashes,
+// user-controlled labels, or another user's sessions.
+struct OwnSessionInfo
+{
+    QUuid uuid;
+    qint64 created_at_ms = 0;
+    qint64 expires_at_ms = 0;
+    bool current = false;
+};
+
 // An append-only administration event. The hash includes the previous event
 // hash, so audit history is verified independently of project revisions.
 struct SecurityAuditEvent
@@ -191,6 +219,32 @@ public:
     // this method. Refuses any subsequent call, even by an administrator.
     std::optional<UserInfo> bootstrapAdministrator(const QString &username, QString *error = nullptr);
 
+    // Initial password enrollment and administrative resets require a trusted
+    // administrator. Only a password verifier, random salt and work factor are
+    // stored, never plaintext. Resets revoke all existing user sessions.
+    bool setUserPassword(const OperationContext &admin, const QUuid &user_uuid,
+                         const QByteArray &password, QString *error = nullptr);
+    // Change the holder's own password. Both the authenticated bearer token
+    // and their CURRENT password are required. On success all user sessions,
+    // including the caller's, are revoked in the audited transaction.
+    // No arbitrary user UUID can be supplied by this self-service API.
+    bool changeOwnPassword(const QByteArray &bearer_token, const QByteArray &current_password,
+                           const QByteArray &new_password, QString *error = nullptr);
+    // Credentials are verified before a new revocable bearer session is issued.
+    // Never return a distinct error for an unknown user or bad password.
+    std::optional<IssuedSession> loginWithPassword(const QString &username,
+        const QByteArray &password, qint64 lifetime_seconds = 3600, QString *error = nullptr);
+
+    // Recovery tokens require system-level security.manage to issue. They are
+    // valid once and for at most one hour. Delivery and real-world identity
+    // checks must be performed by the trusted operator out of band.
+    std::optional<IssuedRecoveryToken> issuePasswordRecovery(const OperationContext &admin,
+        const QUuid &user_uuid, qint64 lifetime_seconds = 900, QString *error = nullptr);
+    // Unauthenticated redemption: possession of the unguessable recovery
+    // token authorizes replacing that one user's password. Revokes sessions.
+    bool redeemPasswordRecovery(const QByteArray &token, const QByteArray &new_password,
+        QString *error = nullptr);
+
     // Session issuance/revocation are restricted to system administrators.
     // No HTTP route exposes these operations. A trusted local host can
     // provision the first credentials after administrator bootstrap.
@@ -212,6 +266,25 @@ public:
     // HTTP-supplied user UUID. Do not return error details to remote clients.
     std::optional<OperationContext> authenticateSession(const QByteArray &bearer_token,
         QString *error = nullptr) const;
+    // Self-service session metadata and logout. Tokens remain confidential;
+    // a caller can revoke only the session represented by their own token.
+    std::optional<ActiveSession> activeSession(const QByteArray &bearer_token,
+        QString *error = nullptr) const;
+    bool logoutSession(const QByteArray &bearer_token, QString *error = nullptr);
+    // Only sessions belonging to the bearer holder; includes only unrevoked,
+    // unexpired sessions. Keyset pagination is by the immutable session UUID.
+    // Pass a null after_uuid to begin. A valid empty result is not an error.
+    QVector<OwnSessionInfo> ownSessions(const QByteArray &bearer_token,
+        const QUuid &after_uuid = {}, int limit = 100, QString *error = nullptr) const;
+    // Revoke only one of the bearer's own sessions, including their current
+    // session. Ownership is rechecked inside the same transaction as auditing.
+    bool revokeOwnSession(const QByteArray &bearer_token, const QUuid &session_uuid,
+        QString *error = nullptr);
+    // Atomically revoke all OTHER active sessions belonging to the bearer
+    // holder. The current session stays usable. Returns the number revoked,
+    // or nullopt on authentication, storage, or audit failure.
+    std::optional<qint64> revokeOtherSessions(const QByteArray &bearer_token,
+        QString *error = nullptr);
 
     // Requires security.audit.read at system scope. Pagination is by durable
     // sequence (exclusive lower bound), not by mutable offsets.
@@ -346,6 +419,8 @@ private:
     bool migrateSessionsV8(QString *error);
     bool migrateSecurityAuditV9(QString *error);
     bool migrateSecurityAdminV10(QString *error);
+    bool migratePasswordCredentialsV11(QString *error);
+    bool migratePasswordRecoveryV12(QString *error);
     bool writeSecurityAuditEvent(const QUuid &actor_uuid, const QString &action,
                                  const QUuid &subject_uuid, QString *error);
     bool auditedSecurityMutation(const QUuid &actor_uuid, const QString &action,

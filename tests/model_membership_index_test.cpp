@@ -140,6 +140,7 @@ int main(int argc, char **argv)
         REQUIRE(sql.exec(QStringLiteral("DROP TABLE user_sessions")));
         REQUIRE(sql.exec(QStringLiteral("DROP TABLE hydraulic_network_references")));
         REQUIRE(sql.exec(QStringLiteral("DROP TABLE hydraulic_network_members")));
+        REQUIRE(sql.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
         REQUIRE(sql.exec(QStringLiteral("PRAGMA user_version=5")));
         sql.finish();
         older.close();

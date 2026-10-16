@@ -15,6 +15,8 @@ int main(int argc, char **argv)
         "Usage:\n"
         "  aowis-db-admin bootstrap DB_FILE USERNAME\n"
         "  aowis-db-admin issue DB_FILE ADMIN_UUID USER_UUID [LIFETIME_SECONDS]\n"
+        "  aowis-db-admin set-password DB_FILE ADMIN_UUID USER_UUID < PASSWORD_STDIN\n"
+        "  aowis-db-admin recover-password DB_FILE ADMIN_UUID USER_UUID [LIFETIME_SECONDS]\n"
         "  aowis-db-admin revoke DB_FILE ADMIN_UUID SESSION_UUID\n"
         "  aowis-db-admin disable-user DB_FILE ADMIN_UUID USER_UUID\n"
         "  aowis-db-admin enable-user DB_FILE ADMIN_UUID USER_UUID\n"
@@ -33,6 +35,8 @@ int main(int argc, char **argv)
     const QString command = args.at(1);
     const bool bootstrap = command == QStringLiteral("bootstrap") && args.size() == 4;
     const bool issue = command == QStringLiteral("issue") && (args.size() == 5 || args.size() == 6);
+    const bool set_password = command == QStringLiteral("set-password") && args.size() == 5;
+    const bool recovery = command == QStringLiteral("recover-password") && (args.size() == 5 || args.size() == 6);
     const bool revoke = command == QStringLiteral("revoke") && args.size() == 5;
     const bool disable = command == QStringLiteral("disable-user") && args.size() == 5;
     const bool enable = command == QStringLiteral("enable-user") && args.size() == 5;
@@ -42,7 +46,7 @@ int main(int argc, char **argv)
     const bool audit = command == QStringLiteral("audit") &&
                        (args.size() == 4 || args.size() == 5 || args.size() == 6);
     const bool audit_verify = command == QStringLiteral("audit-verify") && args.size() == 4;
-    if (!bootstrap && !issue && !revoke && !disable && !enable && !remove_member &&
+    if (!bootstrap && !issue && !set_password && !recovery && !revoke && !disable && !enable && !remove_member &&
         !revoke_permission && !revoke_assignment && !audit && !audit_verify)
     {
         errors << usage;
@@ -130,6 +134,46 @@ int main(int argc, char **argv)
     {
         errors << "Invalid target UUID.\n";
         return 2;
+    }
+    if (set_password)
+    {
+        // Read from stdin rather than argv to avoid credentials in process
+        // command lines and shell history. The operator controls stdin.
+        QTextStream input(stdin);
+        const QByteArray password = input.readLine().toUtf8();
+        if (!database.setUserPassword(context, target, password, &error))
+        {
+            errors << error << "\n";
+            return 1;
+        }
+        output << "OK\n";
+        return 0;
+    }
+    if (recovery)
+    {
+        qint64 lifetime_seconds = 900;
+        if (args.size() == 6)
+        {
+            bool valid = false;
+            lifetime_seconds = args.at(5).toLongLong(&valid);
+            if (!valid || lifetime_seconds < 1 || lifetime_seconds > 3600)
+            {
+                errors << "Invalid recovery lifetime (1..3600 seconds).\n";
+                return 2;
+            }
+        }
+        const std::optional<aowis::db::IssuedRecoveryToken> result =
+            database.issuePasswordRecovery(context, target, lifetime_seconds, &error);
+        if (!result)
+        {
+            errors << error << "\n";
+            return 1;
+        }
+        output << result->token << "\n";
+        output.flush();
+        errors << "Recovery UUID: " << result->uuid.toString(QUuid::WithoutBraces)
+               << " (expires at UTC-ms " << result->expires_at_ms << ")\n";
+        return 0;
     }
     if (issue)
     {

@@ -1,4 +1,5 @@
 #include <aowis/db/http_routes.h>
+#include <aowis/db/http_hardening.h>
 #include <aowis/db/model_codec.h>
 
 #include <QHttpServerResponse>
@@ -6,6 +7,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <functional>
+#include <initializer_list>
 #include <QSet>
 #include <QUrlQuery>
 #include <utility>
@@ -94,6 +97,49 @@ std::optional<SecurityListOptions> securityListOptions(const QHttpServerRequest 
             return std::nullopt;
     }
     return options;
+}
+
+// Mutation endpoints accept only documented JSON fields. Silently ignoring
+// unexpected keys is unsafe for rights management (typos can grant wrong rights).
+bool exactFields(const QJsonObject &body, std::initializer_list<const char *> fields)
+{
+    if (body.size() != static_cast<int>(fields.size()))
+        return false;
+    for (const char *field : fields)
+    {
+        if (!body.contains(QString::fromLatin1(field)))
+            return false;
+    }
+    return true;
+}
+
+bool emptyMutationRequest(const QHttpServerRequest &request)
+{
+    return !request.url().hasQuery() && request.body().isEmpty();
+}
+
+std::optional<AccessScope> scopeFromJson(const QJsonObject &body)
+{
+    const QJsonValue kind = body.value(QStringLiteral("scope_kind"));
+    const QJsonValue uuid_value = body.value(QStringLiteral("scope_uuid"));
+    if (!kind.isString())
+        return std::nullopt;
+    if (kind.toString() == QStringLiteral("system"))
+    {
+        if (!uuid_value.isNull())
+            return std::nullopt;
+        return AccessScope::system();
+    }
+    if (!uuid_value.isString())
+        return std::nullopt;
+    const std::optional<QUuid> uuid = parseUuid(uuid_value.toString());
+    if (!uuid)
+        return std::nullopt;
+    if (kind.toString() == QStringLiteral("project"))
+        return AccessScope::project(*uuid);
+    if (kind.toString() == QStringLiteral("branch"))
+        return AccessScope::branch(*uuid);
+    return std::nullopt;
 }
 
 QJsonObject catalogUserJson(const UserInfo &item)
@@ -273,6 +319,7 @@ QJsonObject workingGeneration(const Database &database, const OperationContext &
 HttpRoutes::HttpRoutes(Database &database, Authenticate authenticate)
     : database_(database), authenticate_(std::move(authenticate))
 {
+    this->login_clock_.start();
 }
 
 std::optional<OperationContext> HttpRoutes::actorFor(const QHttpServerRequest &request) const
@@ -294,6 +341,282 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     // A health check intentionally contains no database or identity details.
     if (!server.route(QStringLiteral("/api/v1/health"), get, []() {
         return QHttpServerResponse(QJsonObject{{QStringLiteral("status"), QStringLiteral("ok")}});
+    }))
+        return false;
+
+    // V26: local password enrollment can exchange verified credentials for a
+    // regular revocable bearer session. Never accept caller-supplied actor UUID.
+    if (!server.route(QStringLiteral("/api/v1/session/login"), post,
+                      [this](const QHttpServerRequest &request) {
+        if (request.url().hasQuery())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid login request"));
+        const std::optional<QJsonObject> body = jsonBody(request, 2048);
+        if (!body || !exactFields(*body, {"username", "password"}) ||
+            !body->value(QStringLiteral("username")).isString() ||
+            !body->value(QStringLiteral("password")).isString())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid login request"));
+        const QString username = body->value(QStringLiteral("username")).toString();
+        // Throttle *before* the expensive password KDF, including unknown
+        // usernames and failed credentials. Count successes too, so probing
+        // a valid account never provides an unlimited retry path. This is a
+        // process-wide HTTP safeguard, not a replacement for proxy limits.
+        if (!this->login_throttle_.allowAttempt(username, this->login_clock_.elapsed()))
+            return jsonError(static_cast<Status>(429), QStringLiteral("Too many login attempts"));
+        const QByteArray secret = body->value(QStringLiteral("password")).toString().toUtf8();
+        QString error;
+        const std::optional<IssuedSession> session = this->database_.loginWithPassword(
+            username, secret, 3600, &error);
+        if (!session)
+            return unauthorized();
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("session_uuid"), uuidString(session->uuid)},
+            {QStringLiteral("user_uuid"), uuidString(session->user_uuid)},
+            {QStringLiteral("expires_at_ms"), QString::number(session->expires_at_ms)},
+            {QStringLiteral("bearer_token"), QString::fromLatin1(session->bearer_token)}});
+    }))
+        return false;
+
+    // V28: anonymous redemption of a short-lived recovery capability issued
+    // locally by a trusted administrator. No username or target user UUID is
+    // accepted. The token is never logged, persisted in plaintext or reusable.
+    if (!server.route(QStringLiteral("/api/v1/session/recover"), post,
+                      [this](const QHttpServerRequest &request) {
+        if (request.url().hasQuery())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid recovery request"));
+        const std::optional<QJsonObject> body = jsonBody(request, 4096);
+        if (!body || !exactFields(*body, {"recovery_token", "new_password"}) ||
+            !body->value(QStringLiteral("recovery_token")).isString() ||
+            !body->value(QStringLiteral("new_password")).isString())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid recovery request"));
+        QString error;
+        if (!this->database_.redeemPasswordRecovery(
+                body->value(QStringLiteral("recovery_token")).toString().toLatin1(),
+                body->value(QStringLiteral("new_password")).toString().toUtf8(), &error))
+        {
+            if (error == QStringLiteral("Invalid new password"))
+                return jsonError(Status::BadRequest, QStringLiteral("Invalid new password"));
+            if (error == QStringLiteral("Invalid or expired recovery token"))
+                return unauthorized();
+            return jsonError(Status::InternalServerError, QStringLiteral("Recovery failed"));
+        }
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("changed"), true},
+            {QStringLiteral("sessions_revoked"), true}});
+    }))
+        return false;
+
+    // V25: session self-service. The token is resolved by the DB itself;
+    // neither actor UUID nor session UUID can be supplied by the client.
+    // The host's authenticator must also accept it, so these routes use the
+    // same authentication boundary as all other protected API endpoints.
+    if (!server.route(QStringLiteral("/api/v1/session/current"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!emptyMutationRequest(request))
+            return jsonError(Status::BadRequest, QStringLiteral("Unexpected query or body"));
+        const std::optional<QByteArray> token = parseBearerAuthorization(
+            request.value(QByteArrayLiteral("authorization")));
+        if (!token)
+            return unauthorized();
+        const std::optional<ActiveSession> session = this->database_.activeSession(*token);
+        if (!session || session->user_uuid != actor->actor_uuid)
+            return unauthorized();
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("session_uuid"), uuidString(session->uuid)},
+            {QStringLiteral("user_uuid"), uuidString(session->user_uuid)},
+            {QStringLiteral("expires_at_ms"), QString::number(session->expires_at_ms)}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/session/current"),
+                      QHttpServerRequest::Method::Delete,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!emptyMutationRequest(request))
+            return jsonError(Status::BadRequest, QStringLiteral("Unexpected query or body"));
+        const std::optional<QByteArray> token = parseBearerAuthorization(
+            request.value(QByteArrayLiteral("authorization")));
+        if (!token)
+            return unauthorized();
+        const std::optional<ActiveSession> session = this->database_.activeSession(*token);
+        if (!session || session->user_uuid != actor->actor_uuid)
+            return unauthorized();
+        QString error;
+        if (!this->database_.logoutSession(*token, &error))
+        {
+            if (error == QStringLiteral("Invalid or expired session"))
+                return unauthorized();
+            return jsonError(Status::InternalServerError, QStringLiteral("Session logout failed"));
+        }
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("revoked"), true}});
+    }))
+        return false;
+
+    // V32: revoke every other active session in one audited transaction.
+    // Only the presented bearer selects the user; no user or session UUID
+    // is accepted. This is deliberately separate from DELETE current.
+    if (!server.route(QStringLiteral("/api/v1/session/revoke-others"), post,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!emptyMutationRequest(request))
+            return jsonError(Status::BadRequest, QStringLiteral("Unexpected query or body"));
+        const std::optional<QByteArray> token = parseBearerAuthorization(
+            request.value(QByteArrayLiteral("authorization")));
+        if (!token)
+            return unauthorized();
+        const std::optional<ActiveSession> current = this->database_.activeSession(*token);
+        if (!current || current->user_uuid != actor->actor_uuid)
+            return unauthorized();
+        QString error;
+        const std::optional<qint64> count = this->database_.revokeOtherSessions(*token, &error);
+        if (!count)
+        {
+            if (error == QStringLiteral("Invalid or expired session"))
+                return unauthorized();
+            return jsonError(Status::InternalServerError, QStringLiteral("Session revocation failed"));
+        }
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("revoked_count"), QString::number(*count)},
+            {QStringLiteral("current_session_uuid"), uuidString(current->uuid)}});
+    }))
+        return false;
+
+    // V29: self-service management of the holder's OTHER sessions. Only an
+    // authenticated token decides whose sessions are visible or revocable.
+    // Revoke does not accept a user UUID and never exposes token hashes.
+    if (!server.route(QStringLiteral("/api/v1/sessions"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!request.body().isEmpty())
+            return jsonError(Status::BadRequest, QStringLiteral("Unexpected request body"));
+        int limit = 100;
+        QUuid after_uuid;
+        QSet<QString> seen;
+        for (const QPair<QString, QString> &item : QUrlQuery(request.url()).queryItems())
+        {
+            if (seen.contains(item.first))
+                return jsonError(Status::BadRequest, QStringLiteral("Duplicate query field"));
+            seen.insert(item.first);
+            if (item.first == QStringLiteral("limit"))
+            {
+                bool ok = false;
+                const int value = item.second.toInt(&ok);
+                if (!ok || value < 1 || value > 100 || QString::number(value) != item.second)
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid limit"));
+                limit = value;
+            }
+            else if (item.first == QStringLiteral("after_uuid"))
+            {
+                const std::optional<QUuid> parsed = parseUuid(item.second);
+                if (!parsed)
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid cursor"));
+                after_uuid = *parsed;
+            }
+            else
+                return jsonError(Status::BadRequest, QStringLiteral("Unknown query field"));
+        }
+        const std::optional<QByteArray> token = parseBearerAuthorization(
+            request.value(QByteArrayLiteral("authorization")));
+        if (!token)
+            return unauthorized();
+        const std::optional<ActiveSession> current = this->database_.activeSession(*token);
+        if (!current || current->user_uuid != actor->actor_uuid)
+            return unauthorized();
+        QString error;
+        const QVector<OwnSessionInfo> sessions = this->database_.ownSessions(*token, after_uuid, limit, &error);
+        if (error == QStringLiteral("Invalid or expired session"))
+            return unauthorized();
+        if (!error.isEmpty())
+            return jsonError(Status::InternalServerError, QStringLiteral("Session listing failed"));
+        QJsonArray records;
+        for (const OwnSessionInfo &entry : sessions)
+            records.append(QJsonObject{
+                {QStringLiteral("session_uuid"), uuidString(entry.uuid)},
+                {QStringLiteral("created_at_ms"), QString::number(entry.created_at_ms)},
+                {QStringLiteral("expires_at_ms"), QString::number(entry.expires_at_ms)},
+                {QStringLiteral("current"), entry.current}});
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("sessions"), records}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/sessions/<arg>"),
+                      QHttpServerRequest::Method::Delete,
+                      [this](const QString &raw_uuid, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!emptyMutationRequest(request))
+            return jsonError(Status::BadRequest, QStringLiteral("Unexpected query or body"));
+        const std::optional<QUuid> uuid = parseUuid(raw_uuid);
+        if (!uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid session UUID"));
+        const std::optional<QByteArray> token = parseBearerAuthorization(
+            request.value(QByteArrayLiteral("authorization")));
+        if (!token)
+            return unauthorized();
+        const std::optional<ActiveSession> current = this->database_.activeSession(*token);
+        if (!current || current->user_uuid != actor->actor_uuid)
+            return unauthorized();
+        QString error;
+        if (!this->database_.revokeOwnSession(*token, *uuid, &error))
+        {
+            if (error == QStringLiteral("Session not found or unavailable"))
+                return unavailable();
+            if (error == QStringLiteral("Invalid or expired session"))
+                return unauthorized();
+            return jsonError(Status::InternalServerError, QStringLiteral("Revocation failed"));
+        }
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("revoked"), true},
+                                               {QStringLiteral("session_uuid"), uuidString(*uuid)}});
+    }))
+        return false;
+
+    // V27: a bearer-session holder may rotate only their own password.
+    // The old password is mandatory; a stolen token alone is insufficient.
+    // Rotation revokes every bearer session and appends a security audit event.
+    if (!server.route(QStringLiteral("/api/v1/session/password"), post,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (request.url().hasQuery())
+            return jsonError(Status::BadRequest, QStringLiteral("Unexpected query"));
+        const std::optional<QByteArray> token = parseBearerAuthorization(
+            request.value(QByteArrayLiteral("authorization")));
+        if (!token)
+            return unauthorized();
+        const std::optional<ActiveSession> session = this->database_.activeSession(*token);
+        if (!session || session->user_uuid != actor->actor_uuid)
+            return unauthorized();
+        const std::optional<QJsonObject> body = jsonBody(request, 4096);
+        if (!body || !exactFields(*body, {"current_password", "new_password"}) ||
+            !body->value(QStringLiteral("current_password")).isString() ||
+            !body->value(QStringLiteral("new_password")).isString())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid password change request"));
+        QString error;
+        if (!this->database_.changeOwnPassword(*token,
+                body->value(QStringLiteral("current_password")).toString().toUtf8(),
+                body->value(QStringLiteral("new_password")).toString().toUtf8(), &error))
+        {
+            if (error.startsWith(QStringLiteral("New password")))
+                return jsonError(Status::BadRequest, QStringLiteral("Invalid new password"));
+            if (error == QStringLiteral("Invalid or expired session"))
+                return unauthorized();
+            if (error == QStringLiteral("Current password incorrect or temporarily unavailable"))
+                return jsonError(Status::Forbidden, QStringLiteral("Current password incorrect or unavailable"));
+            return jsonError(Status::InternalServerError, QStringLiteral("Password change failed"));
+        }
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("changed"), true},
+            {QStringLiteral("sessions_revoked"), true}});
     }))
         return false;
 
@@ -450,6 +773,186 @@ bool HttpRoutes::registerOn(QHttpServer &server)
         for (const RoleAssignmentInfo &item : records)
             items.append(assignmentJson(item));
         return QHttpServerResponse(QJsonObject{{QStringLiteral("assignments"), items}});
+    }))
+        return false;
+
+    // V23: mutation routes reuse the *audited* database functions. The
+    // authenticated host determines the actor; HTTP bodies cannot set it.
+    // Bootstrap and session/token provisioning deliberately have no HTTP route.
+    const std::function<bool(const QString &, const QString &,
+                             std::function<std::optional<QJsonObject>(const OperationContext &, const QString &)>)>
+        registerCreation = [this, &server, post](const QString &route,
+                                                  const QString &field,
+                                                  std::function<std::optional<QJsonObject>(const OperationContext &, const QString &)> create) {
+        return server.route(route, post,
+            [this, field, create](const QHttpServerRequest &request) {
+                const std::optional<OperationContext> actor = actorFor(request);
+                if (!actor)
+                    return unauthorized();
+                if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+                    return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+                const std::optional<QJsonObject> body = jsonBody(request, 4096);
+                if (request.url().hasQuery() || !body || body->size() != 1 ||
+                    !body->value(field).isString() || body->value(field).toString().isEmpty())
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid creation request"));
+                const std::optional<QJsonObject> result = create(*actor, body->value(field).toString());
+                if (!result)
+                    return jsonError(Status::Conflict, QStringLiteral("Creation rejected"));
+                return QHttpServerResponse(*result, Status::Created);
+            });
+    };
+    if (!registerCreation(QStringLiteral("/api/v1/admin/users"), QStringLiteral("username"),
+                          [this](const OperationContext &actor, const QString &value) -> std::optional<QJsonObject> {
+        const std::optional<UserInfo> info = this->database_.createUser(actor, value);
+        return info ? std::optional<QJsonObject>(catalogUserJson(*info)) : std::nullopt;
+    }) ||
+        !registerCreation(QStringLiteral("/api/v1/admin/groups"), QStringLiteral("name"),
+                          [this](const OperationContext &actor, const QString &value) -> std::optional<QJsonObject> {
+        const std::optional<GroupInfo> info = this->database_.createGroup(actor, value);
+        return info ? std::optional<QJsonObject>(catalogGroupJson(*info)) : std::nullopt;
+    }) ||
+        !registerCreation(QStringLiteral("/api/v1/admin/roles"), QStringLiteral("key"),
+                          [this](const OperationContext &actor, const QString &value) -> std::optional<QJsonObject> {
+        const std::optional<RoleInfo> info = this->database_.createRole(actor, value);
+        return info ? std::optional<QJsonObject>(catalogRoleJson(*info)) : std::nullopt;
+    }) ||
+        !registerCreation(QStringLiteral("/api/v1/admin/permissions"), QStringLiteral("key"),
+                          [this](const OperationContext &actor, const QString &value) -> std::optional<QJsonObject> {
+        const std::optional<PermissionInfo> info = this->database_.createPermission(actor, value);
+        return info ? std::optional<QJsonObject>(catalogPermissionJson(*info)) : std::nullopt;
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/groups/<arg>/members"), post,
+                      [this](const QString &group_id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<QUuid> group_uuid = parseUuid(group_id);
+        const std::optional<QJsonObject> body = jsonBody(request, 4096);
+        if (request.url().hasQuery() || !group_uuid || !body || !exactFields(*body, {"user_uuid"}))
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid membership request"));
+        const std::optional<QUuid> user_uuid = parseUuid(body->value(QStringLiteral("user_uuid")).toString());
+        if (!user_uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid user UUID"));
+        const std::optional<QUuid> uuid = this->database_.addGroupMember(*actor, *group_uuid, *user_uuid);
+        if (!uuid)
+            return jsonError(Status::Conflict, QStringLiteral("Membership rejected"));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("uuid"), uuidString(*uuid)}}, Status::Created);
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/roles/<arg>/permissions"), post,
+                      [this](const QString &role_id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<QUuid> role_uuid = parseUuid(role_id);
+        const std::optional<QJsonObject> body = jsonBody(request, 4096);
+        if (request.url().hasQuery() || !role_uuid || !body || !exactFields(*body, {"permission_uuid"}))
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid permission grant request"));
+        const std::optional<QUuid> permission_uuid = parseUuid(body->value(QStringLiteral("permission_uuid")).toString());
+        if (!permission_uuid)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid permission UUID"));
+        const std::optional<QUuid> uuid = this->database_.grantRolePermission(*actor, *role_uuid, *permission_uuid);
+        if (!uuid)
+            return jsonError(Status::Conflict, QStringLiteral("Permission grant rejected"));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("uuid"), uuidString(*uuid)}}, Status::Created);
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/admin/principals/<arg>/<arg>/assignments"), post,
+                      [this](const QString &principal_kind, const QString &principal_id,
+                             const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+            return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+        const std::optional<QUuid> principal_uuid = parseUuid(principal_id);
+        const std::optional<QJsonObject> body = jsonBody(request, 4096);
+        if (request.url().hasQuery() || !principal_uuid || !body ||
+            (principal_kind != QStringLiteral("user") && principal_kind != QStringLiteral("group")) ||
+            !exactFields(*body, {"role_uuid", "scope_kind", "scope_uuid"}))
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid role assignment request"));
+        const std::optional<QUuid> role_uuid = parseUuid(body->value(QStringLiteral("role_uuid")).toString());
+        const std::optional<AccessScope> scope = scopeFromJson(*body);
+        if (!role_uuid || !scope)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid role or scope"));
+        const std::optional<QUuid> uuid = this->database_.assignRole(
+            *actor, principal_kind == QStringLiteral("user") ? PrincipalKind::User : PrincipalKind::Group,
+            *principal_uuid, *role_uuid, *scope);
+        if (!uuid)
+            return jsonError(Status::Conflict, QStringLiteral("Role assignment rejected"));
+        return QHttpServerResponse(QJsonObject{{QStringLiteral("uuid"), uuidString(*uuid)}}, Status::Created);
+    }))
+        return false;
+
+    // A revoked grant is retained for audit/history. DELETE marks it revoked,
+    // never deletes the UUID, so regranting creates a distinct grant.
+    const QHttpServerRequest::Methods remove = QHttpServerRequest::Method::Delete;
+    const std::function<bool(const QString &, std::function<bool(const OperationContext &, const QUuid &)>)>
+        registerRevocation = [this, &server, remove](const QString &route,
+                                                      std::function<bool(const OperationContext &, const QUuid &)> revoke) {
+        return server.route(route, remove,
+            [this, revoke](const QString &id, const QHttpServerRequest &request) {
+                const std::optional<OperationContext> actor = actorFor(request);
+                if (!actor)
+                    return unauthorized();
+                if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+                    return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+                const std::optional<QUuid> uuid = parseUuid(id);
+                if (!uuid || !emptyMutationRequest(request))
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid revocation request"));
+                if (!revoke(*actor, *uuid))
+                    return jsonError(Status::Conflict, QStringLiteral("Revocation rejected"));
+                return QHttpServerResponse(QJsonObject{{QStringLiteral("uuid"), uuidString(*uuid)},
+                                                       {QStringLiteral("revoked"), true}});
+            });
+    };
+    if (!registerRevocation(QStringLiteral("/api/v1/admin/memberships/<arg>"),
+                            [this](const OperationContext &actor, const QUuid &id) {
+        return this->database_.removeGroupMember(actor, id);
+    }) ||
+        !registerRevocation(QStringLiteral("/api/v1/admin/permission-grants/<arg>"),
+                            [this](const OperationContext &actor, const QUuid &id) {
+        return this->database_.revokeRolePermission(actor, id);
+    }) ||
+        !registerRevocation(QStringLiteral("/api/v1/admin/role-assignments/<arg>"),
+                            [this](const OperationContext &actor, const QUuid &id) {
+        return this->database_.revokeRoleAssignment(actor, id);
+    }))
+        return false;
+
+    const std::function<bool(const QString &, std::function<bool(const OperationContext &, const QUuid &)>)>
+        registerUserState = [this, &server, post](const QString &route,
+                                                  std::function<bool(const OperationContext &, const QUuid &)> change) {
+        return server.route(route, post,
+            [this, change](const QString &id, const QHttpServerRequest &request) {
+                const std::optional<OperationContext> actor = actorFor(request);
+                if (!actor)
+                    return unauthorized();
+                if (!this->database_.hasPermission(*actor, QStringLiteral("security.manage"), AccessScope::system()))
+                    return jsonError(Status::Forbidden, QStringLiteral("Permission denied"));
+                const std::optional<QUuid> uuid = parseUuid(id);
+                if (!uuid || !emptyMutationRequest(request))
+                    return jsonError(Status::BadRequest, QStringLiteral("Invalid user state request"));
+                if (!change(*actor, *uuid))
+                    return jsonError(Status::Conflict, QStringLiteral("User state change rejected"));
+                return QHttpServerResponse(QJsonObject{{QStringLiteral("uuid"), uuidString(*uuid)}});
+            });
+    };
+    if (!registerUserState(QStringLiteral("/api/v1/admin/users/<arg>/disable"),
+                           [this](const OperationContext &actor, const QUuid &id) {
+        return this->database_.disableUser(actor, id);
+    }) ||
+        !registerUserState(QStringLiteral("/api/v1/admin/users/<arg>/enable"),
+                           [this](const OperationContext &actor, const QUuid &id) {
+        return this->database_.enableUser(actor, id);
     }))
         return false;
 

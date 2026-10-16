@@ -30,14 +30,14 @@ The schema-v2 security foundation adds UUIDv7 users, groups, custom roles,
 permissions, memberships, grants and scoped role assignments; fixed UUIDs for
 built-in role/permission definitions; and explicit actor-aware reads/writes.
 New finalizations use an authorship-aware SHA-256 V2 chain while v1 finalized
-hashes are preserved. There is no authentication or login system yet.
+hashes are preserved. Persistent bearer sessions, password credentials, and password login are now available; see [V26](docs/http-password-login-v26.md).
 
 See [docs/architecture.md](docs/architecture.md) and
 [docs/identity-and-access.md](docs/identity-and-access.md) for the contracts.
 
 ## Build and test
 
-Requirements: CMake 3.21+, a C++20 compiler, Qt 6 Core/Sql, Python 3 for schema compatibility checks, the Qt SQLite SQL
+Requirements: CMake 3.21+, a C++20 compiler, Qt 6 Core/Sql, OpenSSL libcrypto, Python 3 for schema compatibility checks, the Qt SQLite SQL
 plugin, and the initialized `external/AOWIS-SERVER-MODEL` Git submodule. The Model's existing `createUuidV7()` function is used for IDs.
 
 ```bash
@@ -51,7 +51,7 @@ From the DB repository root, `./git_submodule_update.sh` explicitly moves
 Model to the latest tracked remote revision; review and commit that new gitlink.
 Do not use the update script for normal builds: `git_submodule_init.sh` checks
 out the **pinned** version. The scripts are independent of the shell's working
-directory. The compile script builds the library (there is no DB GUI executable).
+directory. The compile script builds the core and enabled HTTP and local admin tools (there is no DB GUI executable).
 
 Alternatively set `-DAOWIS_MODEL_SOURCE_DIR=/path/to/AOWIS-SERVER-MODEL`.
 The library target is `aowis-db-core` (`AOWIS::DB` alias). All Qt SQL connections
@@ -62,8 +62,7 @@ connection across threads.
 
 For local initialization, the trusted application must call
 `bootstrapAdministrator(username)` once, then pass an `OperationContext` with
-that actor's UUID to all project APIs. Remote callers must be authenticated by
-the future server (not implemented yet). Database files in schema V1/V2/V3 are
+that actor's UUID to all project APIs. Remote callers use authenticated, revocable sessions, including locally enrolled password login. Database files in schema V1/V2/V3 are
 upgraded transactionally to V4 without changing existing finalized hashes.
 
 The core persists project/branch/revision history, legacy whole snapshots,
@@ -82,10 +81,8 @@ project persistence**: project descriptions, external attachment file contents,
 other non-network model domains, domain-reference validation, grouped object
 undo/redo, and model-level merge semantics are still outstanding.
 
-No production HTTP API, user authentication, password/session handling, model validation,
-model-aware validation, grouped object changes, object undo/redo, merge
-handling, or PostgreSQL backend is implemented yet. Authorization is implemented but must be supplied
-with trusted, externally authenticated actor contexts.
+The HTTP API, sessions, credentials, model validation, and grouped history are implemented,
+but production internet deployment, branch merging, and the PostgreSQL backend remain incomplete.
 The SQLite file and hash chain are not tamper-proof against the database
 administrator, by design.
 
@@ -237,3 +234,58 @@ Administrative catalog reads are available through the C++ `Database` API
 and authenticated, system-admin-only HTTP GET routes. Pages use UUID cursors
 and include revoked grants only when explicitly requested. See
 [docs/security-catalog-v22.md](docs/security-catalog-v22.md).
+
+## HTTP deployment safety (V24)
+
+The optional HTTP server is loopback-only. It must not be exposed directly to
+an untrusted network. The server has version-aware request limits and
+non-cacheable response headers; remote access requires a separate maintained
+TLS reverse proxy on the same host. See
+[docs/http-hardening-v24.md](docs/http-hardening-v24.md) for the deployment
+boundary and an example reverse-proxy configuration.
+
+## Session self-service (V25)
+
+Authenticated clients can inspect and revoke their current bearer session
+through `GET` and `DELETE /api/v1/session/current`. Logout is atomic with a
+`session.logout` security-audit event and never revokes other sessions. See
+[docs/http-session-self-service-v25.md](docs/http-session-self-service-v25.md).
+
+## Test execution and authentication workload (V30)
+
+`./compile_linux_tests.sh` builds incrementally using Ninja and runs independent
+CTest executables concurrently (four jobs by default). Each executable creates
+its own temporary SQLite database, so tests do not share database files.
+Set `AOWIS_DB_TEST_JOBS=1` for serial test execution or another value from 1
+through 32 to control concurrency. The password KDF remains PBKDF2-HMAC-SHA-256
+with 600,000 iterations in both tests and production; there is no insecure
+"fast test password" mode. Password-change requests reject current-password
+buffers larger than 1024 bytes before running the KDF.
+
+## Password login (V26 / SQLite V11)
+
+Administrators can provision a local password using the trusted
+`aowis-db-admin set-password DB_FILE ADMIN_UUID USER_UUID` command, reading
+the password from stdin. Clients can then obtain 1-hour bearer sessions with
+`POST /api/v1/session/login`. See
+[http-password-login-v26.md](docs/http-password-login-v26.md) for enrollment,
+cryptographic choices, account lockout, and deployment caveats.
+
+## Password recovery (V28)
+
+A trusted local system administrator can issue a short-lived one-time recovery
+token using `aowis-db-admin recover-password`. A user redeems it using
+`POST /api/v1/session/recover`. Tokens are hashed in SQLite, expire within one
+hour, and are invalidated by password changes or account disable. No email
+verification or delivery is implemented. Details: [V28 recovery](docs/http-password-recovery-v28.md).
+
+For local HTTP login throttling and deployment limitations, see
+[docs/http-login-throttle-v31.md](docs/http-login-throttle-v31.md).
+
+## Revoke other sessions (V32)
+
+Authenticated clients can revoke every other active session of their account
+in one audited transaction using `POST /api/v1/session/revoke-others` with an
+empty body. The current bearer session remains valid, and the response reports
+how many sessions were revoked. See
+[docs/http-revoke-others-v32.md](docs/http-revoke-others-v32.md).

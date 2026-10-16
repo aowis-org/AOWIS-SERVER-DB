@@ -39,7 +39,15 @@ run_suite() {
         printf 'ERROR: no AOWIS tests registered in %s\n%s\n' "$build_dir" "$registered" >&2
         return 1
     fi
-    ctest --test-dir "$build_dir" --output-on-failure -L '^aowis$'
+    # Every test uses an isolated QTemporaryDir SQLite database. They can run
+    # concurrently without sharing database files; PBKDF2 strength is NOT
+    # reduced. Limit concurrency to avoid overwhelming smaller machines.
+    local jobs="${AOWIS_DB_TEST_JOBS:-4}"
+    if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]] || (( jobs > 32 )); then
+        printf 'Invalid AOWIS_DB_TEST_JOBS=%s (expected integer 1..32)\n' "$jobs" >&2
+        return 2
+    fi
+    ctest --test-dir "$build_dir" --parallel "$jobs" --output-on-failure -L '^aowis$'
 }
 
 if [[ ! -f "${PROJECT_DIR}/external/AOWIS-SERVER-MODEL/CMakeLists.txt" ]]; then

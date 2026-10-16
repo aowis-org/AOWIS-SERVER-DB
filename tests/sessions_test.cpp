@@ -52,7 +52,7 @@ int main(int argc, char **argv)
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 10);
+        REQUIRE(query.next() && query.value(0).toInt() == 12);
         REQUIRE(query.exec(QStringLiteral("SELECT token_sha256,uuid FROM user_sessions")));
         REQUIRE(query.next() && query.value(0).toByteArray().size() == 32);
         REQUIRE(query.value(0).toByteArray() != issued->bearer_token);
@@ -108,6 +108,7 @@ int main(int argc, char **argv)
         QSqlQuery query(inspector);
         REQUIRE(query.exec(QStringLiteral("DROP TABLE security_audit_events")));
         REQUIRE(query.exec(QStringLiteral("DROP TABLE user_sessions")));
+        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=7")));
         query.finish();
         inspector.close();

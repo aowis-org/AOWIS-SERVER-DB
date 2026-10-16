@@ -145,7 +145,7 @@ int main(int argc, char **argv)
         REQUIRE(inspection.open());
         QSqlQuery pragma(inspection);
         REQUIRE(pragma.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(pragma.next() && pragma.value(0).toInt() == 10);
+        REQUIRE(pragma.next() && pragma.value(0).toInt() == 12);
         pragma.finish();
         QSqlQuery audit_table(inspection);
         REQUIRE(audit_table.exec(QStringLiteral(

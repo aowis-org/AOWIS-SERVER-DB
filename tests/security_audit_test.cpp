@@ -183,6 +183,7 @@ int main(int argc, char **argv)
             "(SELECT uuid FROM permissions WHERE key='security.audit.read')")));
         REQUIRE(query.exec(QStringLiteral(
             "DELETE FROM permissions WHERE key='security.audit.read'")));
+        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=8")));
         query.finish();
         inspect.close();
@@ -209,7 +210,7 @@ int main(int argc, char **argv)
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 10);
+        REQUIRE(query.next() && query.value(0).toInt() == 12);
         query.finish();
         REQUIRE(query.exec(QStringLiteral("DROP TABLE security_audit_events")));
         query.finish();

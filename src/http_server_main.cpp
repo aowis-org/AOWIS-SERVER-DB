@@ -1,5 +1,6 @@
 #include <aowis/db/database.h>
 #include <aowis/db/http_routes.h>
+#include <aowis/db/http_hardening.h>
 
 #include <QCoreApplication>
 #include <QHostAddress>
@@ -44,12 +45,14 @@ int main(int argc, char **argv)
     }
 
     QHttpServer server;
+    aowis::db::configureHttpHardening(server);
     aowis::db::HttpRoutes routes(database, [&database](const QHttpServerRequest &request)
         -> std::optional<aowis::db::OperationContext> {
         const QByteArray authorization = request.value(QByteArrayLiteral("authorization"));
-        if (!authorization.startsWith("Bearer "))
+        const std::optional<QByteArray> token = aowis::db::parseBearerAuthorization(authorization);
+        if (!token)
             return std::nullopt;
-        return database.authenticateSession(authorization.mid(7));
+        return database.authenticateSession(*token);
     });
     if (!routes.registerOn(server))
     {

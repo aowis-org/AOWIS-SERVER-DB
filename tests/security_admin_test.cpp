@@ -169,6 +169,7 @@ int main(int argc, char **argv)
         REQUIRE(q.exec(QStringLiteral("ALTER TABLE legacy_assignments_v9 RENAME TO role_assignments")));
         REQUIRE(q.exec(QStringLiteral("CREATE TRIGGER role_assignment_no_update BEFORE UPDATE ON role_assignments BEGIN SELECT RAISE(ABORT,'legacy'); END")));
         REQUIRE(q.exec(QStringLiteral("CREATE TRIGGER role_assignment_valid BEFORE INSERT ON role_assignments BEGIN SELECT 1; END")));
+        REQUIRE(q.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
         REQUIRE(q.exec(QStringLiteral("PRAGMA user_version=9")));
         q.finish();
         inspector.close();

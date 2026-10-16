@@ -175,6 +175,7 @@ int main(int argc, char **argv)
         query.finish();
         REQUIRE(query.exec(QStringLiteral("DROP TABLE user_sessions")));
         REQUIRE(query.exec(QStringLiteral("DROP TABLE hydraulic_network_references")));
+        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=6")));
         query.finish();
         inspector.close();

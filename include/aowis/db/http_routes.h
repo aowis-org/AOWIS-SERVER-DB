@@ -2,8 +2,10 @@
 #define AOWIS_DB_HTTP_ROUTES_H
 
 #include <aowis/db/database.h>
+#include <aowis/db/login_throttle.h>
 
 #include <functional>
+#include <QElapsedTimer>
 #include <optional>
 
 #include <QHttpServer>
@@ -29,6 +31,8 @@ private:
 
     Database &database_;
     Authenticate authenticate_;
+    QElapsedTimer login_clock_;
+    LoginThrottle login_throttle_;
 };
 
 } // namespace aowis::db

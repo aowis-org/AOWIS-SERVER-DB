@@ -1,5 +1,6 @@
 #include <aowis/db/database.h>
 #include <aowis/model/uuid.h>
+#include "session_token_internal.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -56,6 +57,16 @@ std::optional<QByteArray> parseToken(const QByteArray &value)
     }
     return QByteArray::fromHex(value);
 }
+}
+
+QByteArray makeSessionToken()
+{
+    return makeRandomToken().toHex();
+}
+
+QByteArray sessionTokenDigest(const QByteArray &random_bytes)
+{
+    return sessionDigest(random_bytes);
 }
 
 bool Database::migrateSessionsV8(QString *error)
@@ -182,6 +193,239 @@ std::optional<OperationContext> Database::authenticateSession(const QByteArray &
     return OperationContext{QUuid::fromRfc4122(query.value(0).toByteArray())};
 }
 
+std::optional<ActiveSession> Database::activeSession(const QByteArray &bearer_token,
+    QString *error) const
+{
+    const std::optional<QByteArray> raw = parseToken(bearer_token);
+    if (!raw)
+    {
+        setError(error, QStringLiteral("Invalid or expired session"));
+        return std::nullopt;
+    }
+    QSqlQuery query(this->database_);
+    if (!query.prepare(QStringLiteral(
+        "SELECT s.uuid,s.user_uuid,s.expires_at_ms FROM user_sessions s "
+        "JOIN users u ON u.uuid=s.user_uuid WHERE s.token_sha256=? "
+        "AND s.revoked_at_ms IS NULL AND s.expires_at_ms>? "
+        "AND u.disabled_at_ms IS NULL LIMIT 1")))
+    {
+        setError(error, query.lastError().text());
+        return std::nullopt;
+    }
+    query.addBindValue(sessionDigest(*raw));
+    query.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    if (!query.exec())
+    {
+        setError(error, query.lastError().text());
+        return std::nullopt;
+    }
+    if (!query.next())
+    {
+        setError(error, QStringLiteral("Invalid or expired session"));
+        return std::nullopt;
+    }
+    return ActiveSession{QUuid::fromRfc4122(query.value(0).toByteArray()),
+                         QUuid::fromRfc4122(query.value(1).toByteArray()),
+                         query.value(2).toLongLong()};
+}
+
+bool Database::logoutSession(const QByteArray &bearer_token, QString *error)
+{
+    const std::optional<ActiveSession> session = activeSession(bearer_token, error);
+    const std::optional<QByteArray> raw = parseToken(bearer_token);
+    if (!session || !raw)
+        return false;
+    if (!beginWrite(error))
+        return false;
+
+    // The token and its owner are revalidated under BEGIN IMMEDIATE. The
+    // revocation and audit record must commit or roll back together.
+    QSqlQuery query(this->database_);
+    if (!query.prepare(QStringLiteral(
+        "UPDATE user_sessions SET revoked_at_ms=? WHERE uuid=? AND user_uuid=? "
+        "AND token_sha256=? AND revoked_at_ms IS NULL AND expires_at_ms>? "
+        "AND EXISTS (SELECT 1 FROM users WHERE uuid=? AND disabled_at_ms IS NULL)")))
+    {
+        setError(error, query.lastError().text());
+        rollback();
+        return false;
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    query.addBindValue(now);
+    query.addBindValue(uuidBytes(session->uuid));
+    query.addBindValue(uuidBytes(session->user_uuid));
+    query.addBindValue(sessionDigest(*raw));
+    query.addBindValue(now);
+    query.addBindValue(uuidBytes(session->user_uuid));
+    if (!query.exec() || query.numRowsAffected() != 1)
+    {
+        setError(error, QStringLiteral("Invalid or expired session"));
+        rollback();
+        return false;
+    }
+    query.finish();
+    if (!writeSecurityAuditEvent(session->user_uuid, QStringLiteral("session.logout"),
+                                 session->uuid, error) || !commit(error))
+    {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+
+QVector<OwnSessionInfo> Database::ownSessions(const QByteArray &bearer_token,
+    const QUuid &after_uuid, int limit, QString *error) const
+{
+    QVector<OwnSessionInfo> result;
+    if (limit < 1 || limit > 100)
+    {
+        setError(error, QStringLiteral("Session listing limit must be 1..100"));
+        return result;
+    }
+    const std::optional<ActiveSession> current = activeSession(bearer_token, error);
+    if (!current)
+        return result;
+
+    QSqlQuery query(this->database_);
+    if (!query.prepare(QStringLiteral(
+        "SELECT uuid,created_at_ms,expires_at_ms FROM user_sessions "
+        "WHERE user_uuid=? AND revoked_at_ms IS NULL AND expires_at_ms>? "
+        "AND (?=1 OR uuid>?) ORDER BY uuid LIMIT ?")))
+    {
+        setError(error, query.lastError().text());
+        return result;
+    }
+    query.addBindValue(uuidBytes(current->user_uuid));
+    query.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    query.addBindValue(after_uuid.isNull() ? 1 : 0);
+    query.addBindValue(uuidBytes(after_uuid));
+    query.addBindValue(limit);
+    if (!query.exec())
+    {
+        setError(error, query.lastError().text());
+        return result;
+    }
+    while (query.next())
+    {
+        const QUuid id = QUuid::fromRfc4122(query.value(0).toByteArray());
+        result.append(OwnSessionInfo{id, query.value(1).toLongLong(),
+                                     query.value(2).toLongLong(), id == current->uuid});
+    }
+    return result;
+}
+
+bool Database::revokeOwnSession(const QByteArray &bearer_token, const QUuid &session_uuid,
+    QString *error)
+{
+    if (session_uuid.isNull())
+    {
+        setError(error, QStringLiteral("Invalid session UUID"));
+        return false;
+    }
+    // Resolve outside the lock, then independently revalidate under it.
+    // A user UUID sent by an HTTP client is never accepted as authority.
+    if (!activeSession(bearer_token, error))
+        return false;
+    if (!beginWrite(error))
+        return false;
+    const std::optional<ActiveSession> current = activeSession(bearer_token, error);
+    if (!current)
+    {
+        rollback();
+        return false;
+    }
+    QSqlQuery query(this->database_);
+    if (!query.prepare(QStringLiteral(
+        "UPDATE user_sessions SET revoked_at_ms=? WHERE uuid=? AND user_uuid=? "
+        "AND revoked_at_ms IS NULL AND expires_at_ms>? "
+        "AND EXISTS(SELECT 1 FROM users WHERE uuid=? AND disabled_at_ms IS NULL)")))
+    {
+        setError(error, query.lastError().text());
+        rollback();
+        return false;
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    query.addBindValue(now);
+    query.addBindValue(uuidBytes(session_uuid));
+    query.addBindValue(uuidBytes(current->user_uuid));
+    query.addBindValue(now);
+    query.addBindValue(uuidBytes(current->user_uuid));
+    if (!query.exec())
+    {
+        setError(error, query.lastError().text());
+        rollback();
+        return false;
+    }
+    if (query.numRowsAffected() != 1)
+    {
+        setError(error, QStringLiteral("Session not found or unavailable"));
+        rollback();
+        return false;
+    }
+    query.finish();
+    const QString action = session_uuid == current->uuid
+        ? QStringLiteral("session.logout") : QStringLiteral("session.revoke.own");
+    if (!writeSecurityAuditEvent(current->user_uuid, action, session_uuid, error) || !commit(error))
+    {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+std::optional<qint64> Database::revokeOtherSessions(const QByteArray &bearer_token,
+    QString *error)
+{
+    const std::optional<QByteArray> raw = parseToken(bearer_token);
+    if (!raw)
+    {
+        setError(error, QStringLiteral("Invalid or expired session"));
+        return std::nullopt;
+    }
+    // Reject invalid credentials without taking the SQLite write lock.
+    // Recheck after BEGIN IMMEDIATE to close the race with other writers.
+    if (!activeSession(bearer_token, error))
+        return std::nullopt;
+    if (!beginWrite(error))
+        return std::nullopt;
+    const std::optional<ActiveSession> current = activeSession(bearer_token, error);
+    if (!current)
+    {
+        rollback();
+        return std::nullopt;
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    QSqlQuery query(this->database_);
+    if (!query.prepare(QStringLiteral(
+            "UPDATE user_sessions SET revoked_at_ms=? "
+            "WHERE user_uuid=? AND uuid<>? AND revoked_at_ms IS NULL AND expires_at_ms>?")))
+    {
+        setError(error, query.lastError().text());
+        rollback();
+        return std::nullopt;
+    }
+    query.addBindValue(now);
+    query.addBindValue(uuidBytes(current->user_uuid));
+    query.addBindValue(uuidBytes(current->uuid));
+    query.addBindValue(now);
+    if (!query.exec())
+    {
+        setError(error, query.lastError().text());
+        rollback();
+        return std::nullopt;
+    }
+    const qint64 revoked_count = query.numRowsAffected();
+    query.finish();
+    if (!writeSecurityAuditEvent(current->user_uuid, QStringLiteral("session.revoke_others"),
+                                 current->uuid, error) || !commit(error))
+    {
+        rollback();
+        return std::nullopt;
+    }
+    return revoked_count;
+}
+
 bool Database::revokeSession(const OperationContext &admin, const QUuid &session_uuid,
     QString *error)
 {
@@ -233,6 +477,21 @@ bool Database::disableUser(const OperationContext &admin, const QUuid &user_uuid
         if (!query.prepare(QStringLiteral(
                 "UPDATE user_sessions SET revoked_at_ms=? "
                 "WHERE user_uuid=? AND revoked_at_ms IS NULL")))
+        {
+            setError(error, query.lastError().text());
+            return false;
+        }
+        query.addBindValue(QDateTime::currentMSecsSinceEpoch());
+        query.addBindValue(uuidBytes(user_uuid));
+        if (!query.exec())
+        {
+            setError(error, query.lastError().text());
+            return false;
+        }
+        query.finish();
+        if (!query.prepare(QStringLiteral(
+                "UPDATE password_recovery_tokens SET invalidated_at_ms=? "
+                "WHERE user_uuid=? AND used_at_ms IS NULL AND invalidated_at_ms IS NULL")))
         {
             setError(error, query.lastError().text());
             return false;

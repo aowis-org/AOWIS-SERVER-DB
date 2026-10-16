@@ -4,6 +4,7 @@ project(AOWIS-SERVER-DB VERSION 0.1.0 LANGUAGES CXX)
 
 include(CTest)
 find_package(Qt6 REQUIRED COMPONENTS Core Sql)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 # Reuse the UUIDv7 implementation already owned by AOWIS-SERVER-MODEL.
 # The pinned Git submodule under external/ is the default.
@@ -42,6 +43,8 @@ add_library(aowis-db-core STATIC
     include/aowis/db/identity.h
     src/identity.cpp
     src/sessions.cpp
+    src/password_credentials.cpp
+    src/session_token_internal.h
     src/security_audit.cpp
     src/security_admin.cpp
     src/security_catalog.cpp
@@ -63,7 +66,7 @@ target_include_directories(aowis-db-core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(aowis-db-core PUBLIC Qt6::Core Qt6::Sql AOWIS::Model)
+target_link_libraries(aowis-db-core PUBLIC Qt6::Core Qt6::Sql AOWIS::Model PRIVATE OpenSSL::Crypto)
 set_target_properties(aowis-db-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Trusted local database operator CLI. No network dependency.
@@ -79,7 +82,11 @@ if(AOWIS_DB_BUILD_HTTP)
     if(TARGET Qt6::Network AND TARGET Qt6::HttpServer)
         add_library(aowis-db-http STATIC
             include/aowis/db/http_routes.h
+            include/aowis/db/http_hardening.h
+            include/aowis/db/login_throttle.h
+            src/login_throttle.cpp
             src/http_routes.cpp
+            src/http_hardening.cpp
         )
         add_library(AOWIS::DBHttp ALIAS aowis-db-http)
         target_compile_features(aowis-db-http PUBLIC cxx_std_20)
@@ -124,6 +131,9 @@ if(BUILD_TESTING)
     aowis_add_db_test(aowis-db-model-local-links-tests aowis-db-model-local-links tests/model_local_links_test.cpp)
     aowis_add_db_test(aowis-db-model-local-resources-tests aowis-db-model-local-resources tests/model_local_resources_test.cpp)
     aowis_add_db_test(aowis-db-sessions-tests aowis-db-sessions tests/sessions_test.cpp)
+    aowis_add_db_test(aowis-db-password-credentials-tests aowis-db-password-credentials tests/password_credentials_test.cpp)
+    aowis_add_db_test(aowis-db-password-change-tests aowis-db-password-change tests/password_self_change_test.cpp)
+    aowis_add_db_test(aowis-db-password-recovery-tests aowis-db-password-recovery tests/password_recovery_test.cpp)
     aowis_add_db_test(aowis-db-security-audit-tests aowis-db-security-audit tests/security_audit_test.cpp)
     aowis_add_db_test(aowis-db-security-admin-tests aowis-db-security-admin tests/security_admin_test.cpp)
     aowis_add_db_test(aowis-db-security-catalog-tests aowis-db-security-catalog tests/security_catalog_test.cpp)
@@ -136,6 +146,24 @@ if(BUILD_TESTING)
         target_link_libraries(aowis-db-http-sessions-tests PRIVATE aowis-db-http)
         aowis_add_db_test(aowis-db-http-security-catalog-tests aowis-db-http-security-catalog tests/http_security_catalog_test.cpp)
         target_link_libraries(aowis-db-http-security-catalog-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-security-mutations-tests aowis-db-http-security-mutations tests/http_security_mutations_test.cpp)
+        target_link_libraries(aowis-db-http-security-mutations-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-hardening-tests aowis-db-http-hardening tests/http_hardening_test.cpp)
+        target_link_libraries(aowis-db-http-hardening-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-login-throttle-tests aowis-db-http-login-throttle tests/http_login_throttle_test.cpp)
+        target_link_libraries(aowis-db-http-login-throttle-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-self-service-tests aowis-db-http-self-service tests/http_session_self_service_test.cpp)
+        aowis_add_db_test(aowis-db-http-password-login-tests aowis-db-http-password-login tests/http_password_login_test.cpp)
+        aowis_add_db_test(aowis-db-http-password-change-tests aowis-db-http-password-change tests/http_password_change_test.cpp)
+        aowis_add_db_test(aowis-db-http-password-recovery-tests aowis-db-http-password-recovery tests/http_password_recovery_test.cpp)
+        aowis_add_db_test(aowis-db-http-own-sessions-tests aowis-db-http-own-sessions tests/http_own_sessions_test.cpp)
+        target_link_libraries(aowis-db-http-own-sessions-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-revoke-others-tests aowis-db-http-revoke-others tests/http_revoke_other_sessions_test.cpp)
+        target_link_libraries(aowis-db-http-revoke-others-tests PRIVATE aowis-db-http)
+        target_link_libraries(aowis-db-http-password-recovery-tests PRIVATE aowis-db-http)
+        target_link_libraries(aowis-db-http-password-change-tests PRIVATE aowis-db-http)
+        target_link_libraries(aowis-db-http-password-login-tests PRIVATE aowis-db-http)
+        target_link_libraries(aowis-db-http-self-service-tests PRIVATE aowis-db-http)
     endif()
 
     get_property(aowis_db_test_executables GLOBAL PROPERTY AOWIS_DB_TEST_EXECUTABLES)
