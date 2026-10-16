@@ -28,7 +28,7 @@ run_suite() {
 
     printf '=== AOWIS DB Linux tests (%s) ===\n' "${build_type:-existing configuration}"
     cmake "${cmake_args[@]}"
-    cmake --build "$build_dir" --target aowis-db-sqlite-tests aowis-db-migration-tests aowis-db-history-tests aowis-db-objects-tests --parallel
+    cmake --build "$build_dir" --target aowis-db-sqlite-tests aowis-db-migration-tests aowis-db-history-tests aowis-db-objects-tests aowis-db-model-tests --parallel
     local registered
     registered="$(ctest --test-dir "$build_dir" -N -L '^aowis$')"
     if ! grep -Eq 'Total Tests: [1-9][0-9]*' <<< "$registered"; then
