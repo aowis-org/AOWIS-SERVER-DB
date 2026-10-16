@@ -136,6 +136,20 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::UserInfo> root_user = db.bootstrapAdministrator(QStringLiteral("operator"), &error);
     REQUIRE(root_user.has_value());
     const OperationContext root{root_user->uuid};
+    // This path upgrades V1 all the way to the current V4 object/history schema.
+    {
+        QSqlDatabase inspection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+                                                             QStringLiteral("schema-inspection"));
+        inspection.setDatabaseName(path);
+        REQUIRE(inspection.open());
+        QSqlQuery pragma(inspection);
+        REQUIRE(pragma.exec(QStringLiteral("PRAGMA user_version")));
+        REQUIRE(pragma.next() && pragma.value(0).toInt() == 4);
+        pragma.finish();
+        inspection.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("schema-inspection"));
+
     const aowis::db::IntegrityReport migrated = db.verifyProject(root, project_uuid);
     REQUIRE(migrated.valid && migrated.checked_revisions == 1);
     REQUIRE(db.revision(root, finalized_uuid, &error)->hash_version == 1);

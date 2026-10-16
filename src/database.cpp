@@ -11,7 +11,7 @@ namespace aowis::db
 {
 namespace
 {
-constexpr int schema_version = 2;
+constexpr int schema_version = 4;
 constexpr int digest_length = 32;
 
 QByteArray uuidBytes(const QUuid &uuid)
@@ -203,8 +203,12 @@ bool Database::migrate(QString *error)
     }
     if (current == schema_version)
         return true;
+    if (current == 3)
+        return migrateObjectsV4(error);
+    if (current == 2)
+        return migrateHistoryV3(error) && migrateObjectsV4(error);
     if (current == 1)
-        return migrateSecurityV2(error);
+        return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error);
     if (current != 0 || !beginWrite(error))
         return false;
 
@@ -322,7 +326,7 @@ bool Database::migrate(QString *error)
         rollback();
         return false;
     }
-    return migrateSecurityV2(error);
+    return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error);
 }
 
 std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &actor_uuid, const QString &name, QString *error)
@@ -635,6 +639,19 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
         }
     }
     if (ok)
+        ok = copyObjects(base_finalized_revision_uuid, result.head_revision_uuid, error);
+    if (ok)
+    {
+        ok = prepare(query, QStringLiteral(
+            "UPDATE revisions SET object_mode=(SELECT object_mode FROM revisions WHERE uuid=?) WHERE uuid=?"), error);
+        if (ok)
+        {
+            query.addBindValue(uuidBytes(base_finalized_revision_uuid));
+            query.addBindValue(uuidBytes(result.head_revision_uuid));
+            ok = run(query, error);
+        }
+    }
+    if (ok)
     {
         ok = prepare(query, QStringLiteral(
             "UPDATE branches SET head_revision_uuid=? WHERE uuid=?"), error);
@@ -677,36 +694,30 @@ bool Database::replaceWorkingSnapshotUnchecked(const QUuid &actor_uuid, const QU
         return false;
     }
 
-    QSqlQuery query(this->database_);
-    bool ok = prepare(query, QStringLiteral(
-        "INSERT INTO snapshots(revision_uuid,format_version,content) VALUES (?,1,?) "
-        "ON CONFLICT(revision_uuid) DO UPDATE SET content=excluded.content"), error);
-    if (ok)
+    const std::optional<int> mode = objectMode(r->uuid, error);
+    if (!mode || *mode != 0)
     {
-        query.addBindValue(uuidBytes(r->uuid));
-        query.addBindValue(canonical_snapshot);
-        ok = run(query, error);
-    }
-    if (ok)
-    {
-        ok = prepare(query, QStringLiteral(
-            "UPDATE revisions SET generation=generation+1 WHERE uuid=? AND state='working' AND generation=?"), error);
-        if (ok)
-        {
-            query.addBindValue(uuidBytes(r->uuid));
-            query.addBindValue(expected_generation);
-            ok = run(query, error) && query.numRowsAffected() == 1;
-        }
-    }
-    if (ok)
-        ok = commit(error);
-    if (!ok)
+        setError(error, QStringLiteral("Object-mode revision cannot use whole-snapshot operations"));
         rollback();
-    return ok;
+        return false;
+    }
+    const bool ok = applySnapshotOperation(*r, actor_uuid, canonical_snapshot,
+                                           QStringLiteral("replace"), QUuid(), error);
+    if (!ok || !commit(error))
+    {
+        rollback();
+        return false;
+    }
+    return true;
 }
 
 std::optional<QByteArray> Database::snapshotUnchecked(const QUuid &revision_uuid, QString *error) const
 {
+    const std::optional<int> mode = objectMode(revision_uuid, error);
+    if (!mode)
+        return std::nullopt;
+    if (*mode == 1)
+        return objectManifest(revision_uuid, error);
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("SELECT content FROM snapshots WHERE revision_uuid=?"), error))
         return std::nullopt;
@@ -743,11 +754,30 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
         rollback();
         return std::nullopt;
     }
-    const std::optional<QByteArray> body = snapshotUnchecked(r->uuid, error);
+    const std::optional<int> mode = objectMode(r->uuid, error);
+    const std::optional<QByteArray> body = mode ? snapshotUnchecked(r->uuid, error) : std::nullopt;
     if (!body)
     {
         rollback();
         return std::nullopt;
+    }
+    if (*mode == 1)
+    {
+        QSqlQuery stored(this->database_);
+        if (!prepare(stored, QStringLiteral(
+                "INSERT INTO snapshots(revision_uuid,format_version,content) VALUES (?,1,?) "
+                "ON CONFLICT(revision_uuid) DO UPDATE SET content=excluded.content"), error))
+        {
+            rollback();
+            return std::nullopt;
+        }
+        stored.addBindValue(uuidBytes(r->uuid));
+        stored.addBindValue(*body);
+        if (!run(stored, error))
+        {
+            rollback();
+            return std::nullopt;
+        }
     }
     QVector<QPair<QUuid, QByteArray>> parent_hashes;
     for (const QUuid &parent_uuid : r->parent_revision_uuids)
@@ -762,6 +792,12 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
         }
         parent_hashes.append(qMakePair(parent_uuid, parent->chain_sha256));
     }
+    const std::optional<QByteArray> operation_digest = historyDigest(r->uuid, error);
+    if (!operation_digest)
+    {
+        rollback();
+        return std::nullopt;
+    }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     Finalization result;
     result.finalized_revision_uuid = r->uuid;
@@ -775,7 +811,8 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
     QSqlQuery query(this->database_);
     bool ok = prepare(query, QStringLiteral(
         "UPDATE revisions SET state='finalized', finalized_at_ms=?, title=?, message=?, "
-        "snapshot_sha256=?,chain_sha256=?, finalized_by_uuid=?, hash_format_version=2 "
+        "snapshot_sha256=?,chain_sha256=?, finalized_by_uuid=?, hash_format_version=2, "
+        "operation_history_sha256=? "
         "WHERE uuid=? AND state='working' AND generation=?"), error);
     if (ok)
     {
@@ -785,6 +822,7 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
         query.addBindValue(result.snapshot_sha256);
         query.addBindValue(result.chain_sha256);
         query.addBindValue(uuidBytes(actor_uuid));
+        query.addBindValue(*operation_digest);
         query.addBindValue(uuidBytes(r->uuid));
         query.addBindValue(expected_generation);
         ok = run(query, error) && query.numRowsAffected() == 1;
@@ -792,8 +830,8 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
     if (ok)
     {
         ok = prepare(query, QStringLiteral(
-            "INSERT INTO revisions (uuid,project_uuid,branch_uuid,number,state,created_at_ms,created_by_uuid) "
-            "VALUES (?,?,?,?, 'working',?,?)"), error);
+            "INSERT INTO revisions (uuid,project_uuid,branch_uuid,number,state,created_at_ms,created_by_uuid,object_mode) "
+            "VALUES (?,?,?,?, 'working',?,?,?)"), error);
         if (ok)
         {
             query.addBindValue(uuidBytes(result.new_working_revision_uuid));
@@ -802,6 +840,7 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
             query.addBindValue(r->number + 1);
             query.addBindValue(now);
             query.addBindValue(uuidBytes(actor_uuid));
+            query.addBindValue(*mode);
             ok = run(query, error);
         }
     }
@@ -829,6 +868,8 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
+    if (ok && *mode == 1)
+        ok = copyObjects(r->uuid, result.new_working_revision_uuid, error);
     if (ok)
     {
         ok = prepare(query, QStringLiteral(
@@ -893,6 +934,27 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
 
         report.failed_revision_uuid = current_uuid;
         const std::optional<QByteArray> body = snapshotUnchecked(current_uuid, &error);
+        const std::optional<int> mode = objectMode(current_uuid, &error);
+        if (!mode)
+        {
+            report.error = error;
+            return report;
+        }
+        if (*mode == 1)
+        {
+            QSqlQuery stored(this->database_);
+            if (!prepare(stored, QStringLiteral("SELECT content FROM snapshots WHERE revision_uuid=?"), &error))
+            {
+                report.error = error;
+                return report;
+            }
+            stored.addBindValue(uuidBytes(current_uuid));
+            if (!run(stored, &error) || !stored.next() || !body || stored.value(0).toByteArray() != *body)
+            {
+                report.error = QStringLiteral("Finalized object manifest differs from persisted snapshot");
+                return report;
+            }
+        }
         if (!body || QCryptographicHash::hash(*body, QCryptographicHash::Sha256) != recorded_snapshot_hash)
         {
             report.error = QStringLiteral("Missing or corrupted finalized snapshot: %1").arg(error);
@@ -904,6 +966,31 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
             report.error = error;
             return report;
         }
+        QSqlQuery operation_seal(this->database_);
+        if (!prepare(operation_seal, QStringLiteral(
+                "SELECT operation_history_sha256 FROM revisions WHERE uuid=?"), &error))
+        {
+            report.error = error;
+            return report;
+        }
+        operation_seal.addBindValue(uuidBytes(current_uuid));
+        if (!run(operation_seal, &error) || !operation_seal.next())
+        {
+            report.error = error;
+            return report;
+        }
+        if (!operation_seal.value(0).isNull())
+        {
+            const QByteArray expected_history_hash = operation_seal.value(0).toByteArray();
+            operation_seal.finish();
+            const std::optional<QByteArray> actual_history_hash = historyDigest(current_uuid, &error);
+            if (!actual_history_hash || expected_history_hash != *actual_history_hash)
+            {
+                report.error = QStringLiteral("Finalized operation history hash mismatch: %1").arg(error);
+                return report;
+            }
+        }
+
         QVector<QPair<QUuid, QByteArray>> parent_hashes;
         for (const QUuid &parent_uuid : current->parent_revision_uuids)
         {

@@ -64,6 +64,45 @@ struct Finalization
     QUuid new_working_revision_uuid;
 };
 
+struct HistoryEvent
+{
+    QUuid uuid;
+    QUuid revision_uuid;
+    QUuid actor_uuid;
+    QUuid target_event_uuid; // Populated for undo/redo events.
+    qint64 sequence = 0;
+    qint64 occurred_at_ms = 0;
+    QString kind; // "replace", "undo", "redo"
+    bool had_previous_snapshot = false;
+    QByteArray before_sha256;
+    QByteArray after_sha256;
+};
+
+// Per-object version is independent of the branch-wide revision generation.
+// Deleted objects remain as tombstones to reject stale recreate operations.
+struct ModelObject
+{
+    QUuid uuid;
+    QString kind;
+    QByteArray content;
+    qint64 version = 0;
+    bool deleted = false;
+};
+
+struct ObjectChange
+{
+    QUuid uuid;
+    QUuid revision_uuid;
+    QUuid object_uuid;
+    QUuid actor_uuid;
+    QString kind;
+    QString action; // put / delete
+    qint64 sequence = 0;
+    qint64 occurred_at_ms = 0;
+    qint64 before_version = -1;
+    qint64 after_version = 0;
+};
+
 struct IntegrityReport
 {
     bool valid = false;
@@ -130,6 +169,36 @@ public:
                                          const QString &message, QString *error = nullptr);
     IntegrityReport verifyProject(const OperationContext &actor, const QUuid &project_uuid) const;
 
+    // Initial object-level persistence. Objects use externally supplied canonical
+    // bytes; full AOWIS Model serialization is still a separate step.
+    // expected_version=-1 means the UUID must not have been used in this revision.
+    // Object mutations are serialized by SQLite, but do not require the caller
+    // to supply the branch-wide revision generation.
+    std::optional<ModelObject> object(const OperationContext &actor, const QUuid &revision_uuid,
+                                      const QUuid &object_uuid, QString *error = nullptr) const;
+    QVector<ModelObject> objects(const OperationContext &actor, const QUuid &revision_uuid,
+                                  QString *error = nullptr) const;
+    bool putObject(const OperationContext &actor, const QUuid &branch_uuid,
+                   const QUuid &object_uuid, const QString &kind, const QByteArray &canonical_bytes,
+                   qint64 expected_version, QString *error = nullptr);
+    bool deleteObject(const OperationContext &actor, const QUuid &branch_uuid,
+                      const QUuid &object_uuid, qint64 expected_version, QString *error = nullptr);
+    QVector<ObjectChange> objectHistoryForRevision(const OperationContext &actor,
+                         const QUuid &revision_uuid, QString *error = nullptr) const;
+
+    // Durable, append-only working revision history. Each change (including
+    // undo and redo) is persisted atomically with the working snapshot.
+    QVector<HistoryEvent> history(const OperationContext &actor, const QUuid &branch_uuid,
+                                  QString *error = nullptr) const;
+    QVector<HistoryEvent> historyForRevision(const OperationContext &actor, const QUuid &revision_uuid,
+                                             QString *error = nullptr) const;
+    // Undo/redo return the UUID of the original change they compensated,
+    // not the UUID of the newly appended compensating history event.
+    std::optional<QUuid> undoLastChange(const OperationContext &actor, const QUuid &branch_uuid,
+                                       qint64 expected_generation, QString *error = nullptr);
+    std::optional<QUuid> redoLastChange(const OperationContext &actor, const QUuid &branch_uuid,
+                                       qint64 expected_generation, QString *error = nullptr);
+
 private:
     bool exec(const QString &sql, QString *error = nullptr) const;
     bool beginWrite(QString *error = nullptr) const;
@@ -137,6 +206,23 @@ private:
     void rollback() const;
     bool migrate(QString *error);
     bool migrateSecurityV2(QString *error);
+    bool migrateHistoryV3(QString *error);
+    bool migrateObjectsV4(QString *error);
+    // The manifest includes the exact object-change journal digest, so it is
+    // covered by the existing V2 finalized SHA-256 revision chain.
+    std::optional<QByteArray> objectManifest(const QUuid &revision_uuid, QString *error) const;
+    std::optional<int> objectMode(const QUuid &revision_uuid, QString *error) const;
+    bool copyObjects(const QUuid &from_revision, const QUuid &to_revision, QString *error);
+    bool modifyObject(const OperationContext &actor, const QUuid &branch_uuid,
+                      const QUuid &object_uuid, const QString &kind,
+                      const std::optional<QByteArray> &bytes, qint64 expected_version,
+                      QString *error);
+    bool applySnapshotOperation(const RevisionInfo &revision, const QUuid &actor_uuid,
+                                const std::optional<QByteArray> &new_snapshot,
+                                const QString &kind, const QUuid &target_uuid,
+                                QString *error);
+    std::optional<QByteArray> historyDigest(const QUuid &revision_uuid,
+                                             QString *error) const;
     bool requirePermission(const OperationContext &actor, const QString &key,
                            const AccessScope &scope, QString *error) const;
 

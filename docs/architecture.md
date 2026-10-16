@@ -1,4 +1,4 @@
-# Persistence architecture and contracts (v2 identity foundation)
+# Persistence architecture and contracts (v4 object persistence foundation)
 
 ## Stable vocabulary
 
@@ -16,9 +16,9 @@ finalized revision owned by another branch of the same project.
 Transactions use `BEGIN IMMEDIATE` so a finalization sees a consistent head,
 generation, snapshot, and parent. Every working revision has a generation
 counter. A mutation must give the generation it read; a mismatch means a
-conflict. This is **snapshot-wide** locking for the foundation. Later,
-per-object optimistic concurrency will allow unrelated edits in the same
-working revision to coexist without conflicts.
+conflict. Legacy snapshot operations use the revision-wide generation, whereas V4
+object-mode mutations use per-object optimistic versions (while still
+advancing the global revision generation for finalization).
 
 SQLite `foreign_keys=ON` and SQL triggers protect finalized revision rows and
 snapshots. Do not grant write access to arbitrary SQL clients expecting these
@@ -74,3 +74,89 @@ revision until copy-on-write object references become available.
   documented in [identity-and-access.md](identity-and-access.md).
 - HTTP authentication and user session/credential management are not implemented.
 - Full edit-operation and security audit histories come after this foundation.
+
+## SQLite operation history: schema V3
+
+Migration V2 -> V3 adds `operation_events` and `revisions.operation_history_sha256`.
+Every accepted snapshot write creates a UUIDv7 event with actor UUID, revision,
+branch, project, monotonic event sequence (= revision edit generation), UTC
+milliseconds, and complete before/after snapshots. `undo` and `redo` are
+**compensating events** referencing a prior `replace` event; no event is deleted.
+All three actions commit the state and event atomically under `BEGIN IMMEDIATE`
+and reject stale expected generations.
+
+The undo/redo stack is reconstructed from append-only events. An ordinary
+replacement clears redo candidates; an undo/redo must exactly match the
+recorded snapshot before it is performed. Events are always scoped to a
+single working revision. Finalizing a revision seals the operation journal
+and starts the next working revision with a fresh journal. Old finalized
+revisions remain accessible via `historyForRevision`.
+
+V3 stores a SHA-256 digest over its exact journal encoding: literal ASCII
+`AOWIS-OPERATIONS-V1` followed by NUL; unsigned 64-bit event count; then
+for each event in increasing sequence: event UUID, actor UUID, revision UUID,
+unsigned 64-bit sequence and Unix millisecond timestamp, length-prefixed UTF-8
+operation kind, target UUID or 16 zero bytes, one byte (0/1) to indicate
+before-snapshot presence (and length-prefixed bytes if present), and similarly
+one byte plus optional length-prefixed after-snapshot bytes.
+
+Finalization saves that digest in `revisions.operation_history_sha256`, and
+verification recalculates and checks it. **This additional journal digest is
+not yet part of the historical V2 revision chain.** A later V3 chain encoding
+will bind the two hashes together; never reinterpret V1 or V2 hashes or
+retroactively assign fictitious edits to old revisions.
+
+At present, entire opaque snapshots are copied for each event. This is a
+correctness-first foundation, not yet suitable for large hydraulic models or
+fine-grained simultaneous editing. Later replace this with per-entity change
+sets, durable grouped transactions, Model-specific inverse commands, and an
+independent security audit trail.
+
+## SQLite model-object foundation: schema V4
+
+Migration V3 -> V4 adds `revisions.object_mode`, `revision_objects` and an
+append-only `object_events` journal. Existing databases remain in legacy
+snapshot mode (0), preserving V1 and V2 revision hashes byte-for-byte.
+
+A fresh working revision with no legacy snapshot/history can switch to object
+mode (1) at its first object write. The two formats cannot be mixed within
+one revision. In object mode, each model object has its own immutable UUID,
+kind identifier, bytes, per-object version and deletion tombstone. Edits use
+`expected_version` (`-1` means never seen before); separate objects can be
+updated against their own versions even when the branch generation changed.
+The branch generation still advances for each successful edit and controls
+finalization. Changes and journal entries are committed atomically. Historical
+revisions cannot be modified by ordinary SQL without disabling triggers.
+
+The `putObject` API stores externally provided **opaque canonical bytes**.
+It does NOT yet offer a complete round-trip serializer for the structures in
+AOWIS-SERVER-MODEL. Model validation, reference integrity, and per-entity
+serialization remain required before production project storage.
+
+For object-mode revisions, `snapshot()` provides a deterministic manifest:
+`AOWIS-OBJECT-MANIFEST-V1` + NUL; SHA-256 of the operation journal; big-endian
+64-bit number of object records (including deletion tombstones); then each
+record sorted by its 16-byte UUID: UUID, length-prefixed UTF-8 kind, unsigned
+64-bit version, deletion marker (0 or 1), and length-prefixed bytes only for
+non-deleted records. The journal hash covers `AOWIS-OBJECT-JOURNAL-V1` + NUL; big-endian
+64-bit journal-entry count; then for each entry ordered by revision-wide
+sequence: event UUID, object UUID, actor UUID, unsigned big-endian sequence
+and Unix-ms timestamp, length-prefixed kind and operation, unsigned
+before_version+1, unsigned after_version, before-deleted marker, before-bytes
+presence marker and optional length-prefixed before bytes, after-bytes
+presence marker and optional length-prefixed after bytes.
+
+Finalization persists the manifest once and its SHA-256 is fed into the
+existing V2 revision chain. A verifier regenerates the manifest from the
+persisted object rows and journal, compares it against both the stored
+snapshot and finalized digest, then checks the previous revision hashes.
+The existing V3 whole-snapshot history is unaffected. On finalization or
+branch creation, object rows are copied into the successor's working state;
+its operation journal starts empty. Large-scale copy-on-write sharing and
+actual `NetworkHydraulic` field-level serializers are later optimizations.
+
+**Important limitation:** object mutations have a durable history but not yet
+reversible object-level undo/redo. Existing whole-snapshot undo/redo remains
+available only for legacy snapshot-mode revisions. A subsequent stage must
+add atomic model-aware operation groups and object-history undo/redo before
+this foundation replaces GUI editing.

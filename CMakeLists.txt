@@ -6,12 +6,13 @@ include(CTest)
 find_package(Qt6 REQUIRED COMPONENTS Core Sql)
 
 # Reuse the UUIDv7 implementation already owned by AOWIS-SERVER-MODEL.
-# A sibling checkout is the default; parent builds can supply the target.
+# The pinned Git submodule under external/ is the default.
+# Parent builds may already provide AOWIS::Model.
 if(NOT TARGET AOWIS::Model)
-    set(AOWIS_MODEL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../AOWIS-SERVER-MODEL"
+    set(AOWIS_MODEL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/AOWIS-SERVER-MODEL"
         CACHE PATH "Path to AOWIS-SERVER-MODEL")
     if(NOT EXISTS "${AOWIS_MODEL_SOURCE_DIR}/CMakeLists.txt")
-        message(FATAL_ERROR "AOWIS-SERVER-MODEL not found. Set AOWIS_MODEL_SOURCE_DIR.")
+        message(FATAL_ERROR "Model submodule missing. Run ./git_submodule_init.sh or set AOWIS_MODEL_SOURCE_DIR.")
     endif()
     add_subdirectory("${AOWIS_MODEL_SOURCE_DIR}"
                      "${CMAKE_CURRENT_BINARY_DIR}/aowis-server-model")
@@ -21,6 +22,8 @@ add_library(aowis-db-core STATIC
     include/aowis/db/database.h
     include/aowis/db/identity.h
     src/identity.cpp
+    src/history.cpp
+    src/objects.cpp
     src/database.cpp
 )
 add_library(AOWIS::DB ALIAS aowis-db-core)
@@ -40,5 +43,11 @@ if(BUILD_TESTING)
     add_executable(aowis-db-migration-tests tests/sqlite_migration_test.cpp)
     target_link_libraries(aowis-db-migration-tests PRIVATE aowis-db-core)
     add_test(NAME aowis-db-migration COMMAND aowis-db-migration-tests)
-    set_tests_properties(aowis-db-sqlite aowis-db-migration PROPERTIES LABELS "aowis;database")
+    add_executable(aowis-db-history-tests tests/history_test.cpp)
+    target_link_libraries(aowis-db-history-tests PRIVATE aowis-db-core)
+    add_test(NAME aowis-db-history COMMAND aowis-db-history-tests)
+    add_executable(aowis-db-objects-tests tests/objects_test.cpp)
+    target_link_libraries(aowis-db-objects-tests PRIVATE aowis-db-core)
+    add_test(NAME aowis-db-objects COMMAND aowis-db-objects-tests)
+    set_tests_properties(aowis-db-sqlite aowis-db-migration aowis-db-history aowis-db-objects PROPERTIES LABELS "aowis;database")
 endif()
