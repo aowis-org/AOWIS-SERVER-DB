@@ -11,6 +11,7 @@
 #include <QSqlDatabase>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QUuid>
 #include <QVector>
 #include <QtGlobal>
@@ -165,6 +166,49 @@ struct ModelObject
     bool deleted = false;
 };
 
+// A read-only three-way comparison of canonical object states. Each entry
+// represents an entity changed relative to the single finalized merge base.
+// Deleted objects are represented by std::nullopt (tombstones are not live
+// entities). Object version counters are not part of content equality.
+enum class ObjectMergeKind
+{
+    LeftOnly,   // Only left changed relative to the base.
+    RightOnly,  // Only right changed relative to the base.
+    BothSame,   // Both changed to identical canonical state (including delete).
+    Conflict,   // Incompatible edits; caller must explicitly resolve them.
+    FieldsMerged // Independent top-level field edits; synthesized canonical result.
+};
+
+struct ObjectMergeChange
+{
+    QUuid object_uuid;
+    ObjectMergeKind kind = ObjectMergeKind::Conflict;
+    std::optional<ModelObject> base;
+    std::optional<ModelObject> left;
+    std::optional<ModelObject> right;
+    // Populated only for supported typed entities changed on both sides.
+    // Nested structs, lists and metadata are treated as atomic top-level fields.
+    QStringList conflicting_fields;
+    std::optional<ModelObject> automatically_merged;
+};
+
+struct ObjectMergePreview
+{
+    QUuid project_uuid;
+    QUuid base_revision_uuid;
+    QUuid left_revision_uuid;
+    QUuid right_revision_uuid;
+    // Captured from the same read transaction as the entity states. A future
+    // merge operation must check these generations again under its write lock.
+    qint64 left_generation = 0;
+    qint64 right_generation = 0;
+    // Transient SHA-256 of every physical left object row, including version
+    // and tombstone data. Captured with the preview's SQLite read snapshot.
+    QByteArray left_physical_sha256;
+    QVector<ObjectMergeChange> changes; // Sorted by UUID bytes.
+    qsizetype conflict_count = 0;
+};
+
 struct ObjectChange
 {
     QUuid uuid;
@@ -182,6 +226,26 @@ struct ObjectChange
 // A batch is one user-visible action. Edits are applied in vector order, all
 // within a single SQLite transaction; all expected versions must match.
 // For deletion, set content to std::nullopt (kind may be empty).
+// A conflict can select one entire side or give a choice for every conflicting
+// top-level field. Nonconflicting fields are always merged automatically when
+// using field choices. FieldsMerged changes require no manual resolution.
+enum class ObjectMergeSide { Left, Right };
+
+struct ObjectMergeFieldResolution
+{
+    QString field_name; // Exact top-level name from ObjectMergeChange::conflicting_fields.
+    ObjectMergeSide side = ObjectMergeSide::Left;
+};
+
+struct ObjectMergeResolution
+{
+    QUuid object_uuid;
+    ObjectMergeSide side = ObjectMergeSide::Left; // Whole entity, when field_resolutions is empty.
+    // When nonempty, must cover each conflicting field exactly once; side is
+    // ignored and all independent changes from both branches are preserved.
+    QVector<ObjectMergeFieldResolution> field_resolutions;
+};
+
 struct ObjectEdit
 {
     QUuid object_uuid;
@@ -366,6 +430,28 @@ public:
         const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
         QString *error = nullptr) const;
 
+    // Preview a three-way merge of canonical object states without modifying
+    // revisions. Requires exactly one finalized common ancestor and object
+    // mode on all three revisions. The caller needs project.read on left,
+    // right AND the base branch (which might be a third private branch).
+    // Supports preview of field conflicts; multiple merge bases remain unsupported.
+    std::optional<ObjectMergePreview> previewObjectMerge(const OperationContext &actor,
+        const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
+        QString *error = nullptr) const;
+
+    // Finalize an entity-level merge on a canonical working revision, including
+    // one with existing local edits. Its sole finalized parent becomes the
+    // first merge parent; the working head's current objects are the left
+    // comparison input. The right input is finalized on another branch.
+    // Local journal/groups are preserved and any merge edits form a new group.
+    // Conflicts require explicit whole-entity or per-field choices. Both head UUID and generation
+    // are required for compare-and-swap; no local edit is silently overwritten.
+    std::optional<Finalization> mergeObjectRevisions(const OperationContext &actor,
+        const QUuid &target_branch_uuid, const QUuid &expected_working_revision_uuid,
+        qint64 expected_generation, const QUuid &right_finalized_revision_uuid,
+        const QVector<ObjectMergeResolution> &resolutions,
+        const QString &title, const QString &message, QString *error = nullptr);
+
     // Legacy opaque whole-snapshot path; object-mode revisions use typed
     // persistence and the separate grouped object journal.
     bool replaceWorkingSnapshot(const OperationContext &actor, const QUuid &branch_uuid,
@@ -512,6 +598,10 @@ private:
                                          qint64 expected_generation,
                                          const QByteArray &snapshot, QString *error);
     std::optional<QByteArray> snapshotUnchecked(const QUuid &revision_uuid, QString *error) const;
+    // Caller holds a BEGIN IMMEDIATE transaction; never commits or rolls back.
+    std::optional<Finalization> finalizeInWriteTransaction(const QUuid &actor_uuid,
+        const QUuid &branch_uuid, qint64 expected_generation, const QString &title,
+        const QString &message, QString *error);
     std::optional<Finalization> finalizeUnchecked(const QUuid &actor_uuid, const QUuid &branch_uuid,
                                                  qint64 expected_generation, const QString &title,
                                                  const QString &message, QString *error);

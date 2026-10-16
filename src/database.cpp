@@ -860,10 +860,25 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
 {
     if (!beginWrite(error))
         return std::nullopt;
+    const std::optional<Finalization> result = finalizeInWriteTransaction(
+        actor_uuid, branch_uuid, expected_generation, title, message, error);
+    if (!result || !commit(error))
+    {
+        rollback();
+        return std::nullopt;
+    }
+    return result;
+}
+
+std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &actor_uuid, const QUuid &branch_uuid,
+                                               qint64 expected_generation,
+                                               const QString &title,
+                                               const QString &message,
+                                               QString *error)
+{
     if (!requirePermission(OperationContext{actor_uuid}, QStringLiteral("project.revision.finalize"),
                            AccessScope::branch(branch_uuid), error))
     {
-        rollback();
         return std::nullopt;
     }
     const std::optional<BranchInfo> b = branchUnchecked(branch_uuid, error);
@@ -871,14 +886,12 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
     if (!r || r->finalized || r->generation != expected_generation)
     {
         setError(error, QStringLiteral("Working revision changed, or branch not found"));
-        rollback();
         return std::nullopt;
     }
     const std::optional<int> mode = objectMode(r->uuid, error);
     const std::optional<QByteArray> body = mode ? snapshotUnchecked(r->uuid, error) : std::nullopt;
     if (!body)
     {
-        rollback();
         return std::nullopt;
     }
     if (*mode == 1)
@@ -888,15 +901,13 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
                 "INSERT INTO snapshots(revision_uuid,format_version,content) VALUES (?,1,?) "
                 "ON CONFLICT(revision_uuid) DO UPDATE SET content=excluded.content"), error))
         {
-            rollback();
-            return std::nullopt;
+                return std::nullopt;
         }
         stored.addBindValue(uuidBytes(r->uuid));
         stored.addBindValue(*body);
         if (!run(stored, error))
         {
-            rollback();
-            return std::nullopt;
+                return std::nullopt;
         }
     }
     QVector<QPair<QUuid, QByteArray>> parent_hashes;
@@ -907,15 +918,13 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
             parent->chain_sha256.size() != digest_length)
         {
             setError(error, QStringLiteral("Invalid finalized parent revision"));
-            rollback();
-            return std::nullopt;
+                return std::nullopt;
         }
         parent_hashes.append(qMakePair(parent_uuid, parent->chain_sha256));
     }
     const std::optional<QByteArray> operation_digest = historyDigest(r->uuid, error);
     if (!operation_digest)
     {
-        rollback();
         return std::nullopt;
     }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -1001,11 +1010,8 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
-    if (ok)
-        ok = commit(error);
     if (!ok)
     {
-        rollback();
         return std::nullopt;
     }
     return result;

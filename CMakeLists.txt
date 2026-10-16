@@ -37,6 +37,20 @@ if(NOT AOWIS_MODEL_CODEC_CHECK_RESULT EQUAL 0)
     message(FATAL_ERROR "Model serialization schema check failed:\n${AOWIS_MODEL_CODEC_CHECK_ERROR}")
 endif()
 message(STATUS "${AOWIS_MODEL_CODEC_CHECK_OUTPUT}")
+# Merge field rules must remain in lockstep with the schema and codec.
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_field_merge.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields_v1.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/aowis/db/model_persistence.h"
+    RESULT_VARIABLE AOWIS_MODEL_FIELD_MERGE_CHECK_RESULT
+    ERROR_VARIABLE AOWIS_MODEL_FIELD_MERGE_CHECK_ERROR
+)
+if(NOT AOWIS_MODEL_FIELD_MERGE_CHECK_RESULT EQUAL 0)
+    message(FATAL_ERROR "Field merge coverage check failed:\n${AOWIS_MODEL_FIELD_MERGE_CHECK_ERROR}")
+endif()
+
 
 add_library(aowis-db-core STATIC
     include/aowis/db/database.h
@@ -59,6 +73,9 @@ add_library(aowis-db-core STATIC
     include/aowis/db/model_persistence.h
     src/database.cpp
     src/revision_ancestry.cpp
+    src/object_merge_preview.cpp
+    src/object_merge_state.h
+    src/object_merge_commit.cpp
 )
 add_library(AOWIS::DB ALIAS aowis-db-core)
 
@@ -119,6 +136,12 @@ if(BUILD_TESTING)
     aowis_add_db_test(aowis-db-migration-tests aowis-db-migration tests/sqlite_migration_test.cpp)
     aowis_add_db_test(aowis-db-history-tests aowis-db-history tests/history_test.cpp)
     aowis_add_db_test(aowis-db-revision-ancestry-tests aowis-db-revision-ancestry tests/revision_ancestry_test.cpp)
+    aowis_add_db_test(aowis-db-object-merge-preview-tests aowis-db-object-merge-preview tests/object_merge_preview_test.cpp)
+    aowis_add_db_test(aowis-db-object-merge-commit-tests aowis-db-object-merge-commit tests/object_merge_commit_test.cpp)
+    aowis_add_db_test(aowis-db-object-merge-local-edits-tests aowis-db-object-merge-local-edits tests/object_merge_local_edits_test.cpp)
+    aowis_add_db_test(aowis-db-object-merge-fields-tests aowis-db-object-merge-fields tests/object_merge_fields_test.cpp)
+    aowis_add_db_test(aowis-db-object-merge-field-resolutions-tests aowis-db-object-merge-field-resolutions tests/object_merge_field_resolutions_test.cpp)
+    aowis_add_db_test(aowis-db-object-merge-metadata-tests aowis-db-object-merge-metadata tests/object_merge_metadata_test.cpp)
     aowis_add_db_test(aowis-db-objects-tests aowis-db-objects tests/objects_test.cpp)
     aowis_add_db_test(aowis-db-model-tests aowis-db-model tests/model_persistence_test.cpp)
     aowis_add_db_test(aowis-db-object-groups-tests aowis-db-object-groups tests/object_groups_test.cpp)

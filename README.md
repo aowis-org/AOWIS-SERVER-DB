@@ -20,12 +20,18 @@ PostgreSQL adapter are planned, but **not implemented yet**.
 - SHA-256 hashes bind immutable revision metadata, a complete opaque snapshot,
   and the parent revision's hash. Branches can therefore have different
   histories with a common finalized ancestor.
-- **Merges are not implemented.** The schema and V1 hash encoding support
-  multiple ordered parents; the merge operation and model-level merge conflict
-  resolution will be built in a later stage. The read-only
-  `compareRevisions()` API now reports ancestor relationships and all finalized
-  merge bases (including criss-cross histories); see
-  [V36 revision ancestry](docs/revision-ancestry-v36.md).
+- **Entity-level merges:** `compareRevisions()` reports ancestry and finalized
+  merge bases; `previewObjectMerge()` compares entity states against one merge
+  base; `mergeObjectRevisions()` creates atomic two-parent revisions with
+  explicit entity conflict choices. V39 supports local edits already present
+  on the target working revision while preserving its journal. V40 can also
+  synthesize nonoverlapping top-level field changes for 18 typed hydraulic
+  entity kinds. V41 lets the caller resolve overlapping top-level fields
+  individually while preserving independent changes from both sides, with
+  the prior whole-entity choices remaining available. Merge support remains
+  limited to canonical object-mode data, diverged source lineages and a single
+  finalized merge base. See [V40](docs/model-field-merge-v40.md) and
+  [V41](docs/model-field-resolutions-v41.md).
 - Editing concurrent working snapshots requires an expected edit generation.
   Stale writes are rejected rather than silently overwriting another client.
 
@@ -82,10 +88,10 @@ only for legacy-mode revisions.
 This is typed hydraulic-network persistence, **not yet production-ready full
 project persistence**: project descriptions, external attachment file contents,
 other non-network model domains, domain-reference validation, grouped object
-undo/redo, and model-level merge semantics are still outstanding.
+and additional non-network domains are still outstanding.
 
 The HTTP API, sessions, credentials, model validation, and grouped history are implemented,
-but production internet deployment, branch merging, and the PostgreSQL backend remain incomplete.
+but production internet deployment, complete branch-merge semantics, and the PostgreSQL backend remain incomplete.
 The SQLite file and hash chain are not tamper-proof against the database
 administrator, by design.
 
@@ -313,3 +319,24 @@ maintenance threshold is 30 days and work is limited to 100 sessions per call:
 This is a one-way, audited operation; it does **not** delete session records or
 change model revision hashes. See
 [session credential redaction](docs/security-session-redaction-v34.md).
+
+## Read-only entity merge preview (V37)
+
+`Database::previewObjectMerge` provides a three-way object-level change and
+conflict summary for two revisions with exactly one finalized common ancestor.
+It compares canonical kind/content rather than version counters, handles
+creation and deletion, and requires read access on all three source branches
+(including the merge base). Multiple merge bases and legacy snapshot mode
+are rejected. It **does not perform a merge or validate a combined model**.
+See [docs/object-merge-preview-v37.md](docs/object-merge-preview-v37.md).
+
+## Atomic finalized object merges (V38)
+
+`Database::mergeObjectRevisions` builds an atomic two-parent revision from two
+finalized divergent branches using V37 object-level conflicts and explicit
+left/right choices. The target must be an unedited working revision copied
+from the left finalized input; all changed objects are journaled and affected
+hydraulic networks validated before finalization. A successful merge returns
+the finalized merge and a new working head. Failures roll back every part.
+See [docs/object-merge-commit-v38.md](docs/object-merge-commit-v38.md) for
+preconditions, permissions, limitations and the no-schema-change guarantee.

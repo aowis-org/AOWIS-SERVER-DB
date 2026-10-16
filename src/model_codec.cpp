@@ -1,4 +1,5 @@
 #include <aowis/db/model_codec.h>
+#include "model_field_merge.h"
 
 #include <QDataStream>
 #include <QIODevice>
@@ -2194,6 +2195,737 @@ QByteArray ModelCodec<WaterQualityWallReaction>::encode(const WaterQualityWallRe
 std::optional<WaterQualityWallReaction> ModelCodec<WaterQualityWallReaction>::decode(const QByteArray &bytes, QString *error)
 {
     return decodeTyped<WaterQualityWallReaction>(bytes, QStringLiteral("WaterQualityWallReaction"), error);
+}
+
+// V40: Field comparison uses the same canonical QDataStream serialization
+// primitives as ModelCodec. Never compare floats with approximate equality or
+// rely on operator== for nested Model structs; compare encoded field bytes.
+template<typename T> QByteArray encodedMergeField(const T &field)
+{
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_0);
+    stream.setByteOrder(QDataStream::BigEndian);
+    stream.setFloatingPointPrecision(QDataStream::DoublePrecision);
+    writeValue(stream, field);
+    return stream.status() == QDataStream::Ok ? bytes : QByteArray();
+}
+
+template<typename T, typename Member>
+void chooseMergeField(const T &base, const T &left, const T &right, T &merged,
+    Member T::*member, const char *name, QStringList &conflicts,
+    const QMap<QString, bool> &field_choices)
+{
+    // EntityMetadata is the only intentionally decomposed nested structure.
+    // Its seven codec fields have stable independent meanings, so edits to a
+    // comment need not conflict with edits to a description. Collections
+    // (including tags) remain atomic; other nested structs are also atomic.
+    if constexpr (std::is_same_v<Member, EntityMetadata>)
+    {
+        if (QString::fromLatin1(name) != QStringLiteral("metadata"))
+        {
+            conflicts.append(QString::fromLatin1(name));
+            return;
+        }
+        const EntityMetadata &base_metadata = base.*member;
+        const EntityMetadata &left_metadata = left.*member;
+        const EntityMetadata &right_metadata = right.*member;
+        EntityMetadata &merged_metadata = merged.*member;
+        chooseMergeField(base_metadata, left_metadata, right_metadata, merged_metadata,
+            &EntityMetadata::enabled, "metadata.enabled", conflicts, field_choices);
+        chooseMergeField(base_metadata, left_metadata, right_metadata, merged_metadata,
+            &EntityMetadata::model_role, "metadata.model_role", conflicts, field_choices);
+        chooseMergeField(base_metadata, left_metadata, right_metadata, merged_metadata,
+            &EntityMetadata::date_added, "metadata.date_added", conflicts, field_choices);
+        chooseMergeField(base_metadata, left_metadata, right_metadata, merged_metadata,
+            &EntityMetadata::date_installed, "metadata.date_installed", conflicts, field_choices);
+        chooseMergeField(base_metadata, left_metadata, right_metadata, merged_metadata,
+            &EntityMetadata::description, "metadata.description", conflicts, field_choices);
+        chooseMergeField(base_metadata, left_metadata, right_metadata, merged_metadata,
+            &EntityMetadata::comment, "metadata.comment", conflicts, field_choices);
+        chooseMergeField(base_metadata, left_metadata, right_metadata, merged_metadata,
+            &EntityMetadata::tags, "metadata.tags", conflicts, field_choices);
+    }
+    else
+    {
+        const QByteArray baseline = encodedMergeField(base.*member);
+        const QByteArray left_bytes = encodedMergeField(left.*member);
+        const QByteArray right_bytes = encodedMergeField(right.*member);
+        if (baseline.isEmpty() || left_bytes.isEmpty() || right_bytes.isEmpty())
+            conflicts.append(QString::fromLatin1(name));
+        else if (left_bytes == right_bytes || right_bytes == baseline)
+            merged.*member = left.*member;
+        else if (left_bytes == baseline)
+            merged.*member = right.*member;
+        else
+        {
+            const QMap<QString, bool>::const_iterator choice = field_choices.constFind(QString::fromLatin1(name));
+            if (choice == field_choices.cend())
+                conflicts.append(QString::fromLatin1(name));
+            else
+                merged.*member = choice.value() ? right.*member : left.*member;
+        }
+    }
+}
+
+template<typename T>
+std::optional<ModelFieldMerge> mergeFieldsForType(const QUuid &object_uuid,
+    const QByteArray &baseline_bytes, const QByteArray &left_bytes,
+    const QByteArray &right_bytes, const QMap<QString, bool> &field_choices);
+
+// These field lists match docs/model_codec_fields_v1.json and the ordered
+// writeStruct/readStruct declarations above. A configure-time checker ensures
+// that a codec or Model schema change cannot silently omit a merge field.
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicPipeMaterial>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicPipeMaterial> baseline = ModelCodec<HydraulicPipeMaterial>::decode(baseline_bytes);
+    const std::optional<HydraulicPipeMaterial> left = ModelCodec<HydraulicPipeMaterial>::decode(left_bytes);
+    const std::optional<HydraulicPipeMaterial> right = ModelCodec<HydraulicPipeMaterial>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicPipeMaterial>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicPipeMaterial>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicPipeMaterial>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicPipeMaterial merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPipeMaterial::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPipeMaterial::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPipeMaterial::description, "description", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPipeMaterial::roughness_by_age, "roughness_by_age", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicPipeMaterial>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicPatternTime>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicPatternTime> baseline = ModelCodec<HydraulicPatternTime>::decode(baseline_bytes);
+    const std::optional<HydraulicPatternTime> left = ModelCodec<HydraulicPatternTime>::decode(left_bytes);
+    const std::optional<HydraulicPatternTime> right = ModelCodec<HydraulicPatternTime>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicPatternTime>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicPatternTime>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicPatternTime>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicPatternTime merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPatternTime::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPatternTime::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPatternTime::multipliers, "multipliers", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicPatternTime::comment, "comment", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicPatternTime>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicCurveTankVolume>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicCurveTankVolume> baseline = ModelCodec<HydraulicCurveTankVolume>::decode(baseline_bytes);
+    const std::optional<HydraulicCurveTankVolume> left = ModelCodec<HydraulicCurveTankVolume>::decode(left_bytes);
+    const std::optional<HydraulicCurveTankVolume> right = ModelCodec<HydraulicCurveTankVolume>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicCurveTankVolume>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicCurveTankVolume>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicCurveTankVolume>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicCurveTankVolume merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveTankVolume::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveTankVolume::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveTankVolume::points, "points", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveTankVolume::comment, "comment", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicCurveTankVolume>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicCurvePumpHead>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicCurvePumpHead> baseline = ModelCodec<HydraulicCurvePumpHead>::decode(baseline_bytes);
+    const std::optional<HydraulicCurvePumpHead> left = ModelCodec<HydraulicCurvePumpHead>::decode(left_bytes);
+    const std::optional<HydraulicCurvePumpHead> right = ModelCodec<HydraulicCurvePumpHead>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicCurvePumpHead>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicCurvePumpHead>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicCurvePumpHead>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicCurvePumpHead merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpHead::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpHead::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpHead::points, "points", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpHead::comment, "comment", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicCurvePumpHead>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicCurvePumpEfficiency>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicCurvePumpEfficiency> baseline = ModelCodec<HydraulicCurvePumpEfficiency>::decode(baseline_bytes);
+    const std::optional<HydraulicCurvePumpEfficiency> left = ModelCodec<HydraulicCurvePumpEfficiency>::decode(left_bytes);
+    const std::optional<HydraulicCurvePumpEfficiency> right = ModelCodec<HydraulicCurvePumpEfficiency>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicCurvePumpEfficiency>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicCurvePumpEfficiency>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicCurvePumpEfficiency>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicCurvePumpEfficiency merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpEfficiency::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpEfficiency::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpEfficiency::points, "points", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurvePumpEfficiency::comment, "comment", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicCurvePumpEfficiency>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicCurveValveHeadloss>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicCurveValveHeadloss> baseline = ModelCodec<HydraulicCurveValveHeadloss>::decode(baseline_bytes);
+    const std::optional<HydraulicCurveValveHeadloss> left = ModelCodec<HydraulicCurveValveHeadloss>::decode(left_bytes);
+    const std::optional<HydraulicCurveValveHeadloss> right = ModelCodec<HydraulicCurveValveHeadloss>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicCurveValveHeadloss>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicCurveValveHeadloss>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicCurveValveHeadloss>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicCurveValveHeadloss merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveHeadloss::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveHeadloss::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveHeadloss::points, "points", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveHeadloss::comment, "comment", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicCurveValveHeadloss>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicCurveValveCharacteristic>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicCurveValveCharacteristic> baseline = ModelCodec<HydraulicCurveValveCharacteristic>::decode(baseline_bytes);
+    const std::optional<HydraulicCurveValveCharacteristic> left = ModelCodec<HydraulicCurveValveCharacteristic>::decode(left_bytes);
+    const std::optional<HydraulicCurveValveCharacteristic> right = ModelCodec<HydraulicCurveValveCharacteristic>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicCurveValveCharacteristic>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicCurveValveCharacteristic>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicCurveValveCharacteristic>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicCurveValveCharacteristic merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveCharacteristic::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveCharacteristic::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveCharacteristic::points, "points", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveValveCharacteristic::comment, "comment", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicCurveValveCharacteristic>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicCurveGeneric>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicCurveGeneric> baseline = ModelCodec<HydraulicCurveGeneric>::decode(baseline_bytes);
+    const std::optional<HydraulicCurveGeneric> left = ModelCodec<HydraulicCurveGeneric>::decode(left_bytes);
+    const std::optional<HydraulicCurveGeneric> right = ModelCodec<HydraulicCurveGeneric>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicCurveGeneric>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicCurveGeneric>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicCurveGeneric>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicCurveGeneric merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveGeneric::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveGeneric::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveGeneric::points, "points", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicCurveGeneric::comment, "comment", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicCurveGeneric>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicNodeReservoir>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicNodeReservoir> baseline = ModelCodec<HydraulicNodeReservoir>::decode(baseline_bytes);
+    const std::optional<HydraulicNodeReservoir> left = ModelCodec<HydraulicNodeReservoir>::decode(left_bytes);
+    const std::optional<HydraulicNodeReservoir> right = ModelCodec<HydraulicNodeReservoir>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicNodeReservoir>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicNodeReservoir>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicNodeReservoir>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicNodeReservoir merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::coordinate_wgs84, "coordinate_wgs84", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::head_input_type, "head_input_type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::hydraulic_head_m, "hydraulic_head_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::terrain_elevation_m, "terrain_elevation_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::hydraulic_head_offset_m, "hydraulic_head_offset_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::head_pattern_mode, "head_pattern_mode", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::head_pattern_uuid, "head_pattern_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::initial_chemical_concentration_mg_per_l, "initial_chemical_concentration_mg_per_l", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::initial_water_age_h, "initial_water_age_h", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::quality_source, "quality_source", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeReservoir::metadata, "metadata", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicNodeReservoir>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicNodeJunction>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicNodeJunction> baseline = ModelCodec<HydraulicNodeJunction>::decode(baseline_bytes);
+    const std::optional<HydraulicNodeJunction> left = ModelCodec<HydraulicNodeJunction>::decode(left_bytes);
+    const std::optional<HydraulicNodeJunction> right = ModelCodec<HydraulicNodeJunction>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicNodeJunction>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicNodeJunction>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicNodeJunction>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicNodeJunction merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::coordinate_wgs84, "coordinate_wgs84", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::elevation_input_type, "elevation_input_type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::elevation_m, "elevation_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::terrain_elevation_m, "terrain_elevation_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::elevation_offset_m, "elevation_offset_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::demands, "demands", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::emitter, "emitter", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::initial_chemical_concentration_mg_per_l, "initial_chemical_concentration_mg_per_l", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::initial_water_age_h, "initial_water_age_h", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::quality_source, "quality_source", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeJunction::metadata, "metadata", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicNodeJunction>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicNodeTank>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicNodeTank> baseline = ModelCodec<HydraulicNodeTank>::decode(baseline_bytes);
+    const std::optional<HydraulicNodeTank> left = ModelCodec<HydraulicNodeTank>::decode(left_bytes);
+    const std::optional<HydraulicNodeTank> right = ModelCodec<HydraulicNodeTank>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicNodeTank>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicNodeTank>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicNodeTank>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicNodeTank merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::coordinate_wgs84, "coordinate_wgs84", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::elevation_input_type, "elevation_input_type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::bottom_elevation_m, "bottom_elevation_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::terrain_elevation_m, "terrain_elevation_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::bottom_offset_m, "bottom_offset_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::water_level_initial_m, "water_level_initial_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::water_level_minimum_m, "water_level_minimum_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::water_level_maximum_m, "water_level_maximum_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::geometry_input_type, "geometry_input_type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::diameter_m, "diameter_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::cross_section_area_m2, "cross_section_area_m2", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::volume_at_maximum_level_m3, "volume_at_maximum_level_m3", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::minimum_volume_m3, "minimum_volume_m3", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::volume_curve_uuid, "volume_curve_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::can_overflow, "can_overflow", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::initial_chemical_concentration_mg_per_l, "initial_chemical_concentration_mg_per_l", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::initial_water_age_h, "initial_water_age_h", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::quality_source, "quality_source", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::mixing_model, "mixing_model", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::mixing_fraction, "mixing_fraction", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::override_bulk_reaction, "override_bulk_reaction", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::bulk_reaction, "bulk_reaction", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicNodeTank::metadata, "metadata", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicNodeTank>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicDemandPoint>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicDemandPoint> baseline = ModelCodec<HydraulicDemandPoint>::decode(baseline_bytes);
+    const std::optional<HydraulicDemandPoint> left = ModelCodec<HydraulicDemandPoint>::decode(left_bytes);
+    const std::optional<HydraulicDemandPoint> right = ModelCodec<HydraulicDemandPoint>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicDemandPoint>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicDemandPoint>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicDemandPoint>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicDemandPoint merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicDemandPoint::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicDemandPoint::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicDemandPoint::coordinate_wgs84, "coordinate_wgs84", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicDemandPoint::attachment, "attachment", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicDemandPoint::demands, "demands", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicDemandPoint::meter, "meter", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicDemandPoint::metadata, "metadata", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicDemandPoint>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicLinkPipe>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicLinkPipe> baseline = ModelCodec<HydraulicLinkPipe>::decode(baseline_bytes);
+    const std::optional<HydraulicLinkPipe> left = ModelCodec<HydraulicLinkPipe>::decode(left_bytes);
+    const std::optional<HydraulicLinkPipe> right = ModelCodec<HydraulicLinkPipe>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicLinkPipe>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicLinkPipe>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicLinkPipe>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicLinkPipe merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::node_uuid_from, "node_uuid_from", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::node_uuid_to, "node_uuid_to", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::vertices, "vertices", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::length_calculated_m, "length_calculated_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::length_measured_m, "length_measured_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::initial_status, "initial_status", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::diameter_mm, "diameter_mm", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::material_uuid, "material_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::roughness_mode, "roughness_mode", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::roughness_hazen_williams, "roughness_hazen_williams", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::roughness_darcy_weisbach_mm, "roughness_darcy_weisbach_mm", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::roughness_chezy_manning, "roughness_chezy_manning", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::minor_loss_coefficient, "minor_loss_coefficient", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::override_bulk_reaction, "override_bulk_reaction", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::bulk_reaction, "bulk_reaction", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::override_wall_reaction, "override_wall_reaction", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::wall_reaction, "wall_reaction", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::leak_area_mm2_per_100m, "leak_area_mm2_per_100m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::leak_area_expansion_per_pressure_head_mm2_per_m, "leak_area_expansion_per_pressure_head_mm2_per_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPipe::metadata, "metadata", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicLinkPipe>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicLinkPump>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicLinkPump> baseline = ModelCodec<HydraulicLinkPump>::decode(baseline_bytes);
+    const std::optional<HydraulicLinkPump> left = ModelCodec<HydraulicLinkPump>::decode(left_bytes);
+    const std::optional<HydraulicLinkPump> right = ModelCodec<HydraulicLinkPump>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicLinkPump>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicLinkPump>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicLinkPump>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicLinkPump merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::node_uuid_from, "node_uuid_from", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::node_uuid_to, "node_uuid_to", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::vertices, "vertices", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::definition_type, "definition_type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::constant_power_kw, "constant_power_kw", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::head_curve_uuid, "head_curve_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::initial_speed_ratio, "initial_speed_ratio", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::initial_status, "initial_status", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::speed_pattern_uuid, "speed_pattern_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::efficiency_input_type, "efficiency_input_type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::constant_efficiency_percent, "constant_efficiency_percent", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::efficiency_curve_uuid, "efficiency_curve_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::energy_price_input_type, "energy_price_input_type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::energy_price_per_kw_h, "energy_price_per_kw_h", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::price_pattern_uuid, "price_pattern_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkPump::metadata, "metadata", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicLinkPump>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicLinkValve>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicLinkValve> baseline = ModelCodec<HydraulicLinkValve>::decode(baseline_bytes);
+    const std::optional<HydraulicLinkValve> left = ModelCodec<HydraulicLinkValve>::decode(left_bytes);
+    const std::optional<HydraulicLinkValve> right = ModelCodec<HydraulicLinkValve>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicLinkValve>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicLinkValve>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicLinkValve>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicLinkValve merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::node_uuid_from, "node_uuid_from", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::node_uuid_to, "node_uuid_to", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::vertices, "vertices", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::type, "type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::setting_pressure_head_m, "setting_pressure_head_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::setting_flow_m3_per_h, "setting_flow_m3_per_h", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::setting_loss_coefficient, "setting_loss_coefficient", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::setting_position_percent, "setting_position_percent", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::head_loss_curve_uuid, "head_loss_curve_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::characteristic_curve_uuid, "characteristic_curve_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::initial_status, "initial_status", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::diameter_mm, "diameter_mm", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::minor_loss_coefficient, "minor_loss_coefficient", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicLinkValve::metadata, "metadata", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicLinkValve>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicControlSimple>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicControlSimple> baseline = ModelCodec<HydraulicControlSimple>::decode(baseline_bytes);
+    const std::optional<HydraulicControlSimple> left = ModelCodec<HydraulicControlSimple>::decode(left_bytes);
+    const std::optional<HydraulicControlSimple> right = ModelCodec<HydraulicControlSimple>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicControlSimple>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicControlSimple>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicControlSimple>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicControlSimple merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::type, "type", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::link_uuid, "link_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::action, "action", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::setting, "setting", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::trigger_node_uuid, "trigger_node_uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::trigger_water_level_m, "trigger_water_level_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::trigger_pressure_head_m, "trigger_pressure_head_m", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::trigger_elapsed_time_s, "trigger_elapsed_time_s", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::trigger_time_of_day_s, "trigger_time_of_day_s", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlSimple::enabled, "enabled", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicControlSimple>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicControlRule>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicControlRule> baseline = ModelCodec<HydraulicControlRule>::decode(baseline_bytes);
+    const std::optional<HydraulicControlRule> left = ModelCodec<HydraulicControlRule>::decode(left_bytes);
+    const std::optional<HydraulicControlRule> right = ModelCodec<HydraulicControlRule>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicControlRule>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicControlRule>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicControlRule>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicControlRule merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlRule::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlRule::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlRule::premises, "premises", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlRule::actions_then, "actions_then", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlRule::actions_else, "actions_else", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlRule::priority, "priority", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicControlRule::enabled, "enabled", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicControlRule>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicMapLabel>(
+    const QUuid &object_uuid, const QByteArray &baseline_bytes,
+    const QByteArray &left_bytes, const QByteArray &right_bytes,
+    const QMap<QString, bool> &field_choices)
+{
+    const std::optional<HydraulicMapLabel> baseline = ModelCodec<HydraulicMapLabel>::decode(baseline_bytes);
+    const std::optional<HydraulicMapLabel> left = ModelCodec<HydraulicMapLabel>::decode(left_bytes);
+    const std::optional<HydraulicMapLabel> right = ModelCodec<HydraulicMapLabel>::decode(right_bytes);
+    if (!baseline || !left || !right || baseline->uuid != object_uuid ||
+        left->uuid != object_uuid || right->uuid != object_uuid ||
+        ModelCodec<HydraulicMapLabel>::encode(*baseline) != baseline_bytes ||
+        ModelCodec<HydraulicMapLabel>::encode(*left) != left_bytes ||
+        ModelCodec<HydraulicMapLabel>::encode(*right) != right_bytes)
+        return std::nullopt;
+    HydraulicMapLabel merged = *left;
+    ModelFieldMerge result;
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicMapLabel::id, "id", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicMapLabel::uuid, "uuid", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicMapLabel::coordinate_wgs84, "coordinate_wgs84", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicMapLabel::text, "text", result.conflicting_fields, field_choices);
+    chooseMergeField(*baseline, *left, *right, merged, &HydraulicMapLabel::anchor_node_uuid, "anchor_node_uuid", result.conflicting_fields, field_choices);
+    if (result.conflicting_fields.isEmpty())
+    {
+        result.content = ModelCodec<HydraulicMapLabel>::encode(merged);
+        if (result.content.isEmpty())
+            return std::nullopt;
+    }
+    return result;
+}
+std::optional<ModelFieldMerge> mergeModelFields(const QUuid &object_uuid,
+    const QString &kind, const QByteArray &base, const QByteArray &left,
+    const QByteArray &right, const QMap<QString, bool> &field_choices)
+{
+    // Bound discretionary field parsing in merge preview. Large objects are
+    // still mergeable through existing explicit entity-level resolutions.
+    constexpr qsizetype field_merge_limit = 4 * 1024 * 1024;
+    if (object_uuid.isNull() || base.isEmpty() || left.isEmpty() || right.isEmpty() ||
+        base.size() > field_merge_limit || left.size() > field_merge_limit ||
+        right.size() > field_merge_limit)
+        return std::nullopt;
+    if (kind == QStringLiteral("hydraulic.pipe_material"))
+        return mergeFieldsForType<HydraulicPipeMaterial>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.pattern_time"))
+        return mergeFieldsForType<HydraulicPatternTime>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.curve_tank_volume"))
+        return mergeFieldsForType<HydraulicCurveTankVolume>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.curve_pump_head"))
+        return mergeFieldsForType<HydraulicCurvePumpHead>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.curve_pump_efficiency"))
+        return mergeFieldsForType<HydraulicCurvePumpEfficiency>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.curve_valve_headloss"))
+        return mergeFieldsForType<HydraulicCurveValveHeadloss>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.curve_valve_characteristic"))
+        return mergeFieldsForType<HydraulicCurveValveCharacteristic>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.curve_generic"))
+        return mergeFieldsForType<HydraulicCurveGeneric>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.reservoir"))
+        return mergeFieldsForType<HydraulicNodeReservoir>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.junction"))
+        return mergeFieldsForType<HydraulicNodeJunction>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.tank"))
+        return mergeFieldsForType<HydraulicNodeTank>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.demand_point"))
+        return mergeFieldsForType<HydraulicDemandPoint>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.pipe"))
+        return mergeFieldsForType<HydraulicLinkPipe>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.pump"))
+        return mergeFieldsForType<HydraulicLinkPump>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.valve"))
+        return mergeFieldsForType<HydraulicLinkValve>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.control_simple"))
+        return mergeFieldsForType<HydraulicControlSimple>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.control_rule"))
+        return mergeFieldsForType<HydraulicControlRule>(object_uuid, base, left, right, field_choices);
+    if (kind == QStringLiteral("hydraulic.map_label"))
+        return mergeFieldsForType<HydraulicMapLabel>(object_uuid, base, left, right, field_choices);
+    return std::nullopt;
 }
 
 } // namespace aowis::db
