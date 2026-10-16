@@ -136,8 +136,8 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::UserInfo> root_user = db.bootstrapAdministrator(QStringLiteral("operator"), &error);
     REQUIRE(root_user.has_value());
     const OperationContext root{root_user->uuid};
-    // This fixture starts at V1. Its final schema version must match V10,
-    // including the audit journal (rather than stopping at the old V8).
+    // This fixture starts at V1. Upgrade through the current V13 schema,
+    // preserving legacy snapshots and adding the security audit journal.
     {
         QSqlDatabase inspection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
                                                              QStringLiteral("schema-inspection"));
@@ -145,7 +145,7 @@ int main(int argc, char **argv)
         REQUIRE(inspection.open());
         QSqlQuery pragma(inspection);
         REQUIRE(pragma.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(pragma.next() && pragma.value(0).toInt() == 12);
+        REQUIRE(pragma.next() && pragma.value(0).toInt() == 13);
         pragma.finish();
         QSqlQuery audit_table(inspection);
         REQUIRE(audit_table.exec(QStringLiteral(

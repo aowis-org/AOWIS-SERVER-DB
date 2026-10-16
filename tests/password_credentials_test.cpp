@@ -42,7 +42,7 @@ int main(int argc, char **argv)
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 12);
+        REQUIRE(query.next() && query.value(0).toInt() == 13);
         query.finish();
         REQUIRE(query.exec(QStringLiteral("SELECT salt,verifier,iterations FROM user_password_credentials")));
         REQUIRE(query.next());

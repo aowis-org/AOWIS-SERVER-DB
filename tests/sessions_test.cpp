@@ -52,18 +52,28 @@ int main(int argc, char **argv)
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 12);
+        REQUIRE(query.next() && query.value(0).toInt() == 13);
         REQUIRE(query.exec(QStringLiteral("SELECT token_sha256,uuid FROM user_sessions")));
         REQUIRE(query.next() && query.value(0).toByteArray().size() == 32);
         REQUIRE(query.value(0).toByteArray() != issued->bearer_token);
         REQUIRE(query.value(1).toByteArray() == issued->uuid.toRfc4122());
         query.finish();
-        // Force expiry using a privileged direct-SQL user. This is strictly a
-        // test; the application API does not change immutable expiration.
-        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER user_sessions_immutable_identity")));
+        // Force expiry using privileged SQL solely for the test. V13 renamed
+        // the immutability trigger; preserve and restore its exact definition
+        // so subsequent database opens still validate the complete schema.
+        REQUIRE(query.exec(QStringLiteral(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='user_sessions_immutable_identity_v13'")));
+        REQUIRE(query.next());
+        const QString original_trigger = query.value(0).toString();
+        REQUIRE(!original_trigger.isEmpty());
+        query.finish();
+        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER user_sessions_immutable_identity_v13")));
         REQUIRE(query.prepare(QStringLiteral("UPDATE user_sessions SET expires_at_ms=created_at_ms+1 WHERE uuid=?")));
         query.addBindValue(issued->uuid.toRfc4122());
         REQUIRE(query.exec());
+        query.finish();
+        REQUIRE(query.exec(original_trigger));
         query.finish();
         inspect.close();
     }

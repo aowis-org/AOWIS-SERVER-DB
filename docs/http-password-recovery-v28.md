@@ -41,9 +41,16 @@ The password is hashed with the existing PBKDF2-HMAC-SHA-256 credential scheme.
 The SQLite database contains **only a domain-separated SHA-256 digest** of the
 32-byte randomly generated recovery token. Each token has its own UUIDv7.
 Recovery invalidates all user sessions. Issuance and redemption appear in the
-security audit chain without logging the secret. The audit event for redemption
-attributes the authority to the administrator who issued the capability; it
-cannot establish the identity of the person who physically presented it.
+security audit chain without logging the secret. Issuance is attributed to the
+administrator (`credential.recovery.issue`). Redemption is attributed to the
+**recovered account** (`credential.recovery.redeem`) because the presented
+capability authorizes changes to that account. This is **not evidence that the
+account owner personally presented the token**. The issuing administrator's
+UUID remains stored in `password_recovery_tokens.issued_by_uuid`; redemption
+must not be misreported as an action performed by that administrator. The
+credential's `changed_by_uuid` likewise identifies the recovered account after
+redemption, not a verified natural person. Older audit entries are immutable
+and keep their originally recorded attribution.
 
 The reset transaction atomically closes the token, updates the password,
 revokes sessions, and appends the audit entry; failure rolls back all changes.

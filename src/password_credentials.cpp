@@ -474,6 +474,16 @@ std::optional<IssuedSession> Database::loginWithPassword(const QString &username
         setError(error, failure);
         return std::nullopt;
     }
+    // Enforce the same per-user quota as administrator-issued sessions. This
+    // check occurs under BEGIN IMMEDIATE, after password verification, so
+    // concurrent logins cannot exceed the limit.
+    if (!hasSessionCapacity(this->database_, user_uuid, now, error))
+    {
+        // Do not disclose the account's session usage through a login reply.
+        setError(error, failure);
+        rollback();
+        return std::nullopt;
+    }
     const QByteArray random = makeSessionToken();
     if (random.size() != 64)
     {
@@ -732,7 +742,7 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     QSqlQuery lookup(this->database_);
     if (!lookup.prepare(QStringLiteral(
-            "SELECT t.uuid,t.user_uuid,t.issued_by_uuid FROM password_recovery_tokens t "
+            "SELECT t.uuid,t.user_uuid FROM password_recovery_tokens t "
             "JOIN users u ON u.uuid=t.user_uuid "
             "WHERE t.token_sha256=? AND t.used_at_ms IS NULL AND t.invalidated_at_ms IS NULL "
             "AND t.expires_at_ms>? AND u.disabled_at_ms IS NULL")))
@@ -758,7 +768,6 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
     }
     const QUuid recovery_uuid = QUuid::fromRfc4122(lookup.value(0).toByteArray());
     const QUuid user_uuid = QUuid::fromRfc4122(lookup.value(1).toByteArray());
-    const QUuid issuer_uuid = QUuid::fromRfc4122(lookup.value(2).toByteArray());
     lookup.finish();
     QSqlQuery close_token(this->database_);
     if (!close_token.prepare(QStringLiteral(
@@ -795,7 +804,11 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
     update.addBindValue(verifier);
     update.addBindValue(password_iterations);
     update.addBindValue(now);
-    update.addBindValue(uuidBytes(issuer_uuid));
+    // Redemption proves possession of a capability bound to this account,
+    // not participation by the administrator who originally issued it.
+    // Attribution is to the affected account; the issuer remains recorded
+    // separately in password_recovery_tokens.issued_by_uuid.
+    update.addBindValue(uuidBytes(user_uuid));
     if (!update.exec())
     {
         setError(error, update.lastError().text());
@@ -820,7 +833,10 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
         return false;
     }
     sessions.finish();
-    if (!writeSecurityAuditEvent(issuer_uuid, QStringLiteral("credential.recovery.redeem"),
+    // A recovered account is the audit actor in the sense of capability
+    // ownership, NOT a verified human presenter. Never falsely attribute
+    // later token redemption to its issuing administrator.
+    if (!writeSecurityAuditEvent(user_uuid, QStringLiteral("credential.recovery.redeem"),
                                  recovery_uuid, error) || !commit(error))
     {
         rollback();

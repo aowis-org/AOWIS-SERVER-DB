@@ -58,6 +58,7 @@ add_library(aowis-db-core STATIC
     include/aowis/db/model_codec.h
     include/aowis/db/model_persistence.h
     src/database.cpp
+    src/revision_ancestry.cpp
 )
 add_library(AOWIS::DB ALIAS aowis-db-core)
 
@@ -117,6 +118,7 @@ if(BUILD_TESTING)
     aowis_add_db_test(aowis-db-sqlite-tests aowis-db-sqlite tests/sqlite_test.cpp)
     aowis_add_db_test(aowis-db-migration-tests aowis-db-migration tests/sqlite_migration_test.cpp)
     aowis_add_db_test(aowis-db-history-tests aowis-db-history tests/history_test.cpp)
+    aowis_add_db_test(aowis-db-revision-ancestry-tests aowis-db-revision-ancestry tests/revision_ancestry_test.cpp)
     aowis_add_db_test(aowis-db-objects-tests aowis-db-objects tests/objects_test.cpp)
     aowis_add_db_test(aowis-db-model-tests aowis-db-model tests/model_persistence_test.cpp)
     aowis_add_db_test(aowis-db-object-groups-tests aowis-db-object-groups tests/object_groups_test.cpp)
@@ -131,6 +133,8 @@ if(BUILD_TESTING)
     aowis_add_db_test(aowis-db-model-local-links-tests aowis-db-model-local-links tests/model_local_links_test.cpp)
     aowis_add_db_test(aowis-db-model-local-resources-tests aowis-db-model-local-resources tests/model_local_resources_test.cpp)
     aowis_add_db_test(aowis-db-sessions-tests aowis-db-sessions tests/sessions_test.cpp)
+    aowis_add_db_test(aowis-db-session-capacity-tests aowis-db-session-capacity tests/session_capacity_test.cpp)
+    aowis_add_db_test(aowis-db-session-redaction-tests aowis-db-session-redaction tests/session_redaction_test.cpp)
     aowis_add_db_test(aowis-db-password-credentials-tests aowis-db-password-credentials tests/password_credentials_test.cpp)
     aowis_add_db_test(aowis-db-password-change-tests aowis-db-password-change tests/password_self_change_test.cpp)
     aowis_add_db_test(aowis-db-password-recovery-tests aowis-db-password-recovery tests/password_recovery_test.cpp)

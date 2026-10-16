@@ -22,7 +22,10 @@ PostgreSQL adapter are planned, but **not implemented yet**.
   histories with a common finalized ancestor.
 - **Merges are not implemented.** The schema and V1 hash encoding support
   multiple ordered parents; the merge operation and model-level merge conflict
-  resolution will be built in a later stage.
+  resolution will be built in a later stage. The read-only
+  `compareRevisions()` API now reports ancestor relationships and all finalized
+  merge bases (including criss-cross histories); see
+  [V36 revision ancestry](docs/revision-ancestry-v36.md).
 - Editing concurrent working snapshots requires an expected edit generation.
   Stale writes are rejected rather than silently overwriting another client.
 
@@ -279,6 +282,12 @@ token using `aowis-db-admin recover-password`. A user redeems it using
 hour, and are invalidated by password changes or account disable. No email
 verification or delivery is implemented. Details: [V28 recovery](docs/http-password-recovery-v28.md).
 
+**Recovery attribution (V35):** issuance is audited under the issuing
+administrator, while redemption and `changed_by_uuid` identify the affected
+account. Possession of its bearer recovery token does not prove the human
+identity of the redeemer; issuer identity remains separately recorded on the
+token. Historical audit hashes are not rewritten.
+
 For local HTTP login throttling and deployment limitations, see
 [docs/http-login-throttle-v31.md](docs/http-login-throttle-v31.md).
 
@@ -289,3 +298,18 @@ in one audited transaction using `POST /api/v1/session/revoke-others` with an
 empty body. The current bearer session remains valid, and the response reports
 how many sessions were revoked. See
 [docs/http-revoke-others-v32.md](docs/http-revoke-others-v32.md).
+
+## Spent session credential retention (V34 / SQLite V13)
+
+A trusted local administrator can redact the stored bearer-token digests of
+sessions that expired or were revoked before a selected cutoff. Session records,
+UUIDs, timestamps, and the security audit chain remain intact. The default
+maintenance threshold is 30 days and work is limited to 100 sessions per call:
+
+```bash
+./build-linux/aowis-db-admin redact-sessions DATABASE.sqlite ADMIN_UUID [MIN_AGE_DAYS [LIMIT]]
+```
+
+This is a one-way, audited operation; it does **not** delete session records or
+change model revision hashes. See
+[session credential redaction](docs/security-session-redaction-v34.md).

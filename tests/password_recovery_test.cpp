@@ -49,7 +49,7 @@ int main(int argc, char **argv)
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
         REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 12);
+        REQUIRE(query.next() && query.value(0).toInt() == 13);
         query.finish();
         REQUIRE(query.exec(QStringLiteral("SELECT token_sha256 FROM password_recovery_tokens")));
         REQUIRE(query.next());
@@ -99,6 +99,52 @@ int main(int argc, char **argv)
     }
     QSqlDatabase::removeDatabase(QStringLiteral("recovery-unblock"));
     REQUIRE(db.redeemPasswordRecovery(second->token, new_password, &error));
+
+    // The administrator authorized issuance, but did not redeem the token.
+    // The redemption belongs to the affected account, not to its issuer.
+    // Possession of the one-use recovery capability does not independently
+    // establish which human presented it.
+    const QVector<aowis::db::SecurityAuditEvent> audit = db.securityAudit(root, 0, 100, &error);
+    bool saw_issuance = false;
+    bool saw_redemption = false;
+    for (const aowis::db::SecurityAuditEvent &event : audit)
+    {
+        if (event.subject_uuid == second->uuid &&
+            event.action == QStringLiteral("credential.recovery.issue"))
+        {
+            REQUIRE(event.actor_uuid == admin->uuid);
+            saw_issuance = true;
+        }
+        if (event.subject_uuid == second->uuid &&
+            event.action == QStringLiteral("credential.recovery.redeem"))
+        {
+            REQUIRE(event.actor_uuid == user->uuid);
+            saw_redemption = true;
+        }
+    }
+    REQUIRE(saw_issuance && saw_redemption);
+    {
+        QSqlDatabase inspect = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+            QStringLiteral("recovery-attribution"));
+        inspect.setDatabaseName(path);
+        REQUIRE(inspect.open());
+        QSqlQuery query(inspect);
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT issued_by_uuid FROM password_recovery_tokens WHERE uuid=?")));
+        query.addBindValue(second->uuid.toRfc4122());
+        REQUIRE(query.exec() && query.next());
+        REQUIRE(query.value(0).toByteArray() == admin->uuid.toRfc4122());
+        query.finish();
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT changed_by_uuid FROM user_password_credentials WHERE user_uuid=?")));
+        query.addBindValue(user->uuid.toRfc4122());
+        REQUIRE(query.exec() && query.next());
+        REQUIRE(query.value(0).toByteArray() == user->uuid.toRfc4122());
+        query.finish();
+        inspect.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("recovery-attribution"));
+
     REQUIRE(!db.redeemPasswordRecovery(second->token, old_password, &error));
     REQUIRE(!db.authenticateSession(first_login->bearer_token, &error));
     REQUIRE(!db.loginWithPassword(QStringLiteral("engineer"), old_password, 3600, &error));

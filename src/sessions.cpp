@@ -69,6 +69,33 @@ QByteArray sessionTokenDigest(const QByteArray &random_bytes)
     return sessionDigest(random_bytes);
 }
 
+bool hasSessionCapacity(const QSqlDatabase &connection, const QUuid &user_uuid,
+                        qint64 at_ms, QString *error)
+{
+    QSqlQuery query(connection);
+    if (!query.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM user_sessions WHERE user_uuid=? "
+            "AND revoked_at_ms IS NULL AND expires_at_ms>?")))
+    {
+        setError(error, query.lastError().text());
+        return false;
+    }
+    query.addBindValue(uuidBytes(user_uuid));
+    query.addBindValue(at_ms);
+    if (!query.exec() || !query.next())
+    {
+        setError(error, QStringLiteral("Could not check active session limit: %1")
+            .arg(query.lastError().text()));
+        return false;
+    }
+    if (query.value(0).toLongLong() >= max_active_sessions_per_user)
+    {
+        setError(error, QStringLiteral("Active session limit reached (32 per user)"));
+        return false;
+    }
+    return true;
+}
+
 bool Database::migrateSessionsV8(QString *error)
 {
     if (!beginWrite(error))
@@ -112,6 +139,125 @@ bool Database::migrateSessionsV8(QString *error)
     return true;
 }
 
+// A spent session's digest is overwritten with an unmistakably non-secret
+// marker, unique to that session UUID. The 16-byte prefix is ASCII
+// "AOWIS-REDACT-V1!" followed by the session's 16-byte RFC 4122 UUID.
+// SQLite enforces that a digest may be changed only to precisely this marker.
+// No token hash or bearer token is kept in the security audit record.
+bool Database::migrateSessionRedactionV13(QString *error)
+{
+    if (!beginWrite(error))
+        return false;
+    if (!exec(QStringLiteral("DROP TRIGGER IF EXISTS user_sessions_immutable_identity"), error) ||
+        !exec(QStringLiteral("DROP TRIGGER IF EXISTS user_sessions_immutable_identity_v13"), error) ||
+        !exec(QStringLiteral(R"SQL(
+            CREATE TRIGGER user_sessions_immutable_identity_v13 BEFORE UPDATE ON user_sessions
+            WHEN NEW.uuid!=OLD.uuid OR NEW.user_uuid!=OLD.user_uuid
+                OR NEW.created_by_uuid!=OLD.created_by_uuid
+                OR NEW.created_at_ms!=OLD.created_at_ms OR NEW.expires_at_ms!=OLD.expires_at_ms
+                OR (OLD.revoked_at_ms IS NOT NULL AND NEW.revoked_at_ms IS NOT OLD.revoked_at_ms)
+                OR (OLD.revoked_at_ms IS NULL AND NEW.revoked_at_ms IS NOT NULL
+                    AND NEW.revoked_at_ms<OLD.created_at_ms)
+                OR (NEW.token_sha256!=OLD.token_sha256 AND NOT (
+                    NEW.token_sha256=CAST(x'414f5749532d5245444143542d563121' || OLD.uuid AS BLOB)
+                    AND (OLD.revoked_at_ms IS NOT NULL OR OLD.expires_at_ms<=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))
+                ))
+            BEGIN SELECT RAISE(ABORT,'session identity is immutable; spent credentials may only be redacted'); END
+        )SQL"), error) ||
+        !exec(QStringLiteral("PRAGMA user_version = 13"), error) || !commit(error))
+    {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+std::optional<int> Database::redactSpentSessionTokens(const OperationContext &admin,
+                                                       qint64 cutoff_ms, int max_count,
+                                                       QString *error)
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (cutoff_ms <= 0 || cutoff_ms > now || max_count < 1 || max_count > 500)
+    {
+        setError(error, QStringLiteral("Invalid session-redaction cutoff or batch limit (1..500)"));
+        return std::nullopt;
+    }
+    if (!beginWrite(error))
+        return std::nullopt;
+    if (!requirePermission(admin, QStringLiteral("security.manage"), AccessScope::system(), error))
+    {
+        rollback();
+        return std::nullopt;
+    }
+    // Preserve full session metadata: only spent credential digests are
+    // redacted. Sessions must be revoked or expired, and their last use date
+    // must be at or before the selected retention cutoff.
+    QSqlQuery select(this->database_);
+    if (!select.prepare(QStringLiteral(R"SQL(
+        SELECT uuid FROM user_sessions
+        WHERE (expires_at_ms<=? OR (revoked_at_ms IS NOT NULL AND revoked_at_ms<=?))
+          AND (revoked_at_ms IS NOT NULL OR expires_at_ms<=?)
+          AND token_sha256!=CAST(x'414f5749532d5245444143542d563121' || uuid AS BLOB)
+        ORDER BY expires_at_ms,uuid LIMIT ?
+    )SQL")))
+    {
+        setError(error, select.lastError().text());
+        rollback();
+        return std::nullopt;
+    }
+    select.addBindValue(cutoff_ms);
+    select.addBindValue(cutoff_ms);
+    select.addBindValue(now);
+    select.addBindValue(max_count);
+    if (!select.exec())
+    {
+        setError(error, select.lastError().text());
+        rollback();
+        return std::nullopt;
+    }
+    QVector<QUuid> session_ids;
+    while (select.next())
+        session_ids.append(QUuid::fromRfc4122(select.value(0).toByteArray()));
+    select.finish();
+
+    QSqlQuery update(this->database_);
+    if (!update.prepare(QStringLiteral(
+            "UPDATE user_sessions SET token_sha256="
+            "CAST(x'414f5749532d5245444143542d563121' || uuid AS BLOB) "
+            "WHERE uuid=? AND token_sha256!="
+            "CAST(x'414f5749532d5245444143542d563121' || uuid AS BLOB)")))
+    {
+        setError(error, update.lastError().text());
+        rollback();
+        return std::nullopt;
+    }
+    for (const QUuid &id : session_ids)
+    {
+        update.bindValue(0, uuidBytes(id));
+        if (!update.exec() || update.numRowsAffected() != 1)
+        {
+            setError(error, QStringLiteral("Unable to redact spent session credential: %1")
+                              .arg(update.lastError().text()));
+            rollback();
+            return std::nullopt;
+        }
+        update.finish();
+        if (!writeSecurityAuditEvent(admin.actor_uuid, QStringLiteral("session.token.redact"),
+                                     id, error))
+        {
+            rollback();
+            return std::nullopt;
+        }
+    }
+    update.finish();
+    if (!commit(error))
+    {
+        rollback();
+        return std::nullopt;
+    }
+    return session_ids.size();
+}
+
 std::optional<IssuedSession> Database::issueSession(const OperationContext &admin,
     const QUuid &user_uuid, qint64 lifetime_seconds, QString *error)
 {
@@ -134,6 +280,8 @@ std::optional<IssuedSession> Database::issueSession(const OperationContext &admi
     // stores the session UUID, never the bearer token or its hash.
     const bool saved = auditedSecurityMutation(admin.actor_uuid, QStringLiteral("session.issue"),
         result.uuid, [&]() -> bool {
+        if (!hasSessionCapacity(this->database_, user_uuid, now, error))
+            return false;
         QSqlQuery query(this->database_);
         if (!query.prepare(QStringLiteral(
             "INSERT INTO user_sessions(uuid,user_uuid,token_sha256,created_by_uuid,created_at_ms,expires_at_ms) "

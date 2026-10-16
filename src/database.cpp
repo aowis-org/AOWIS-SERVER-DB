@@ -11,7 +11,7 @@ namespace aowis::db
 {
 namespace
 {
-constexpr int schema_version = 12;
+constexpr int schema_version = 13;
 constexpr int digest_length = 32;
 
 QByteArray uuidBytes(const QUuid &uuid)
@@ -230,6 +230,19 @@ bool Database::openSqlite(const QString &file_path, QString *error)
         return false;
     }
     recovery_guards.finish();
+    // Avoid silently accepting an incomplete V13 database: redaction must be
+    // one-way and protected by its migrated trigger.
+    QSqlQuery redaction_guard(this->database_);
+    if (!redaction_guard.exec(QStringLiteral(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name='user_sessions_immutable_identity_v13' LIMIT 1")) ||
+        !redaction_guard.next())
+    {
+        setError(error, QStringLiteral("SQLite V13 session-redaction guard is missing"));
+        close();
+        return false;
+    }
+    redaction_guard.finish();
     return true;
 }
 
@@ -292,28 +305,30 @@ bool Database::migrate(QString *error)
     }
     if (current == schema_version)
         return true;
+    if (current == 12)
+        return migrateSessionRedactionV13(error);
     if (current == 11)
-        return migratePasswordRecoveryV12(error);
+        return migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 10)
-        return migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 9)
-        return migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 8)
-        return migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 7)
-        return migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 6)
-        return migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 5)
-        return migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 4)
-        return migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 3)
-        return migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 2)
-        return migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current == 1)
-        return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+        return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
     if (current != 0 || !beginWrite(error))
         return false;
 
@@ -431,7 +446,7 @@ bool Database::migrate(QString *error)
         rollback();
         return false;
     }
-    return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error);
+    return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
 }
 
 std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &actor_uuid, const QString &name, QString *error)

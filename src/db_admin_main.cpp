@@ -1,6 +1,7 @@
 #include <aowis/db/database.h>
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QFileInfo>
 #include <QStringList>
 #include <QTextStream>
@@ -25,6 +26,7 @@ int main(int argc, char **argv)
         "  aowis-db-admin revoke-role-assignment DB_FILE ADMIN_UUID ASSIGNMENT_UUID\n"
         "  aowis-db-admin audit DB_FILE ADMIN_UUID [AFTER_SEQUENCE [LIMIT]]\n"
         "  aowis-db-admin audit-verify DB_FILE ADMIN_UUID\n"
+        "  aowis-db-admin redact-sessions DB_FILE ADMIN_UUID [MIN_AGE_DAYS [LIMIT]]\n"
         "Local operator only: file-level SQLite access is trusted.\n"
         "Capture issued tokens securely (umask 077); never publish or commit them.\n");
     if (args.size() < 4)
@@ -46,8 +48,10 @@ int main(int argc, char **argv)
     const bool audit = command == QStringLiteral("audit") &&
                        (args.size() == 4 || args.size() == 5 || args.size() == 6);
     const bool audit_verify = command == QStringLiteral("audit-verify") && args.size() == 4;
+    const bool redact_sessions = command == QStringLiteral("redact-sessions") &&
+        (args.size() == 4 || args.size() == 5 || args.size() == 6);
     if (!bootstrap && !issue && !set_password && !recovery && !revoke && !disable && !enable && !remove_member &&
-        !revoke_permission && !revoke_assignment && !audit && !audit_verify)
+        !revoke_permission && !revoke_assignment && !audit && !audit_verify && !redact_sessions)
     {
         errors << usage;
         return 2;
@@ -83,6 +87,35 @@ int main(int argc, char **argv)
         return 2;
     }
     const aowis::db::OperationContext context{administrator};
+    if (redact_sessions)
+    {
+        bool valid = true;
+        qint64 days = 30;
+        int limit = 100;
+        if (args.size() >= 5)
+            days = args.at(4).toLongLong(&valid);
+        if (!valid || days < 0 || days > 3650)
+        {
+            errors << "Invalid minimum session age (0..3650 days).\n";
+            return 2;
+        }
+        if (args.size() == 6)
+            limit = args.at(5).toInt(&valid);
+        if (!valid || limit < 1 || limit > 500)
+        {
+            errors << "Invalid session-redaction batch limit (1..500).\n";
+            return 2;
+        }
+        const qint64 cutoff = QDateTime::currentMSecsSinceEpoch() - days * 86400000LL;
+        const std::optional<int> count = database.redactSpentSessionTokens(context, cutoff, limit, &error);
+        if (!count)
+        {
+            errors << error << "\n";
+            return 1;
+        }
+        output << "Redacted credentials for " << *count << " spent sessions\n";
+        return 0;
+    }
     if (audit_verify)
     {
         const aowis::db::SecurityAuditReport report = database.verifySecurityAudit(context);

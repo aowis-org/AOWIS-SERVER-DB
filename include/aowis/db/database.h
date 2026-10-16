@@ -118,6 +118,20 @@ struct RevisionInfo
     int hash_version = 1;
 };
 
+// Read-only DAG comparison. Merge bases are the maximal common ancestors:
+// several are possible for criss-cross merges. Only finalized revisions are
+// eligible as merge bases. No merge or model mutation is performed.
+// Ancestor relationships include equality, so equal revisions set both flags.
+struct RevisionComparison
+{
+    QUuid project_uuid;
+    QUuid left_revision_uuid;
+    QUuid right_revision_uuid;
+    bool left_is_ancestor_of_right = false;
+    bool right_is_ancestor_of_left = false;
+    QVector<QUuid> merge_base_revision_uuids;
+};
+
 struct Finalization
 {
     QUuid finalized_revision_uuid;
@@ -245,6 +259,8 @@ public:
     bool redeemPasswordRecovery(const QByteArray &token, const QByteArray &new_password,
         QString *error = nullptr);
 
+    // Each user may hold up to 32 concurrent unexpired, unrevoked sessions.
+    // This quota applies to both password login and administrator issuance.
     // Session issuance/revocation are restricted to system administrators.
     // No HTTP route exposes these operations. A trusted local host can
     // provision the first credentials after administrator bootstrap.
@@ -252,6 +268,12 @@ public:
         const QUuid &user_uuid, qint64 lifetime_seconds, QString *error = nullptr);
     bool revokeSession(const OperationContext &admin, const QUuid &session_uuid,
         QString *error = nullptr);
+    // Retain session identity and history, but erase spent bearer-token digests.
+    // cutoff_ms must be a past UTC millisecond timestamp; max_count is 1..500.
+    // Every scrubbed session receives its own immutable security audit event.
+    // An active session is never scrubbed. Local administrator operation only.
+    std::optional<int> redactSpentSessionTokens(const OperationContext &admin,
+        qint64 cutoff_ms, int max_count = 100, QString *error = nullptr);
     bool disableUser(const OperationContext &admin, const QUuid &user_uuid,
         QString *error = nullptr);
     bool enableUser(const OperationContext &admin, const QUuid &user_uuid,
@@ -337,6 +359,12 @@ public:
                                            QString *error = nullptr);
     std::optional<BranchInfo> branch(const OperationContext &actor, const QUuid &branch_uuid, QString *error = nullptr) const;
     std::optional<RevisionInfo> revision(const OperationContext &actor, const QUuid &revision_uuid, QString *error = nullptr) const;
+    // Compare two revisions in one project (working heads are allowed).
+    // Requires project.read on BOTH source branches. Returns all maximal
+    // FINALIZED common ancestors, not an arbitrary single merge base.
+    std::optional<RevisionComparison> compareRevisions(const OperationContext &actor,
+        const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
+        QString *error = nullptr) const;
 
     // Legacy opaque whole-snapshot path; object-mode revisions use typed
     // persistence and the separate grouped object journal.
@@ -417,6 +445,7 @@ private:
     bool migrateHydraulicMembershipV6(QString *error);
     bool migrateHydraulicReferencesV7(QString *error);
     bool migrateSessionsV8(QString *error);
+    bool migrateSessionRedactionV13(QString *error);
     bool migrateSecurityAuditV9(QString *error);
     bool migrateSecurityAdminV10(QString *error);
     bool migratePasswordCredentialsV11(QString *error);
