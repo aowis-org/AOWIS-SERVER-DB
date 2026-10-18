@@ -4,6 +4,7 @@
 #include <QDataStream>
 #include <QIODevice>
 #include <QList>
+#include <QSet>
 #include <QDate>
 #include <QStringList>
 #include <limits>
@@ -2211,15 +2212,50 @@ template<typename T> QByteArray encodedMergeField(const T &field)
     return stream.status() == QDataStream::Ok ? bytes : QByteArray();
 }
 
+// QStringList preserves order; metadata.tags is not an unordered set.
+// Combine only unambiguous, disjoint *append-only* changes. Deletions,
+// reordering, inserting in the middle, repeated additions and changes to
+// existing tags deliberately retain the usual explicit field conflict.
+std::optional<QStringList> mergeAppendedMetadataTags(const QStringList &base,
+    const QStringList &left, const QStringList &right)
+{
+    if (left.size() <= base.size() || right.size() <= base.size())
+        return std::nullopt;
+    for (qsizetype i = 0; i < base.size(); ++i)
+    {
+        if (left.at(i) != base.at(i) || right.at(i) != base.at(i))
+            return std::nullopt;
+    }
+    QSet<QString> observed;
+    for (const QString &tag : base)
+        observed.insert(tag);
+    QStringList merged = left;
+    for (qsizetype i = base.size(); i < left.size(); ++i)
+    {
+        const QString &tag = left.at(i);
+        if (tag.isEmpty() || observed.contains(tag))
+            return std::nullopt;
+        observed.insert(tag);
+    }
+    for (qsizetype i = base.size(); i < right.size(); ++i)
+    {
+        const QString &tag = right.at(i);
+        if (tag.isEmpty() || observed.contains(tag))
+            return std::nullopt;
+        observed.insert(tag);
+        merged.append(tag);
+    }
+    return merged;
+}
+
 template<typename T, typename Member>
 void chooseMergeField(const T &base, const T &left, const T &right, T &merged,
     Member T::*member, const char *name, QStringList &conflicts,
     const QMap<QString, bool> &field_choices)
 {
     // EntityMetadata is the only intentionally decomposed nested structure.
-    // Its seven codec fields have stable independent meanings, so edits to a
-    // comment need not conflict with edits to a description. Collections
-    // (including tags) remain atomic; other nested structs are also atomic.
+    // Its seven codec fields have stable independent meanings. Tags support
+    // only disjoint append-only changes; other nested collections are atomic.
     if constexpr (std::is_same_v<Member, EntityMetadata>)
     {
         if (QString::fromLatin1(name) != QStringLiteral("metadata"))
@@ -2259,6 +2295,19 @@ void chooseMergeField(const T &base, const T &left, const T &right, T &merged,
             merged.*member = right.*member;
         else
         {
+            if constexpr (std::is_same_v<Member, QStringList>)
+            {
+                if (QString::fromLatin1(name) == QStringLiteral("metadata.tags"))
+                {
+                    const std::optional<QStringList> appended = mergeAppendedMetadataTags(
+                        base.*member, left.*member, right.*member);
+                    if (appended)
+                    {
+                        merged.*member = *appended;
+                        return;
+                    }
+                }
+            }
             const QMap<QString, bool>::const_iterator choice = field_choices.constFind(QString::fromLatin1(name));
             if (choice == field_choices.cend())
                 conflicts.append(QString::fromLatin1(name));

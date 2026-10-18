@@ -19,8 +19,9 @@ conflicting subfields, or lists overlapping fields by dotted names:
 - `metadata.comment`
 - `metadata.tags`
 
-`metadata.tags` remains an **atomic ordered list**: concurrent differing tag
-list edits conflict. All other nested structs and collections, including
+`metadata.tags` remains an **atomic ordered list in V42**: concurrent
+differing tag list edits conflict. V43 adds a narrow disjoint append-only
+exception; see [V43 tags](model-tag-append-merge-v43.md). All other nested structs and collections, including
 coordinates, demands, curves and vertices, retain their conservative atomic
 handling. Use the existing `ObjectMergeFieldResolution` with the dotted field
 name, e.g. `{QStringLiteral("metadata.description"), ObjectMergeSide::Left}`.

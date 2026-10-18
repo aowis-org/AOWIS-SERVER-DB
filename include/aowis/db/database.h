@@ -187,7 +187,8 @@ struct ObjectMergeChange
     std::optional<ModelObject> left;
     std::optional<ModelObject> right;
     // Populated only for supported typed entities changed on both sides.
-    // Nested structs, lists and metadata are treated as atomic top-level fields.
+    // Typed metadata subfields are compared independently. Distinct appended
+    // metadata tags may merge; other collections remain atomic.
     QStringList conflicting_fields;
     std::optional<ModelObject> automatically_merged;
 };
@@ -233,7 +234,7 @@ enum class ObjectMergeSide { Left, Right };
 
 struct ObjectMergeFieldResolution
 {
-    QString field_name; // Exact top-level name from ObjectMergeChange::conflicting_fields.
+    QString field_name; // Exact (possibly dotted) name from conflicting_fields.
     ObjectMergeSide side = ObjectMergeSide::Left;
 };
 
@@ -439,6 +440,16 @@ public:
         const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
         QString *error = nullptr) const;
 
+    // Memory-bounded three-way preview for remote clients. Streams unchanged
+    // entities without retaining them, rejects once either limit is reached,
+    // and returns no partial result. The payload budget counts canonical
+    // content from all three states of each changed entity. This does not
+    // change the unrestricted core merge-commit behavior.
+    std::optional<ObjectMergePreview> previewObjectMergeBounded(const OperationContext &actor,
+        const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
+        qsizetype max_changes, qsizetype max_changed_payload_bytes,
+        QString *error = nullptr) const;
+
     // Finalize an entity-level merge on a canonical working revision, including
     // one with existing local edits. Its sole finalized parent becomes the
     // first merge parent; the working head's current objects are the left
@@ -524,6 +535,7 @@ private:
     bool commit(QString *error = nullptr) const;
     void rollback() const;
     bool migrate(QString *error);
+    bool setSchemaVersion(int version, QString *error);
     bool migrateSecurityV2(QString *error);
     bool migrateHistoryV3(QString *error);
     bool migrateObjectsV4(QString *error);

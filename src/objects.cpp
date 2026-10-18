@@ -148,7 +148,7 @@ bool Database::migrateObjectsV4(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version = 4"), error) || !commit(error))
+    if (!setSchemaVersion(4, error) || !commit(error))
     {
         rollback();
         return false;

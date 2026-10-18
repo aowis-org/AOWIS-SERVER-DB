@@ -110,6 +110,20 @@ int main(int argc, char **argv)
     REQUIRE(preview->right_generation == right_generation);
     REQUIRE(preview->conflict_count == 3);
     REQUIRE(preview->changes.size() == 11);
+    // Bounded HTTP-style previews must report the same classifications and
+    // physical digest, but abort on excessive changed rows or retained bytes.
+    const std::optional<ObjectMergePreview> bounded = db.previewObjectMergeBounded(
+        root, left_uuid, right_uuid, 11, 1024, &error);
+    REQUIRE(bounded && bounded->changes.size() == 11);
+    REQUIRE(bounded->conflict_count == preview->conflict_count);
+    REQUIRE(bounded->left_physical_sha256 == preview->left_physical_sha256);
+    REQUIRE(!db.previewObjectMergeBounded(root, left_uuid, right_uuid, 10, 1024, &error));
+    REQUIRE(error == QStringLiteral("Merge preview exceeds changed-entity limit"));
+    REQUIRE(!db.previewObjectMergeBounded(root, left_uuid, right_uuid, 11, 10, &error));
+    REQUIRE(error == QStringLiteral("Merge preview exceeds changed-payload limit"));
+    REQUIRE(!db.previewObjectMergeBounded(root, left_uuid, right_uuid, 0, 1024, &error));
+    REQUIRE(error == QStringLiteral("Merge preview limits must be positive"));
+    error.clear();
     for (const QUuid &uuid : QVector<QUuid>{only_left, only_right, both_same,
              conflict, delete_modify, both_delete, only_delete, new_same,
              new_clash, new_left, new_right})
@@ -162,6 +176,7 @@ int main(int argc, char **argv)
     const OperationContext restricted{viewer->uuid};
     REQUIRE(db.compareRevisions(restricted, left_uuid, right_uuid, &error));
     REQUIRE(!db.previewObjectMerge(restricted, left_uuid, right_uuid, &error));
+    REQUIRE(!db.previewObjectMergeBounded(restricted, left_uuid, right_uuid, 11, 1024, &error));
     REQUIRE(db.assignRole(root, PrincipalKind::User, viewer->uuid, role->uuid,
         AccessScope::branch(project->main_branch_uuid), &error));
     REQUIRE(db.previewObjectMerge(restricted, left_uuid, right_uuid, &error));

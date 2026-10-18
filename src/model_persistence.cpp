@@ -739,7 +739,7 @@ bool Database::migrateHydraulicMembershipV6(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version=6"), error) || !commit(error))
+    if (!setSchemaVersion(6, error) || !commit(error))
     {
         rollback();
         return false;
@@ -815,7 +815,7 @@ bool Database::migrateHydraulicReferencesV7(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version=7"), error) || !commit(error))
+    if (!setSchemaVersion(7, error) || !commit(error))
     {
         rollback();
         return false;

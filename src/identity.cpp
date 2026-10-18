@@ -255,7 +255,7 @@ bool Database::migrateSecurityV2(QString *error)
         }
     }
     if (ok)
-        ok = exec(QStringLiteral("PRAGMA user_version = 2"), error) && commit(error);
+        ok = setSchemaVersion(2, error) && commit(error);
     if (!ok)
         rollback();
     return ok;

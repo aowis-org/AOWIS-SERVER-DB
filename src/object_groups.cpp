@@ -117,7 +117,7 @@ bool Database::migrateObjectGroupsV5(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version = 5"), error) || !commit(error))
+    if (!setSchemaVersion(5, error) || !commit(error))
     {
         rollback();
         return false;

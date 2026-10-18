@@ -177,7 +177,7 @@ bool Database::migrateSecurityAuditV9(QString *error)
     }
     grant_check.finish();
 
-    if (!exec(QStringLiteral("PRAGMA user_version = 9"), error) || !commit(error))
+    if (!setSchemaVersion(9, error) || !commit(error))
     {
         rollback();
         return false;

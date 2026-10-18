@@ -99,6 +99,67 @@ std::optional<SecurityListOptions> securityListOptions(const QHttpServerRequest 
     return options;
 }
 
+// Merge queries have two required, named UUID parameters. Reject repeated or
+// unexpected parameters rather than silently changing the compared revisions.
+struct RevisionPair
+{
+    QUuid left;
+    QUuid right;
+};
+
+std::optional<RevisionPair> revisionPairQuery(const QHttpServerRequest &request)
+{
+    if (!request.body().isEmpty())
+        return std::nullopt;
+    const QUrlQuery query(request.url());
+    const QList<QPair<QString, QString>> items = query.queryItems();
+    if (items.size() != 2)
+        return std::nullopt;
+    std::optional<QUuid> left;
+    std::optional<QUuid> right;
+    for (const QPair<QString, QString> &item : items)
+    {
+        const std::optional<QUuid> uuid = parseUuid(item.second);
+        if (!uuid)
+            return std::nullopt;
+        if (item.first == QStringLiteral("left_revision_uuid") && !left)
+            left = uuid;
+        else if (item.first == QStringLiteral("right_revision_uuid") && !right)
+            right = uuid;
+        else
+            return std::nullopt;
+    }
+    if (!left || !right)
+        return std::nullopt;
+    return RevisionPair{*left, *right};
+}
+
+QJsonObject comparisonJson(const RevisionComparison &comparison)
+{
+    QJsonArray bases;
+    for (const QUuid &uuid : comparison.merge_base_revision_uuids)
+        bases.append(uuidString(uuid));
+    return {{QStringLiteral("project_uuid"), uuidString(comparison.project_uuid)},
+            {QStringLiteral("left_revision_uuid"), uuidString(comparison.left_revision_uuid)},
+            {QStringLiteral("right_revision_uuid"), uuidString(comparison.right_revision_uuid)},
+            {QStringLiteral("left_is_ancestor_of_right"), comparison.left_is_ancestor_of_right},
+            {QStringLiteral("right_is_ancestor_of_left"), comparison.right_is_ancestor_of_left},
+            {QStringLiteral("merge_base_revision_uuids"), bases}};
+}
+
+QString changeKindName(ObjectMergeKind kind)
+{
+    switch (kind)
+    {
+    case ObjectMergeKind::LeftOnly: return QStringLiteral("left_only");
+    case ObjectMergeKind::RightOnly: return QStringLiteral("right_only");
+    case ObjectMergeKind::BothSame: return QStringLiteral("both_same");
+    case ObjectMergeKind::Conflict: return QStringLiteral("conflict");
+    case ObjectMergeKind::FieldsMerged: return QStringLiteral("fields_merged");
+    }
+    return QStringLiteral("unknown");
+}
+
 // Mutation endpoints accept only documented JSON fields. Silently ignoring
 // unexpected keys is unsafe for rights management (typos can grant wrong rights).
 bool exactFields(const QJsonObject &body, std::initializer_list<const char *> fields)
@@ -111,6 +172,84 @@ bool exactFields(const QJsonObject &body, std::initializer_list<const char *> fi
             return false;
     }
     return true;
+}
+
+// A merge commit accepts only explicitly specified conflict choices. Keep
+// JSON validation separate from the core: the database still validates the
+// choices against its authoritative, transaction-checked merge preview.
+std::optional<ObjectMergeSide> mergeSide(const QJsonValue &value)
+{
+    if (!value.isString())
+        return std::nullopt;
+    if (value.toString() == QStringLiteral("left"))
+        return ObjectMergeSide::Left;
+    if (value.toString() == QStringLiteral("right"))
+        return ObjectMergeSide::Right;
+    return std::nullopt;
+}
+
+std::optional<QVector<ObjectMergeResolution>> mergeResolutions(const QJsonValue &value)
+{
+    if (!value.isArray())
+        return std::nullopt;
+    const QJsonArray entries = value.toArray();
+    if (entries.size() > 256)
+        return std::nullopt;
+    QVector<ObjectMergeResolution> resolutions;
+    resolutions.reserve(entries.size());
+    QSet<QUuid> seen_objects;
+    int total_fields = 0;
+    for (const QJsonValue &entry : entries)
+    {
+        if (!entry.isObject())
+            return std::nullopt;
+        const QJsonObject item = entry.toObject();
+        if (!item.value(QStringLiteral("object_uuid")).isString())
+            return std::nullopt;
+        const std::optional<QUuid> uuid = parseUuid(item.value(QStringLiteral("object_uuid")).toString());
+        if (!uuid || seen_objects.contains(*uuid))
+            return std::nullopt;
+        seen_objects.insert(*uuid);
+        ObjectMergeResolution resolution;
+        resolution.object_uuid = *uuid;
+        if (item.contains(QStringLiteral("side")))
+        {
+            if (!exactFields(item, {"object_uuid", "side"}))
+                return std::nullopt;
+            const std::optional<ObjectMergeSide> side = mergeSide(item.value(QStringLiteral("side")));
+            if (!side)
+                return std::nullopt;
+            resolution.side = *side;
+        }
+        else
+        {
+            if (!exactFields(item, {"object_uuid", "field_resolutions"}) ||
+                !item.value(QStringLiteral("field_resolutions")).isArray())
+                return std::nullopt;
+            const QJsonArray fields = item.value(QStringLiteral("field_resolutions")).toArray();
+            if (fields.isEmpty() || fields.size() > 64 || total_fields + fields.size() > 1024)
+                return std::nullopt;
+            total_fields += fields.size();
+            QSet<QString> seen_fields;
+            for (const QJsonValue &field_value : fields)
+            {
+                if (!field_value.isObject())
+                    return std::nullopt;
+                const QJsonObject field = field_value.toObject();
+                if (!exactFields(field, {"field_name", "side"}) ||
+                    !field.value(QStringLiteral("field_name")).isString())
+                    return std::nullopt;
+                const QString name = field.value(QStringLiteral("field_name")).toString();
+                const std::optional<ObjectMergeSide> side = mergeSide(field.value(QStringLiteral("side")));
+                if (!side || name.isEmpty() || name.size() > 256 || seen_fields.contains(name))
+                    return std::nullopt;
+                seen_fields.insert(name);
+                resolution.field_resolutions.append(ObjectMergeFieldResolution{name, *side});
+            }
+        }
+        resolutions.append(resolution);
+    }
+    return resolutions;
 }
 
 bool emptyMutationRequest(const QHttpServerRequest &request)
@@ -1048,6 +1187,84 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
+    // V44: read-only DAG and three-way merge summaries for remote GUI clients.
+    // The core enforces read access to both tips and (for preview) the merge
+    // base. All failures are deliberately indistinguishable from unavailable
+    // resources, so UUID probes cannot reveal private revision relationships.
+    if (!server.route(QStringLiteral("/api/v1/merge/compare"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<RevisionPair> pair = revisionPairQuery(request);
+        if (!pair)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid revision comparison query"));
+        QString error;
+        const std::optional<RevisionComparison> comparison = this->database_.compareRevisions(
+            *actor, pair->left, pair->right, &error);
+        return comparison ? QHttpServerResponse(comparisonJson(*comparison)) : unavailable();
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/merge/preview"), get,
+                      [this](const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<RevisionPair> pair = revisionPairQuery(request);
+        if (!pair)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid merge preview query"));
+        QString error;
+        // Bound retained entity payloads while scanning the SQLite revisions,
+        // before building the response. Unchanged entities are streamed.
+        const std::optional<ObjectMergePreview> preview = this->database_.previewObjectMergeBounded(
+            *actor, pair->left, pair->right, 1024, 16 * 1024 * 1024, &error);
+        if (!preview)
+        {
+            if (error == QStringLiteral("Merge preview exceeds changed-entity limit"))
+                return jsonError(Status::Conflict, QStringLiteral("Merge preview exceeds 1024 changed entities"));
+            if (error == QStringLiteral("Merge preview exceeds changed-payload limit"))
+                return jsonError(Status::Conflict, QStringLiteral("Merge preview exceeds 16 MiB changed payloads"));
+            return unavailable();
+        }
+        // Keep the serialized JSON size limit independent of payload limits.
+        if (preview->changes.size() > 1024)
+            return jsonError(Status::Conflict, QStringLiteral("Merge preview exceeds 1024 changed entities"));
+        QJsonArray changes;
+        for (const ObjectMergeChange &change : preview->changes)
+        {
+            QJsonArray fields;
+            for (const QString &field : change.conflicting_fields)
+                fields.append(field);
+            // This is a summary, NOT an export of entity payloads. Authorized
+            // clients can retrieve existing source objects via revision GET.
+            const std::optional<ModelObject> &representative = change.left ?
+                change.left : (change.right ? change.right : change.base);
+            changes.append(QJsonObject{
+                {QStringLiteral("object_uuid"), uuidString(change.object_uuid)},
+                {QStringLiteral("kind"), representative ? representative->kind : QString()},
+                {QStringLiteral("classification"), changeKindName(change.kind)},
+                {QStringLiteral("base_present"), change.base.has_value()},
+                {QStringLiteral("left_present"), change.left.has_value()},
+                {QStringLiteral("right_present"), change.right.has_value()},
+                {QStringLiteral("conflicting_fields"), fields}});
+        }
+        QJsonObject result{
+            {QStringLiteral("project_uuid"), uuidString(preview->project_uuid)},
+            {QStringLiteral("base_revision_uuid"), uuidString(preview->base_revision_uuid)},
+            {QStringLiteral("left_revision_uuid"), uuidString(preview->left_revision_uuid)},
+            {QStringLiteral("right_revision_uuid"), uuidString(preview->right_revision_uuid)},
+            {QStringLiteral("left_generation"), QString::number(preview->left_generation)},
+            {QStringLiteral("right_generation"), QString::number(preview->right_generation)},
+            {QStringLiteral("conflict_count"), QString::number(preview->conflict_count)},
+            {QStringLiteral("changes"), changes}};
+        const QByteArray encoded = QJsonDocument(result).toJson(QJsonDocument::Compact);
+        if (encoded.size() > 1024 * 1024)
+            return jsonError(Status::Conflict, QStringLiteral("Merge preview exceeds 1 MiB"));
+        return QHttpServerResponse(result);
+    }))
+        return false;
+
     if (!server.route(QStringLiteral("/api/v1/revisions/<arg>"), get,
                       [this](const QString &id, const QHttpServerRequest &request) {
         const std::optional<OperationContext> actor = actorFor(request);
@@ -1277,6 +1494,52 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     };
     if (!registerCompensation(QStringLiteral("/api/v1/branches/<arg>/undo"), false) ||
         !registerCompensation(QStringLiteral("/api/v1/branches/<arg>/redo"), true))
+        return false;
+
+    // V45: commit a two-parent merge through the authoritative transactional
+    // core. Never trust a previous preview: UUID, generation, permissions and
+    // physical object state are rechecked by mergeObjectRevisions().
+    if (!server.route(QStringLiteral("/api/v1/branches/<arg>/merge"), post,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> branch_uuid = parseUuid(id);
+        const std::optional<QJsonObject> body = jsonBody(request);
+        if (!branch_uuid || request.url().hasQuery() || !body ||
+            !exactFields(*body, {"expected_working_revision_uuid", "expected_generation",
+                                 "right_finalized_revision_uuid", "resolutions", "title", "message"}))
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid merge request"));
+        const QJsonValue head_value = body->value(QStringLiteral("expected_working_revision_uuid"));
+        const QJsonValue remote_value = body->value(QStringLiteral("right_finalized_revision_uuid"));
+        const QJsonValue title_value = body->value(QStringLiteral("title"));
+        const QJsonValue message_value = body->value(QStringLiteral("message"));
+        if (!head_value.isString() || !remote_value.isString() ||
+            !title_value.isString() || !message_value.isString())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid merge request fields"));
+        const std::optional<QUuid> working_uuid = parseUuid(head_value.toString());
+        const std::optional<QUuid> right_uuid = parseUuid(remote_value.toString());
+        const std::optional<qint64> generation = expectedGeneration(*body);
+        const std::optional<QVector<ObjectMergeResolution>> resolutions =
+            mergeResolutions(body->value(QStringLiteral("resolutions")));
+        const QString title = title_value.toString();
+        const QString message = message_value.toString();
+        if (!working_uuid || !right_uuid || !generation || !resolutions ||
+            title.trimmed().isEmpty() || title.size() > 256 || message.size() > 4096)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid merge request fields"));
+        QString error;
+        const std::optional<Finalization> result = this->database_.mergeObjectRevisions(
+            *actor, *branch_uuid, *working_uuid, *generation, *right_uuid,
+            *resolutions, title, message, &error);
+        if (!result)
+            return jsonError(Status::Conflict, QStringLiteral("Merge denied, stale, or conflicted"));
+        return QHttpServerResponse(QJsonObject{
+            {QStringLiteral("finalized_revision_uuid"), uuidString(result->finalized_revision_uuid)},
+            {QStringLiteral("new_working_revision_uuid"), uuidString(result->new_working_revision_uuid)},
+            {QStringLiteral("snapshot_sha256"), QString::fromLatin1(result->snapshot_sha256.toHex())},
+            {QStringLiteral("chain_sha256"), QString::fromLatin1(result->chain_sha256.toHex())}},
+            Status::Created);
+    }))
         return false;
 
     if (!server.route(QStringLiteral("/api/v1/branches/<arg>/finalize"), post,

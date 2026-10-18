@@ -334,9 +334,55 @@ See [docs/object-merge-preview-v37.md](docs/object-merge-preview-v37.md).
 
 `Database::mergeObjectRevisions` builds an atomic two-parent revision from two
 finalized divergent branches using V37 object-level conflicts and explicit
-left/right choices. The target must be an unedited working revision copied
-from the left finalized input; all changed objects are journaled and affected
-hydraulic networks validated before finalization. A successful merge returns
+left/right choices. V39 also permits local edits in the working revision,
+preserving existing journal groups. Changed objects are journaled and affected
+networks undergo structural/reference-consistency checks before finalization. A successful merge returns
 the finalized merge and a new working head. Failures roll back every part.
 See [docs/object-merge-commit-v38.md](docs/object-merge-commit-v38.md) for
 preconditions, permissions, limitations and the no-schema-change guarantee.
+
+## Field-aware merge and append-only tags (V39–V43)
+
+The V39 merge commit preserves existing working edits and object journal groups.
+V40–V42 add typed top-level and `EntityMetadata` subfield-aware merging, plus
+explicit per-field conflict choices. V43 can automatically combine disjoint
+append-only `metadata.tags` changes in deterministic left-then-right order.
+Removals, reordering and overlapping tag additions still conflict. See
+[metadata merge](docs/model-metadata-merge-v42.md) and
+[append-only tags](docs/model-tag-append-merge-v43.md). None of these merges
+runs EPANET; network validation is structural and reference-based.
+
+## V44 — Remote merge inspection
+
+Read-only REST routes for revision ancestry and bounded three-way object merge summaries are documented in [`docs/http-merge-preview-v44.md`](docs/http-merge-preview-v44.md). No merge commit is performed over HTTP.
+
+## V45 — Atomic merges over REST
+
+`POST /api/v1/branches/{branch_uuid}/merge` exposes the existing atomic,
+field-aware two-parent merge commit to authenticated clients. It requires the
+working head UUID and decimal-string generation, a finalized remote revision,
+a title, a message, and explicit choices for conflicts. The core rechecks
+permissions and revision state before committing; no client preview acts as
+an authorization token. See [REST merge commit](docs/http-merge-commit-v45.md).
+
+## V46 — Streaming, bounded merge previews
+
+`Database::previewObjectMerge()` now merges three UUID-ordered SQLite read
+cursors rather than retaining complete base/left/right entity maps. Unchanged
+entities are released as the scan advances. Its C++ return type and existing
+merge-commit behavior are unchanged.
+
+The new `previewObjectMergeBounded()` overload lets remote callers limit both
+changed-entity count and the canonical payload bytes retained for those
+changes. The REST merge preview uses 1,024 changed entities, 16 MiB of source
+contents, and its existing 1 MiB JSON response limit, returning HTTP 409
+without partial data when exceeded. This is a memory bound on materialized
+preview data, not a bounded scan time or pagination system. See
+[HTTP merge-preview limits](docs/http-merge-preview-v44.md).
+
+## SQLite backend boundary (V47)
+
+SQLite connection setup, migration version PRAGMAs, transaction primitives and
+security-schema verification are isolated in `src/sqlite_backend.cpp`; see
+[the V47 backend separation notes](docs/backend-separation-v47.md).
+**PostgreSQL is not implemented yet.**

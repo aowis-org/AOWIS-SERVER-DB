@@ -3,12 +3,11 @@
 #include "model_field_merge.h"
 
 #include <algorithm>
+#include <limits>
 
 #include <QByteArrayView>
 #include <QCryptographicHash>
 
-#include <QMap>
-#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
@@ -23,53 +22,75 @@ void setError(QString *error, const QString &message)
         *error = message;
 }
 
-// Load live entity state only. An absent row and a deletion tombstone both
-// represent absence for semantic three-way comparison. Tombstone versions
-// remain in SQLite for optimistic concurrency and are never modified here.
-bool readLiveObjects(const QSqlDatabase &database, const QUuid &revision_uuid,
-                     QMap<QUuid, ModelObject> &objects, QString *error)
+// Stream the three object revisions in stable UUID order. Holding only one
+// row per revision avoids retaining every unchanged network entity in memory.
+// Tombstones are deliberately absent from semantic comparison; their physical
+// rows are still covered by the separate left-side generation digest.
+struct LiveObjectCursor
 {
-    QSqlQuery query(database);
-    if (!query.prepare(QStringLiteral(
-            "SELECT object_uuid,kind,content,version FROM revision_objects "
-            "WHERE revision_uuid=? AND deleted=0 ORDER BY object_uuid")))
+    QSqlQuery query;
+    std::optional<ModelObject> current;
+    QByteArray previous_id;
+
+    explicit LiveObjectCursor(const QSqlDatabase &database) : query(database)
     {
-        setError(error, query.lastError().text());
-        return false;
+        // SQLite supports interleaved forward-only statements on the same
+        // connection. PostgreSQL cannot safely use that access pattern.
+        if (database.driverName() == QStringLiteral("QSQLITE"))
+            this->query.setForwardOnly(true);
     }
-    query.addBindValue(revision_uuid.toRfc4122());
-    if (!query.exec())
+
+    bool open(const QUuid &revision_uuid, QString *error)
     {
-        setError(error, query.lastError().text());
-        return false;
+        if (!this->query.prepare(QStringLiteral(
+                "SELECT object_uuid,kind,content,version FROM revision_objects "
+                "WHERE revision_uuid=? AND deleted=0 ORDER BY object_uuid")))
+        {
+            setError(error, this->query.lastError().text());
+            return false;
+        }
+        this->query.addBindValue(revision_uuid.toRfc4122());
+        if (!this->query.exec())
+        {
+            setError(error, this->query.lastError().text());
+            return false;
+        }
+        return advance(error);
     }
-    while (query.next())
+
+    bool advance(QString *error)
     {
-        const QUuid object_uuid = QUuid::fromRfc4122(query.value(0).toByteArray());
-        if (object_uuid.isNull() || objects.contains(object_uuid))
+        this->current.reset();
+        if (!this->query.next())
+        {
+            if (this->query.lastError().isValid())
+            {
+                setError(error, this->query.lastError().text());
+                return false;
+            }
+            this->query.finish();
+            return true;
+        }
+        const QByteArray raw_uuid = this->query.value(0).toByteArray();
+        const QUuid uuid = QUuid::fromRfc4122(raw_uuid);
+        if (uuid.isNull() || raw_uuid.size() != 16 ||
+            (!this->previous_id.isEmpty() && raw_uuid <= this->previous_id))
         {
             setError(error, QStringLiteral("Invalid or duplicate object UUID in revision"));
             return false;
         }
-        objects.insert(object_uuid, ModelObject{object_uuid, query.value(1).toString(),
-            query.value(2).toByteArray(), query.value(3).toLongLong(), false});
+        this->previous_id = raw_uuid;
+        this->current = ModelObject{uuid, this->query.value(1).toString(),
+            this->query.value(2).toByteArray(), this->query.value(3).toLongLong(), false};
+        return true;
     }
-    if (query.lastError().isValid())
-    {
-        setError(error, query.lastError().text());
-        return false;
-    }
-    return true;
-}
 
-std::optional<ModelObject> findObject(const QMap<QUuid, ModelObject> &objects,
-                                      const QUuid &uuid)
-{
-    const QMap<QUuid, ModelObject>::const_iterator it = objects.constFind(uuid);
-    if (it == objects.cend())
-        return std::nullopt;
-    return *it;
-}
+    void finish()
+    {
+        this->current.reset();
+        this->query.finish();
+    }
+};
 
 bool sameContent(const std::optional<ModelObject> &a, const std::optional<ModelObject> &b)
 {
@@ -124,6 +145,19 @@ std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database
 std::optional<ObjectMergePreview> Database::previewObjectMerge(const OperationContext &actor,
     const QUuid &left_revision_uuid, const QUuid &right_revision_uuid, QString *error) const
 {
+    return previewObjectMergeBounded(actor, left_revision_uuid, right_revision_uuid,
+        std::numeric_limits<qsizetype>::max(), std::numeric_limits<qsizetype>::max(), error);
+}
+
+std::optional<ObjectMergePreview> Database::previewObjectMergeBounded(const OperationContext &actor,
+    const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
+    qsizetype max_changes, qsizetype max_changed_payload_bytes, QString *error) const
+{
+    if (max_changes < 1 || max_changed_payload_bytes < 1)
+    {
+        setError(error, QStringLiteral("Merge preview limits must be positive"));
+        return std::nullopt;
+    }
     // A single read transaction produces a coherent SQLite snapshot even if
     // another connection modifies either editable working head concurrently.
     QSqlQuery transaction(this->database_);
@@ -177,27 +211,19 @@ std::optional<ObjectMergePreview> Database::previewObjectMerge(const OperationCo
         return fail();
     }
 
-    QMap<QUuid, ModelObject> base_objects;
-    QMap<QUuid, ModelObject> left_objects;
-    QMap<QUuid, ModelObject> right_objects;
-    if (!readLiveObjects(this->database_, base_uuid, base_objects, error) ||
-        !readLiveObjects(this->database_, left_revision_uuid, left_objects, error) ||
-        !readLiveObjects(this->database_, right_revision_uuid, right_objects, error))
+    LiveObjectCursor base_cursor(this->database_);
+    LiveObjectCursor left_cursor(this->database_);
+    LiveObjectCursor right_cursor(this->database_);
+    const auto failScan = [&]() -> std::optional<ObjectMergePreview> {
+        base_cursor.finish();
+        left_cursor.finish();
+        right_cursor.finish();
         return fail();
-
-    QSet<QUuid> ids;
-    for (QMap<QUuid, ModelObject>::const_iterator it = base_objects.cbegin();
-         it != base_objects.cend(); ++it)
-        ids.insert(it.key());
-    for (QMap<QUuid, ModelObject>::const_iterator it = left_objects.cbegin();
-         it != left_objects.cend(); ++it)
-        ids.insert(it.key());
-    for (QMap<QUuid, ModelObject>::const_iterator it = right_objects.cbegin();
-         it != right_objects.cend(); ++it)
-        ids.insert(it.key());
-    QVector<QUuid> sorted_ids = ids.values();
-    std::sort(sorted_ids.begin(), sorted_ids.end(),
-              [](const QUuid &a, const QUuid &b) { return a.toRfc4122() < b.toRfc4122(); });
+    };
+    if (!base_cursor.open(base_uuid, error) ||
+        !left_cursor.open(left_revision_uuid, error) ||
+        !right_cursor.open(right_revision_uuid, error))
+        return failScan();
 
     // Captured inside the same read transaction as the three-way comparison:
     // an unjournaled update cannot silently alter the working head between
@@ -205,7 +231,7 @@ std::optional<ObjectMergePreview> Database::previewObjectMerge(const OperationCo
     const std::optional<QByteArray> physical = mergePhysicalObjectDigest(
         this->database_, left_revision_uuid, error);
     if (!physical)
-        return fail();
+        return failScan();
 
     ObjectMergePreview result;
     result.left_physical_sha256 = *physical;
@@ -215,15 +241,67 @@ std::optional<ObjectMergePreview> Database::previewObjectMerge(const OperationCo
     result.right_revision_uuid = right_revision_uuid;
     result.left_generation = left_revision->generation;
     result.right_generation = right_revision->generation;
-    for (const QUuid &uuid : sorted_ids)
+    qsizetype retained_payload_bytes = 0;
+    while (base_cursor.current || left_cursor.current || right_cursor.current)
     {
-        const std::optional<ModelObject> baseline = findObject(base_objects, uuid);
-        const std::optional<ModelObject> left = findObject(left_objects, uuid);
-        const std::optional<ModelObject> right = findObject(right_objects, uuid);
+        // All three cursors use ORDER BY object_uuid on the stored BLOB UUID.
+        // This is the same RFC4122 byte ordering used by earlier previews.
+        QByteArray next_id;
+        const auto includeId = [&next_id](const std::optional<ModelObject> &object) {
+            if (object)
+            {
+                const QByteArray candidate = object->uuid.toRfc4122();
+                if (next_id.isEmpty() || candidate < next_id)
+                    next_id = candidate;
+            }
+        };
+        includeId(base_cursor.current);
+        includeId(left_cursor.current);
+        includeId(right_cursor.current);
+        const QUuid uuid = QUuid::fromRfc4122(next_id);
+        const bool advance_base = base_cursor.current && base_cursor.current->uuid == uuid;
+        const bool advance_left = left_cursor.current && left_cursor.current->uuid == uuid;
+        const bool advance_right = right_cursor.current && right_cursor.current->uuid == uuid;
+        // Moving the current row means only changed rows can remain retained
+        // in the result; all other model payloads are promptly discarded.
+        const std::optional<ModelObject> baseline = advance_base ?
+            std::move(base_cursor.current) : std::nullopt;
+        const std::optional<ModelObject> left = advance_left ?
+            std::move(left_cursor.current) : std::nullopt;
+        const std::optional<ModelObject> right = advance_right ?
+            std::move(right_cursor.current) : std::nullopt;
+        if ((advance_base && !base_cursor.advance(error)) ||
+            (advance_left && !left_cursor.advance(error)) ||
+            (advance_right && !right_cursor.advance(error)))
+            return failScan();
         const bool left_changed = !sameContent(baseline, left);
         const bool right_changed = !sameContent(baseline, right);
         if (!left_changed && !right_changed)
             continue;
+
+        // Refuse oversized previews before copying changed entities or
+        // running the field-level codec. These limits apply only to the
+        // bounded API; the existing C++ commit path remains unrestricted.
+        if (result.changes.size() >= max_changes)
+        {
+            setError(error, QStringLiteral("Merge preview exceeds changed-entity limit"));
+            return failScan();
+        }
+        qsizetype this_payload_bytes = 0;
+        for (const std::optional<ModelObject> *object : {&baseline, &left, &right})
+        {
+            if (*object)
+            {
+                const qsizetype length = (*object)->content.size();
+                if (length > max_changed_payload_bytes - retained_payload_bytes - this_payload_bytes)
+                {
+                    setError(error, QStringLiteral("Merge preview exceeds changed-payload limit"));
+                    return failScan();
+                }
+                this_payload_bytes += length;
+            }
+        }
+        retained_payload_bytes += this_payload_bytes;
 
         ObjectMergeKind kind = ObjectMergeKind::Conflict;
         if (!left_changed)
@@ -254,11 +332,14 @@ std::optional<ObjectMergePreview> Database::previewObjectMerge(const OperationCo
             ++result.conflict_count;
         result.changes.append(std::move(change));
     }
+    base_cursor.finish();
+    left_cursor.finish();
+    right_cursor.finish();
     QSqlQuery commit(this->database_);
     if (!commit.exec(QStringLiteral("COMMIT")))
     {
         setError(error, commit.lastError().text());
-        return fail();
+        return failScan();
     }
     return result;
 }

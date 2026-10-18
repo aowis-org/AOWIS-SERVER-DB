@@ -205,7 +205,7 @@ bool Database::migrateHistoryV3(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version = 3"), error) || !commit(error))
+    if (!setSchemaVersion(3, error) || !commit(error))
     {
         rollback();
         return false;

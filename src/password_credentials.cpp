@@ -82,7 +82,7 @@ bool Database::migratePasswordCredentialsV11(QString *error)
         failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK(failed_attempts>=0 AND failed_attempts<=5),
         locked_until_ms INTEGER NOT NULL DEFAULT 0
     ))SQL"), error) ||
-        !exec(QStringLiteral("PRAGMA user_version = 11"), error) || !commit(error))
+        !setSchemaVersion(11, error) || !commit(error))
     {
         rollback();
         return false;
@@ -596,7 +596,7 @@ bool Database::migratePasswordRecoveryV12(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version = 12"), error) || !commit(error))
+    if (!setSchemaVersion(12, error) || !commit(error))
     {
         rollback();
         return false;

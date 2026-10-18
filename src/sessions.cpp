@@ -131,7 +131,7 @@ bool Database::migrateSessionsV8(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version = 8"), error) || !commit(error))
+    if (!setSchemaVersion(8, error) || !commit(error))
     {
         rollback();
         return false;
@@ -164,7 +164,7 @@ bool Database::migrateSessionRedactionV13(QString *error)
                 ))
             BEGIN SELECT RAISE(ABORT,'session identity is immutable; spent credentials may only be redacted'); END
         )SQL"), error) ||
-        !exec(QStringLiteral("PRAGMA user_version = 13"), error) || !commit(error))
+        !setSchemaVersion(13, error) || !commit(error))
     {
         rollback();
         return false;

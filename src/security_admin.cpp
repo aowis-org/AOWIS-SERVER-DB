@@ -160,7 +160,7 @@ bool Database::migrateSecurityAdminV10(QString *error)
                 return false;
             }
         }
-        if (!exec(QStringLiteral("PRAGMA user_version = 10"), error) || !commit(error))
+        if (!setSchemaVersion(10, error) || !commit(error))
         {
             rollback();
             return false;
@@ -211,7 +211,7 @@ bool Database::migrateSecurityAdminV10(QString *error)
             return false;
         }
     }
-    if (!exec(QStringLiteral("PRAGMA user_version = 10"), error) || !commit(error))
+    if (!setSchemaVersion(10, error) || !commit(error))
     {
         rollback();
         return false;
