@@ -189,6 +189,17 @@ int main(int argc, char **argv)
     REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error).size() == 1);
     REQUIRE(database.objectGroupsForRevision(actor, project->working_revision_uuid, &error)
                 .first().object_event_uuids.size() == 19);
+    const QVector<aowis::db::ObjectChange> initial_events =
+        database.objectHistoryForRevision(actor, project->working_revision_uuid, &error);
+    REQUIRE(initial_events.size() == 19);
+    for (qsizetype index = 0; index < initial_events.size(); ++index)
+    {
+        REQUIRE(initial_events.at(index).sequence == index + 1);
+        REQUIRE(initial_events.at(index).actor_uuid == actor.actor_uuid);
+        REQUIRE(initial_events.at(index).action == QStringLiteral("put"));
+        REQUIRE(initial_events.at(index).before_version == -1);
+        REQUIRE(initial_events.at(index).after_version == 1);
+    }
     REQUIRE(database.object(actor, project->working_revision_uuid, pipe.uuid, &error)->kind == QStringLiteral("hydraulic.pipe"));
     REQUIRE(!database.saveHydraulicNetwork(actor, project->main_branch_uuid, 0, network, &error));
     NetworkHydraulic conflicting = network;

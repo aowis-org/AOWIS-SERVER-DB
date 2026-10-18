@@ -95,6 +95,23 @@ int main(int argc, char **argv)
     REQUIRE(db.saveHydraulicNetwork(actor, project->main_branch_uuid, 0, first, &error));
     const qint64 first_generation = db.revision(actor, project->working_revision_uuid, &error)->generation;
     REQUIRE(db.saveHydraulicNetwork(actor, project->main_branch_uuid, first_generation, second, &error));
+    // The second wholly new network uses the same bulk insert path even when
+    // the revision already has other networks and a nonzero journal sequence.
+    const QVector<aowis::db::ObjectChange> initial_history =
+        db.objectHistoryForRevision(actor, project->working_revision_uuid, &error);
+    REQUIRE(initial_history.size() == 8);
+    for (qsizetype position = 0; position < initial_history.size(); ++position)
+    {
+        REQUIRE(initial_history.at(position).sequence == position + 1);
+        REQUIRE(initial_history.at(position).actor_uuid == actor.actor_uuid);
+        REQUIRE(initial_history.at(position).before_version == -1);
+        REQUIRE(initial_history.at(position).after_version == 1);
+    }
+    const QVector<aowis::db::ObjectGroup> initial_groups =
+        db.objectGroupsForRevision(actor, project->working_revision_uuid, &error);
+    REQUIRE(initial_groups.size() == 2);
+    REQUIRE(initial_groups.at(0).object_event_uuids.size() == 4);
+    REQUIRE(initial_groups.at(1).object_event_uuids.size() == 4);
 
     {
         QSqlDatabase inspection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("index-check"));

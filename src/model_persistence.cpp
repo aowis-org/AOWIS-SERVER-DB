@@ -2,8 +2,12 @@
 
 #include <aowis/db/model_persistence.h>
 #include <aowis/db/model_validation.h>
+#include <aowis/model/uuid.h>
 
 #include <QDataStream>
+#include <QDateTime>
+#include <QDebug>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QSet>
 #include <QIODevice>
@@ -101,6 +105,105 @@ bool fetchObjectsForNetworkSave(const StorageBackend &backend, const QSqlDatabas
                                    query.value(1).toString(), query.value(2).toByteArray(),
                                    query.value(3).toLongLong(), query.value(4).toBool()};
             result.insert(item.uuid, item);
+        }
+    }
+    return true;
+}
+
+// The first insertion of a previously unknown network has no old object
+// versions to read or reconcile. The caller has already checked permissions,
+// revision generation, all incoming UUIDs and network-wide validation inside
+// a write transaction. Use reusable statements for the same writes produced
+// by modifyObjectInTransaction: one object row, one generation increment and
+// one immutable journal event per entity, in exactly the input order.
+//
+// Do not use this path for replacements, deletions, tombstones or UUIDs
+// already present in the revision. Those retain the checked general path.
+bool insertFreshNetworkObjects(const StorageBackend &backend,
+                               const QSqlDatabase &database,
+                               const RevisionInfo &revision,
+                               const OperationContext &actor,
+                               const QVector<StoredRecord> &records,
+                               bool enable_object_mode,
+                               QString *error)
+{
+    const QVariant revision_id = backend.bindUuid(revision.uuid);
+    const QVariant actor_id = backend.bindUuid(actor.actor_uuid);
+    if (enable_object_mode)
+    {
+        QSqlQuery mode(database);
+        if (!mode.prepare(QStringLiteral(
+                "UPDATE revisions SET object_mode=1 WHERE uuid=? AND object_mode=0")))
+        {
+            assignError(error, mode.lastError().text());
+            return false;
+        }
+        mode.addBindValue(revision_id);
+        if (!mode.exec() || mode.numRowsAffected() != 1)
+        {
+            assignError(error, mode.lastError().text().isEmpty()
+                ? QStringLiteral("Cannot enable object mode") : mode.lastError().text());
+            return false;
+        }
+    }
+
+    QSqlQuery insert(database);
+    QSqlQuery generation(database);
+    QSqlQuery event(database);
+    if (!insert.prepare(QStringLiteral(
+            "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
+            "VALUES (?,?,?,?,1,0)")) ||
+        !generation.prepare(QStringLiteral(
+            "UPDATE revisions SET generation=generation+1 WHERE uuid=? AND state='working'")) ||
+        !event.prepare(QStringLiteral(
+            "INSERT INTO object_events(uuid,revision_uuid,object_uuid,actor_uuid,sequence,occurred_at_ms,kind,action,"
+            "before_version,after_version,before_content,after_content,before_deleted) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")))
+    {
+        const QString detail = !insert.lastError().text().isEmpty() ? insert.lastError().text()
+            : !generation.lastError().text().isEmpty() ? generation.lastError().text()
+            : event.lastError().text();
+        assignError(error, detail);
+        return false;
+    }
+    generation.bindValue(0, revision_id);
+    insert.bindValue(0, revision_id);
+    event.bindValue(1, revision_id);
+    event.bindValue(3, actor_id);
+    event.bindValue(7, QStringLiteral("put"));
+    event.bindValue(8, -1);
+    event.bindValue(9, 1);
+    event.bindValue(10, QVariant());
+    event.bindValue(12, 1);
+    qint64 sequence = revision.generation;
+    for (const StoredRecord &record : records)
+    {
+        const QVariant object_id = backend.bindUuid(record.uuid);
+        insert.bindValue(1, object_id);
+        insert.bindValue(2, record.kind);
+        insert.bindValue(3, record.content);
+        if (!insert.exec())
+        {
+            assignError(error, insert.lastError().text());
+            return false;
+        }
+        if (!generation.exec() || generation.numRowsAffected() != 1)
+        {
+            assignError(error, generation.lastError().text().isEmpty()
+                ? QStringLiteral("Working revision generation conflict") : generation.lastError().text());
+            return false;
+        }
+        ++sequence;
+        event.bindValue(0, backend.bindUuid(createUuidV7()));
+        event.bindValue(2, object_id);
+        event.bindValue(4, sequence);
+        event.bindValue(5, QDateTime::currentMSecsSinceEpoch());
+        event.bindValue(6, record.kind);
+        event.bindValue(11, record.content);
+        if (!event.exec())
+        {
+            assignError(error, event.lastError().text());
+            return false;
         }
     }
     return true;
@@ -803,6 +906,10 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
                                    const NetworkHydraulic &network,
                                    QString *error)
 {
+    const bool profile = qEnvironmentVariableIsSet("AOWIS_DB_PROFILE_SAVE");
+    QElapsedTimer profile_clock;
+    if (profile)
+        profile_clock.start();
     const ModelValidationReport validation = validateHydraulicNetwork(network);
     if (!validation.valid())
     {
@@ -811,8 +918,16 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
     }
     NetworkIndex index;
     QVector<StoredRecord> requested;
-    if (!buildRecords(network, index, requested, error) || !beginWrite(error))
+    if (!buildRecords(network, index, requested, error))
         return false;
+    const qint64 prepared_ms = profile ? profile_clock.elapsed() : 0;
+    if (!beginWrite(error))
+        return false;
+    qint64 looked_up_ms = prepared_ms;
+    qint64 written_ms = prepared_ms;
+    qint64 indexed_ms = prepared_ms;
+    qint64 grouped_ms = prepared_ms;
+    bool used_fresh_insert = false;
     bool ok = false;
     do
     {
@@ -895,42 +1010,59 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
                                         relevant_ids, existing, error))
             break;
 
-        bool write_failed = false;
-        for (const StoredRecord &item : requested)
+        if (profile)
+            looked_up_ms = profile_clock.elapsed();
+        const bool fresh_network = old_ids.isEmpty() && existing.isEmpty();
+        used_fresh_insert = fresh_network;
+        if (fresh_network)
         {
-            const bool exists = existing.contains(item.uuid);
-            const ModelObject prior = exists ? existing[item.uuid] : ModelObject{};
-            if (exists && item.uuid != network.uuid && !old_ids.contains(item.uuid))
-            {
-                assignError(error, QStringLiteral("Model object UUID already used outside this network"));
-                write_failed = true; break;
-            }
-            if (exists && prior.kind != item.kind)
-            {
-                assignError(error, QStringLiteral("Object UUID collision across model types"));
-                write_failed = true; break;
-            }
-            if (exists && !prior.deleted && prior.content == item.content)
-                continue;
-            if (!modifyObjectInTransaction(actor, branch_uuid, item.uuid, item.kind,
-                                           item.content, exists ? prior.version : -1, error))
-            {
-                write_failed = true; break;
-            }
+            // Mode 0 was checked for legacy snapshots above. Switching it on
+            // once here is equivalent to the first individual object insert.
+            if (!insertFreshNetworkObjects(*this->backend_, this->database_, *revision,
+                                           actor, requested, *mode == 0, error))
+                break;
         }
-        if (write_failed) break;
-        for (const QUuid &old_uuid : old_ids)
+        else
         {
-            if (new_ids.contains(old_uuid)) continue;
-            if (!existing.contains(old_uuid) || existing[old_uuid].deleted ||
-                !modifyObjectInTransaction(actor, branch_uuid, old_uuid, QString(),
-                                           std::nullopt, existing[old_uuid].version, error))
+            bool write_failed = false;
+            for (const StoredRecord &item : requested)
             {
-                assignError(error, QStringLiteral("Could not delete old network entity"));
-                write_failed = true; break;
+                const bool exists = existing.contains(item.uuid);
+                const ModelObject prior = exists ? existing[item.uuid] : ModelObject{};
+                if (exists && item.uuid != network.uuid && !old_ids.contains(item.uuid))
+                {
+                    assignError(error, QStringLiteral("Model object UUID already used outside this network"));
+                    write_failed = true; break;
+                }
+                if (exists && prior.kind != item.kind)
+                {
+                    assignError(error, QStringLiteral("Object UUID collision across model types"));
+                    write_failed = true; break;
+                }
+                if (exists && !prior.deleted && prior.content == item.content)
+                    continue;
+                if (!modifyObjectInTransaction(actor, branch_uuid, item.uuid, item.kind,
+                                               item.content, exists ? prior.version : -1, error))
+                {
+                    write_failed = true; break;
+                }
             }
+            if (write_failed) break;
+            for (const QUuid &old_uuid : old_ids)
+            {
+                if (new_ids.contains(old_uuid)) continue;
+                if (!existing.contains(old_uuid) || existing[old_uuid].deleted ||
+                    !modifyObjectInTransaction(actor, branch_uuid, old_uuid, QString(),
+                                               std::nullopt, existing[old_uuid].version, error))
+                {
+                    assignError(error, QStringLiteral("Could not delete old network entity"));
+                    write_failed = true; break;
+                }
+            }
+            if (write_failed) break;
         }
-        if (write_failed) break;
+        if (profile)
+            written_ms = profile_clock.elapsed();
         const std::optional<RevisionInfo> after = revisionUnchecked(revision->uuid, error);
         if (!after) break;
         if (after->generation != expected_generation)
@@ -945,13 +1077,37 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
                 !replaceNetworkMembership(revision->uuid, network.uuid, new_members, error))
                 break;
             if (!replaceHydraulicReferences(revision->uuid, network, error)) break;
+            if (profile)
+                indexed_ms = profile_clock.elapsed();
             if (!writeObjectGroupInTransaction(*revision, actor, QStringLiteral("edit"),
                                                QUuid(), expected_generation, error)) break;
+        }
+        if (profile)
+        {
+            if (after->generation == expected_generation)
+                indexed_ms = profile_clock.elapsed();
+            grouped_ms = profile_clock.elapsed();
         }
         ok = true;
     } while (false);
     if (ok) ok = commit(error);
     if (!ok) rollback();
+    if (ok && profile)
+    {
+        const qint64 total_ms = profile_clock.elapsed();
+        // Opt-in diagnostics, emitted once per save, never per object.
+        qInfo().noquote().nospace()
+            << "aowis_network_save_profile"
+            << " objects=" << requested.size()
+            << " fresh_insert=" << (used_fresh_insert ? 1 : 0)
+            << " validation_encode_ms=" << prepared_ms
+            << " lookup_ms=" << (looked_up_ms - prepared_ms)
+            << " writes_ms=" << (written_ms - looked_up_ms)
+            << " index_ms=" << (indexed_ms - written_ms)
+            << " group_ms=" << (grouped_ms - indexed_ms)
+            << " commit_ms=" << (total_ms - grouped_ms)
+            << " total_ms=" << total_ms;
+    }
     return ok;
 }
 

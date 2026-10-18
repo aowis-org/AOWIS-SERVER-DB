@@ -41,3 +41,24 @@ uses the whole-network save API. They intentionally measure different workloads.
 Database file bytes count the final SQLite file after closing the connection,
 not transient WAL peaks or process memory. Benchmarking PostgreSQL, concurrent
 editors, history growth, and peak memory remain separate follow-up work.
+
+## Profile a network save
+
+Set `AOWIS_DB_PROFILE_SAVE=1` to print a single phase summary per successful
+`saveHydraulicNetwork()` invocation. For example:
+
+```bash
+AOWIS_DB_PROFILE_SAVE=1 ./build-linux-tests/aowis-db-network-benchmark 10000
+```
+
+The `aowis_network_save_profile` line includes validation and serialization,
+transactional lookups, object/journal writes, membership/reference indexing,
+group-journal construction and commit. All times are wall-clock milliseconds;
+query planning, driver overhead and cache effects are included. The diagnostics
+are disabled by default. `fresh_insert=1` indicates an entirely new network
+using reusable prepared object/event statements. Updates to existing networks
+continue through the ordinary version-checked object mutation path.
+
+The journal still contains one immutable event per entity and one group per
+user-visible save. Compare both speed and SQLite file size across identical
+workloads before changing storage structures.

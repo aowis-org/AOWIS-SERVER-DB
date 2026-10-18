@@ -87,13 +87,14 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
     member_events.addBindValue(after->generation);
     if (!run(member_events, error))
         return std::nullopt;
+    QSqlQuery insert(this->database_);
+    if (!prepare(insert, QStringLiteral(
+            "INSERT INTO object_group_events(group_uuid,position,object_event_uuid) VALUES(?,?,?)"), error))
+        return std::nullopt;
+    insert.bindValue(0, this->backend_->bindUuid(group_uuid));
     qint64 position = 0;
     while (member_events.next())
     {
-        QSqlQuery insert(this->database_);
-        if (!prepare(insert, QStringLiteral(
-                "INSERT INTO object_group_events(group_uuid,position,object_event_uuid) VALUES(?,?,?)"), error))
-            return std::nullopt;
         // Convert through the backend: SQLite returns RFC-4122 BLOBs, while
         // PostgreSQL returns native UUID values. Never forward a raw driver
         // QVariant from one query as an unvalidated UUID parameter.
@@ -103,9 +104,8 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
             fail(error, QStringLiteral("Invalid object-event UUID in group journal"));
             return std::nullopt;
         }
-        insert.addBindValue(this->backend_->bindUuid(group_uuid));
-        insert.addBindValue(position);
-        insert.addBindValue(this->backend_->bindUuid(event_uuid));
+        insert.bindValue(1, position);
+        insert.bindValue(2, this->backend_->bindUuid(event_uuid));
         if (!run(insert, error))
             return std::nullopt;
         ++position;
