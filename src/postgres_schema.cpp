@@ -556,6 +556,49 @@ BEGIN
 END
 $aowis$)SQL",
     R"SQL(CREATE TRIGGER immutable_revision_identity BEFORE UPDATE ON revisions FOR EACH ROW EXECUTE FUNCTION aowis_guard_immutable_revision_identity())SQL",
+    // The application validates a complete new hydraulic network before
+    // entering this function. It does not bypass the normal row triggers:
+    // revision generation and each immutable journal event still advance
+    // together, one object at a time. A JSON array merely amortizes QPSQL
+    // client/server round trips; all writes share the caller's transaction.
+    R"SQL(CREATE FUNCTION aowis_insert_fresh_network_objects(
+        p_revision_uuid UUID, p_actor_uuid UUID, p_rows JSONB)
+    RETURNS BIGINT LANGUAGE plpgsql AS $aowis$
+DECLARE
+    item RECORD;
+    content_bytes BYTEA;
+    next_generation BIGINT;
+    inserted_count BIGINT := 0;
+BEGIN
+    IF jsonb_typeof(p_rows) IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'expected fresh-network JSON array' USING ERRCODE = '22023';
+    END IF;
+    FOR item IN
+        SELECT value FROM jsonb_array_elements(p_rows) WITH ORDINALITY AS incoming(value, ordinal)
+        ORDER BY ordinal
+    LOOP
+        content_bytes := decode(item.value->>'content_b64', 'base64');
+        INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted)
+        VALUES (p_revision_uuid,(item.value->>'object_uuid')::UUID,
+                item.value->>'kind',content_bytes,1,0);
+        UPDATE revisions SET generation=generation+1
+        WHERE uuid=p_revision_uuid AND state='working'
+        RETURNING generation INTO next_generation;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'working revision generation conflict' USING ERRCODE = '23514';
+        END IF;
+        INSERT INTO object_events(uuid,revision_uuid,object_uuid,actor_uuid,
+            sequence,occurred_at_ms,kind,action,before_version,after_version,
+            before_content,after_content,before_deleted)
+        VALUES ((item.value->>'event_uuid')::UUID,p_revision_uuid,
+                (item.value->>'object_uuid')::UUID,p_actor_uuid,next_generation,
+                (item.value->>'occurred_at_ms')::BIGINT,item.value->>'kind',
+                'put',-1,1,NULL,content_bytes,1);
+        inserted_count := inserted_count+1;
+    END LOOP;
+    RETURN inserted_count;
+END
+$aowis$)SQL",
     R"SQL(CREATE FUNCTION aowis_guard_object_event_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM revisions r WHERE r.uuid=NEW.revision_uuid
@@ -1006,6 +1049,11 @@ bool PostgresBackend::verifySchema(const QSqlDatabase &database, QString *error)
     // Check every expected name, not merely the aggregate count: a damaged
     // database must not silently lose a security or immutability guard.
     return checkObjects(database, QStringLiteral(
+        "SELECT proname FROM pg_catalog.pg_proc p "
+        "JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace "
+        "WHERE n.nspname=current_schema()"),
+        {QStringLiteral("aowis_insert_fresh_network_objects")}, error) &&
+           checkObjects(database, QStringLiteral(
         "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname=current_schema()"), tables, error) &&
            checkObjects(database, QStringLiteral(
         "SELECT indexname FROM pg_catalog.pg_indexes WHERE schemaname=current_schema()"), indexes, error) &&

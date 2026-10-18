@@ -1,4 +1,5 @@
 #include <aowis/db/model_persistence.h>
+#include <aowis/db/model_validation.h>
 #include <aowis/model/uuid.h>
 
 #include <QCoreApplication>
@@ -64,7 +65,29 @@ bool indexedObjectLookups(QSqlDatabase &database)
                           (plan.contains(QStringLiteral("PRIMARY KEY")) ||
                            plan.contains(QStringLiteral("INDEX")));
     }
-    return object_indexed && member_indexed;
+    // The existing-network read must use both the membership-by-network
+    // index and revision_objects primary key; otherwise large unchanged
+    // saves could degrade into full-revision scans.
+    QSqlQuery joined(database);
+    if (!joined.exec(QStringLiteral(
+            "EXPLAIN QUERY PLAN SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
+            "FROM hydraulic_network_members m JOIN revision_objects o "
+            "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
+            "WHERE m.revision_uuid=x'00' AND m.network_uuid=x'01'")))
+        return false;
+    bool indexed_members = false;
+    bool indexed_objects = false;
+    while (joined.next())
+    {
+        const QString plan = joined.value(3).toString().toUpper();
+        if (plan.contains(QStringLiteral("SEARCH")) &&
+            plan.contains(QStringLiteral("INDEX")))
+        {
+            indexed_members |= plan.contains(QStringLiteral(" M "));
+            indexed_objects |= plan.contains(QStringLiteral(" O "));
+        }
+    }
+    return object_indexed && member_indexed && indexed_members && indexed_objects;
 }
 } // namespace
 
@@ -100,6 +123,27 @@ int main(int argc, char **argv)
     REQUIRE(db.putObject(actor, branch, generic_uuid,
                          QStringLiteral("generic.annotation"), QByteArray("keep"), -1, &error));
     generation = db.revision(actor, revision, &error)->generation;
+
+    // The indexed-member read must still inspect UUIDs newly added to the
+    // network. An unrelated generic object cannot be silently overwritten.
+    NetworkHydraulic colliding = large;
+    HydraulicNodeJunction borrowed;
+    borrowed.uuid = generic_uuid;
+    borrowed.id = QStringLiteral("borrowed-generic-id");
+    colliding.nodes_junctions.append(borrowed);
+    REQUIRE(aowis::db::validateHydraulicNetwork(colliding).valid());
+    REQUIRE(!db.saveHydraulicNetwork(actor, branch, generation, colliding, &error));
+    REQUIRE(db.revision(actor, revision, &error)->generation == generation);
+
+    // Ownership checks must still reject newly introduced UUIDs that belong
+    // to a different hydraulic network, not just unrelated generic objects.
+    NetworkHydraulic foreign_collision = large;
+    HydraulicNodeJunction foreign_member = foreign.nodes_junctions.first();
+    foreign_member.id = QStringLiteral("borrowed-foreign-id");
+    foreign_collision.nodes_junctions.append(foreign_member);
+    REQUIRE(aowis::db::validateHydraulicNetwork(foreign_collision).valid());
+    REQUIRE(!db.saveHydraulicNetwork(actor, branch, generation, foreign_collision, &error));
+    REQUIRE(db.revision(actor, revision, &error)->generation == generation);
 
     REQUIRE(db.saveHydraulicNetwork(actor, branch, generation, large, &error));
     REQUIRE(db.revision(actor, revision, &error)->generation == generation);

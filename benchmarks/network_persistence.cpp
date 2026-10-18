@@ -3,12 +3,113 @@
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QDebug>
 #include <QFileInfo>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
 #include <QTemporaryDir>
 #include <QTextStream>
 
 #include <cstdio>
 #include <optional>
+
+namespace
+{
+// The environment variable deliberately identifies a dedicated *test*
+// database, never AOWIS's configured operational database. Only the new,
+// randomly named benchmark schema is created and dropped.
+class TemporaryPostgresSchema final
+{
+public:
+    ~TemporaryPostgresSchema()
+    {
+        if (this->created_ && this->connection_.isOpen())
+        {
+            // DROP ... CASCADE lists every schema object as a NOTICE.
+            // Avoid hundreds of distracting lines in benchmark output.
+            QSqlQuery quiet(this->connection_);
+            quiet.exec(QStringLiteral("SET client_min_messages TO warning"));
+            QSqlQuery drop(this->connection_);
+            if (!drop.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(this->schema_name_)))
+                qWarning().noquote() << "Cannot remove temporary benchmark schema:"
+                                     << this->schema_name_ << drop.lastError().text();
+        }
+        if (this->connection_.isValid())
+        {
+            this->connection_.close();
+            this->connection_ = QSqlDatabase();
+            QSqlDatabase::removeDatabase(this->connection_name_);
+        }
+    }
+
+    bool create(QString *error)
+    {
+        const QByteArray selected_database = qgetenv("AOWIS_DB_TEST_PG_DB");
+        if (selected_database.isEmpty())
+        {
+            *error = QStringLiteral("--postgres requires AOWIS_DB_TEST_PG_DB for a dedicated disposable test database");
+            return false;
+        }
+        if (!QSqlDatabase::isDriverAvailable(QStringLiteral("QPSQL")))
+        {
+            *error = QStringLiteral("Qt QPSQL driver is unavailable");
+            return false;
+        }
+        this->database_name_ = QString::fromUtf8(selected_database);
+        this->schema_name_ = QStringLiteral("aowis_benchmark_") +
+            createUuidV7().toString(QUuid::Id128);
+        this->connection_name_ = QStringLiteral("aowis-benchmark-schema-") +
+            createUuidV7().toString(QUuid::Id128);
+        this->connection_ = QSqlDatabase::addDatabase(QStringLiteral("QPSQL"), this->connection_name_);
+        this->connection_.setDatabaseName(this->database_name_);
+        // libpq reads PGHOST, PGPORT, PGUSER, PGPASSWORD and related settings.
+        if (!this->connection_.open())
+        {
+            *error = this->connection_.lastError().text();
+            return false;
+        }
+        QSqlQuery create(this->connection_);
+        if (!create.exec(QStringLiteral("CREATE SCHEMA %1").arg(this->schema_name_)))
+        {
+            *error = create.lastError().text();
+            return false;
+        }
+        this->created_ = true;
+        return true;
+    }
+
+    QString databaseName() const { return this->database_name_; }
+    QString schemaName() const { return this->schema_name_; }
+
+    std::optional<qint64> storageBytes(QString *error) const
+    {
+        QSqlQuery size(this->connection_);
+        if (!size.prepare(QStringLiteral(
+                "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0) "
+                "FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid "
+                "WHERE n.nspname = ? AND c.relkind IN ('r', 'm')")))
+        {
+            *error = size.lastError().text();
+            return std::nullopt;
+        }
+        size.addBindValue(this->schema_name_);
+        if (!size.exec() || !size.next())
+        {
+            *error = size.lastError().text();
+            return std::nullopt;
+        }
+        return size.value(0).toLongLong();
+    }
+
+private:
+    QString database_name_;
+    QString schema_name_;
+    QString connection_name_;
+    QSqlDatabase connection_;
+    bool created_ = false;
+};
+}
 
 // An opt-in measurement tool, not a pass/fail CTest. Timing depends on the
 // filesystem, host hardware, Qt build, network size and database contents.
@@ -20,19 +121,36 @@ int main(int argc, char **argv)
     QTextStream output(stdout);
     QTextStream errors(stderr);
     const QStringList arguments = app.arguments();
-    if (arguments.size() > 2 || (arguments.size() == 2 && arguments.at(1) == QStringLiteral("--help")))
+    bool postgres = false;
+    bool has_count = false;
+    int count = 1000;
+    for (int index = 1; index < arguments.size(); ++index)
     {
-        output << "Usage: aowis-db-network-benchmark [PIPE_COUNT]\n"
-                  "Default PIPE_COUNT: 1000; allowed range: 1..100000.\n"
-                  "Uses an isolated temporary SQLite database.\n";
-        return arguments.size() == 2 && arguments.at(1) == QStringLiteral("--help") ? 0 : 2;
-    }
-    bool number_ok = true;
-    const int count = arguments.size() == 2 ? arguments.at(1).toInt(&number_ok) : 1000;
-    if (!number_ok || count < 1 || count > 100000)
-    {
-        errors << "PIPE_COUNT must be an integer between 1 and 100000.\n";
-        return 2;
+        const QString argument = arguments.at(index);
+        if (argument == QStringLiteral("--help"))
+        {
+            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--postgres]\n"
+                      "Default PIPE_COUNT: 1000; allowed range: 1..100000.\n"
+                      "SQLite uses a temporary file. PostgreSQL requires a dedicated\n"
+                      "AOWIS_DB_TEST_PG_DB and libpq PG* connection settings;\n"
+                      "a random temporary schema is created and deleted.\n";
+            return 0;
+        }
+        if (argument == QStringLiteral("--postgres") && !postgres)
+        {
+            postgres = true;
+            continue;
+        }
+        bool number_ok = false;
+        const int parsed_count = argument.toInt(&number_ok);
+        if (has_count || !number_ok || parsed_count < 1 || parsed_count > 100000)
+        {
+            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--postgres]\n"
+                      "PIPE_COUNT must be an integer between 1 and 100000.\n";
+            return 2;
+        }
+        has_count = true;
+        count = parsed_count;
     }
 
     QString error;
@@ -48,8 +166,16 @@ int main(int argc, char **argv)
         return 1;
     }
     const QString db_path = directory.filePath(QStringLiteral("network.sqlite"));
+    TemporaryPostgresSchema postgres_schema;
     aowis::db::Database database;
-    if (!database.openSqlite(db_path, &error))
+    if (postgres)
+    {
+        if (!postgres_schema.create(&error))
+            return fail(QStringLiteral("Create isolated PostgreSQL schema"));
+        if (!database.openPostgres(postgres_schema.databaseName(), postgres_schema.schemaName(), &error))
+            return fail(QStringLiteral("Open PostgreSQL"));
+    }
+    else if (!database.openSqlite(db_path, &error))
         return fail(QStringLiteral("Open SQLite"));
     const std::optional<aowis::db::UserInfo> administrator =
         database.bootstrapAdministrator(QStringLiteral("benchmark-admin"), &error);
@@ -152,8 +278,14 @@ int main(int argc, char **argv)
     const qint64 verify_ms = timer.elapsed();
 
     database.close();
-    const qint64 file_bytes = QFileInfo(db_path).size();
-    output << "backend=sqlite\n"
+    std::optional<qint64> postgres_bytes;
+    if (postgres)
+    {
+        postgres_bytes = postgres_schema.storageBytes(&error);
+        if (!postgres_bytes)
+            return fail(QStringLiteral("Measure PostgreSQL schema storage"));
+    }
+    output << (postgres ? "backend=postgres\n" : "backend=sqlite\n")
            << "pipes=" << count << "\n"
            << "junctions=" << count << "\n"
            << "initial_save_ms=" << initial_save_ms << "\n"
@@ -162,8 +294,11 @@ int main(int argc, char **argv)
            << "single_entity_edit_ms=" << single_edit_ms << "\n"
            << "finalize_ms=" << finalize_ms << "\n"
            << "create_branch_ms=" << branch_ms << "\n"
-           << "verify_history_ms=" << verify_ms << "\n"
-           << "sqlite_file_bytes=" << file_bytes << "\n";
+           << "verify_history_ms=" << verify_ms << "\n";
+    if (postgres)
+        output << "postgres_schema_bytes=" << *postgres_bytes << "\n";
+    else
+        output << "sqlite_file_bytes=" << QFileInfo(db_path).size() << "\n";
     output.flush();
     return 0;
 }

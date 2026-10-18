@@ -249,10 +249,12 @@ read from stdin, not from the process argument list.
 
 ## Performance measurements
 
-An optional [SQLite network benchmark](docs/performance.md) measures storage,
-network load, single-entity edits, finalization and branch creation at selected
-network sizes. It runs separately from CTest, so large workloads never slow the
-normal regression suite.
+An optional [SQLite and PostgreSQL network benchmark](docs/performance.md)
+measures storage, network load, single-entity edits, finalization and branch
+creation at selected network sizes. PostgreSQL can be benchmarked using
+`./tools/benchmark_network_postgres.sh 10000`, which starts and removes an
+isolated Docker test instance. Both modes run separately from CTest, so large
+workloads never slow the normal regression suite.
 
 ## Tests: SQLite and real PostgreSQL
 

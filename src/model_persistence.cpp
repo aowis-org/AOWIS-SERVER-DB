@@ -11,6 +11,9 @@
 #include <QHash>
 #include <QSet>
 #include <QIODevice>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
@@ -110,6 +113,69 @@ bool fetchObjectsForNetworkSave(const StorageBackend &backend, const QSqlDatabas
     return true;
 }
 
+// Existing networks already have an ownership index keyed by revision and
+// network. Read their members in one indexed join rather than generating and
+// executing hundreds of IN-list queries for a large unchanged resave.
+//
+// Always fetch the root and newly introduced UUIDs separately: they are not
+// necessarily members yet, and an incoming UUID may already belong to an
+// unrelated generic object. If an index row is unexpectedly missing, fall
+// back to the primary-key lookup for that old UUID rather than treating an
+// existing object as an insertion. This retains the original collision and
+// version-check behavior without relying on index consistency for safety.
+bool fetchIndexedNetworkObjectsForSave(const StorageBackend &backend,
+                                       const QSqlDatabase &database,
+                                       const QUuid &revision_uuid,
+                                       const QUuid &network_uuid,
+                                       const QSet<QUuid> &old_ids,
+                                       const QSet<QUuid> &new_ids,
+                                       QHash<QUuid, ModelObject> &result,
+                                       QSet<QUuid> &unchecked_uuids,
+                                       QString *error)
+{
+    QSet<QUuid> missing = old_ids;
+    QSqlQuery query(database);
+    if (!query.prepare(QStringLiteral(
+            "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
+            "FROM hydraulic_network_members m "
+            "JOIN revision_objects o ON o.revision_uuid=m.revision_uuid "
+            "AND o.object_uuid=m.entity_uuid "
+            "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+    {
+        assignError(error, query.lastError().text());
+        return false;
+    }
+    query.addBindValue(backend.bindUuid(revision_uuid));
+    query.addBindValue(backend.bindUuid(network_uuid));
+    if (!query.exec())
+    {
+        assignError(error, query.lastError().text());
+        return false;
+    }
+    while (query.next())
+    {
+        const QUuid uuid = backend.readUuid(query.value(0));
+        if (!old_ids.contains(uuid))
+            continue;
+        result.insert(uuid, ModelObject{uuid, query.value(1).toString(),
+                      query.value(2).toByteArray(), query.value(3).toLongLong(),
+                      query.value(4).toBool()});
+        missing.remove(uuid);
+    }
+    query.finish();
+
+    // The indexed join proves ownership for every old UUID it returned:
+    // hydraulic_network_members has a unique (revision_uuid,entity_uuid)
+    // key, so an entity cannot simultaneously belong to another network.
+    // Explicitly check ownership only where that proof is unavailable:
+    // newly introduced UUIDs, the root, and missing/corrupt index entries.
+    unchecked_uuids = new_ids;
+    unchecked_uuids.subtract(old_ids);
+    unchecked_uuids.unite(missing);
+    return fetchObjectsForNetworkSave(backend, database, revision_uuid,
+                                      unchecked_uuids, result, error);
+}
+
 // The first insertion of a previously unknown network has no old object
 // versions to read or reconcile. The caller has already checked permissions,
 // revision generation, all incoming UUIDs and network-wide validation inside
@@ -145,6 +211,57 @@ bool insertFreshNetworkObjects(const StorageBackend &backend,
                 ? QStringLiteral("Cannot enable object mode") : mode.lastError().text());
             return false;
         }
+    }
+
+    // A Qt/QPSQL exec is a network round trip. Sending three statements for
+    // each entity (object, generation, event) dominates large fresh imports.
+    // The backend's guarded PL/pgSQL function performs exactly those same
+    // operations in the original order, within this transaction, using
+    // bounded JSON batches. Existing objects and SQLite retain their paths.
+    if (database.driverName() == QStringLiteral("QPSQL"))
+    {
+        QSqlQuery batch(database);
+        if (!batch.prepare(QStringLiteral(
+                "SELECT aowis_insert_fresh_network_objects("
+                "CAST(? AS UUID),CAST(? AS UUID),CAST(? AS JSONB))")))
+        {
+            assignError(error, batch.lastError().text());
+            return false;
+        }
+        constexpr qsizetype batch_size = 128;
+        for (qsizetype offset = 0; offset < records.size(); offset += batch_size)
+        {
+            const qsizetype count = qMin(batch_size, records.size() - offset);
+            QJsonArray rows;
+            for (qsizetype index = 0; index < count; ++index)
+            {
+                const StoredRecord &record = records.at(offset + index);
+                QJsonObject item;
+                item.insert(QStringLiteral("object_uuid"),
+                            record.uuid.toString(QUuid::WithoutBraces));
+                item.insert(QStringLiteral("event_uuid"),
+                            createUuidV7().toString(QUuid::WithoutBraces));
+                item.insert(QStringLiteral("kind"), record.kind);
+                item.insert(QStringLiteral("content_b64"),
+                            QString::fromLatin1(record.content.toBase64()));
+                item.insert(QStringLiteral("occurred_at_ms"),
+                            QString::number(QDateTime::currentMSecsSinceEpoch()));
+                rows.append(item);
+            }
+            batch.bindValue(0, revision_id);
+            batch.bindValue(1, actor_id);
+            batch.bindValue(2, QString::fromUtf8(
+                QJsonDocument(rows).toJson(QJsonDocument::Compact)));
+            if (!batch.exec() || !batch.next() || batch.value(0).toLongLong() != count)
+            {
+                assignError(error, batch.lastError().text().isEmpty()
+                    ? QStringLiteral("PostgreSQL fresh-network journal batch mismatch")
+                    : batch.lastError().text());
+                return false;
+            }
+            batch.finish();
+        }
+        return true;
     }
 
     QSqlQuery insert(database);
@@ -1119,6 +1236,8 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
     const qint64 prepared_ms = profile ? profile_clock.elapsed() : 0;
     if (!beginWrite(error))
         return false;
+    qint64 ownership_cost_ms = 0;
+    qint64 fetch_cost_ms = 0;
     qint64 looked_up_ms = prepared_ms;
     qint64 written_ms = prepared_ms;
     qint64 indexed_ms = prepared_ms;
@@ -1193,20 +1312,43 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
         QSet<QUuid> new_ids;
         for (const StoredRecord &item : requested)
             new_ids.insert(item.uuid);
-        if (!checkIncomingNetworkOwnership(*this->backend_, this->database_, revision->uuid,
-                                           network.uuid, new_ids, error))
-            break;
-
-        // Include previous members for version-checked deletions, even when
-        // they are absent from the new incoming root. Objects from unrelated
-        // networks (and unrelated generic records) are never deserialized.
-        QSet<QUuid> relevant_ids = new_ids;
-        relevant_ids.unite(old_ids);
+        // For an existing network, the membership-index join proves that
+        // each returned entity is owned by this network. Checking those same
+        // 20,000+ UUIDs again with bounded IN lists is redundant. Only new
+        // UUIDs and missing index entries need the separate collision query.
+        // A fresh network has no indexed members, so all UUIDs are checked.
         QHash<QUuid, ModelObject> existing;
-        if (!fetchObjectsForNetworkSave(*this->backend_, this->database_, revision->uuid,
-                                        relevant_ids, existing, error))
+        QSet<QUuid> ownership_to_check;
+        if (!old_ids.isEmpty())
+        {
+            const qint64 fetch_started = profile ? profile_clock.elapsed() : 0;
+            if (!fetchIndexedNetworkObjectsForSave(*this->backend_, this->database_,
+                                                    revision->uuid, network.uuid,
+                                                    old_ids, new_ids, existing,
+                                                    ownership_to_check, error))
+                break;
+            if (profile)
+                fetch_cost_ms += profile_clock.elapsed() - fetch_started;
+        }
+        else
+        {
+            ownership_to_check = new_ids;
+        }
+        const qint64 ownership_started = profile ? profile_clock.elapsed() : 0;
+        if (!checkIncomingNetworkOwnership(*this->backend_, this->database_, revision->uuid,
+                                           network.uuid, ownership_to_check, error))
             break;
-
+        if (profile)
+            ownership_cost_ms = profile_clock.elapsed() - ownership_started;
+        if (old_ids.isEmpty())
+        {
+            const qint64 fetch_started = profile ? profile_clock.elapsed() : 0;
+            if (!fetchObjectsForNetworkSave(*this->backend_, this->database_, revision->uuid,
+                                            new_ids, existing, error))
+                break;
+            if (profile)
+                fetch_cost_ms += profile_clock.elapsed() - fetch_started;
+        }
         if (profile)
             looked_up_ms = profile_clock.elapsed();
         const bool fresh_network = old_ids.isEmpty() && existing.isEmpty();
@@ -1320,6 +1462,8 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
             << " fresh_insert=" << (used_fresh_insert ? 1 : 0)
             << " validation_encode_ms=" << prepared_ms
             << " lookup_ms=" << (looked_up_ms - prepared_ms)
+            << " ownership_ms=" << ownership_cost_ms
+            << " fetch_ms=" << fetch_cost_ms
             << " writes_ms=" << (written_ms - looked_up_ms)
             << " index_ms=" << (indexed_ms - written_ms)
             << " membership_ms=" << (membership_ms - written_ms)

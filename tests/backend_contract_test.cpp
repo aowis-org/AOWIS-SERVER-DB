@@ -798,6 +798,29 @@ int main(int argc, char **argv)
                 REQUIRE_SQL(ddl, ddl.next());
                 REQUIRE(ddl.value(0).toInt() == 520);
                 ddl.finish();
+                // The server-side fresh-import batches still produce exactly
+                // one immutable event per object, strictly ordered across
+                // all 128-object batch boundaries, with one edit group.
+                const std::optional<aowis::db::RevisionInfo> batch_revision =
+                    reopened.revision(actor, batch_project->working_revision_uuid, &error);
+                REQUIRE(batch_revision.has_value() && batch_revision->generation == 522);
+                REQUIRE(reopened.objectGroupsForRevision(
+                    actor, batch_project->working_revision_uuid, &error).size() == 1);
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*),MIN(e.sequence),MAX(e.sequence),"
+                    "COUNT(DISTINCT ge.position) "
+                    "FROM object_group_events ge "
+                    "JOIN object_events e ON e.uuid=ge.object_event_uuid "
+                    "JOIN object_groups g ON g.uuid=ge.group_uuid "
+                    "WHERE g.revision_uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_project->working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() == 522);
+                REQUIRE(ddl.value(1).toLongLong() == 1);
+                REQUIRE(ddl.value(2).toLongLong() == 522);
+                REQUIRE(ddl.value(3).toLongLong() == 522);
+                ddl.finish();
                 reopened.close();
             }
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(core_schema)));
