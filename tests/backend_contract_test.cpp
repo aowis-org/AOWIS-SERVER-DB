@@ -130,7 +130,12 @@ int main(int argc, char **argv)
     aowis::db::PostgresBackend postgres_adapter;
     aowis::db::StorageBackend &postgres_contract = postgres_adapter;
     REQUIRE(postgres_contract.bindUuid(id).metaType().id() == QMetaType::QUuid);
+    // Qt's SQL result layer treats a null QUuid as SQL NULL. The all-zero
+    // UUID must instead bind as its non-NULL text representation.
+    REQUIRE(postgres_contract.bindUuid(QUuid()).metaType().id() == QMetaType::QString);
     REQUIRE(!postgres_contract.bindUuid(QUuid()).isNull());
+    REQUIRE(postgres_contract.bindUuid(QUuid()).toString() ==
+            QStringLiteral("00000000-0000-0000-0000-000000000000"));
     REQUIRE(postgres_contract.readUuid(postgres_contract.bindUuid(id)) == id);
     REQUIRE(postgres_contract.readUuid(postgres_contract.bindUuid(QUuid())).isNull());
     REQUIRE(postgres_contract.readUuid(QVariant()).isNull());
@@ -143,10 +148,15 @@ int main(int argc, char **argv)
     // PostgreSQL schema creation and verification are exercised on an
     // isolated transaction if a live test database is provided below.
 
-    // Optional integration test: set AOWIS_DB_TEST_PG_DB to the name of an
-    // existing test database. libpq reads PGHOST, PGUSER and credentials from
-    // the environment or .pgpass. No permanent tables are created or dropped.
+    // Live integration: compile_linux_tests.sh supplies a disposable Docker
+    // PostgreSQL database automatically, or uses a dedicated external test
+    // database. If AOWIS_DB_TEST_PG_REQUIRED=1, a missing database is a test
+    // failure rather than an accidental skip. PostgreSQL schemas are isolated.
     const QByteArray pg_database_name = qgetenv("AOWIS_DB_TEST_PG_DB");
+    // Test-runner/CI guarantee: never report green if live PostgreSQL was
+    // required but its connection settings were accidentally not passed on.
+    if (qgetenv("AOWIS_DB_TEST_PG_REQUIRED") == QByteArray("1"))
+        REQUIRE(!pg_database_name.isEmpty());
     if (!pg_database_name.isEmpty())
     {
         const QString pg_connection_name = QStringLiteral("backend-contract-postgres");
@@ -176,16 +186,35 @@ int main(int argc, char **argv)
                 pg_query.addBindValue(postgres_contract.bindUuid(QUuid()));
                 REQUIRE_SQL(pg_query, pg_query.exec());
                 pg_query.finish();
+                // SQL NULL must remain distinct from the all-zero UUID.
                 REQUIRE_SQL(pg_query, pg_query.exec(QStringLiteral(
-                    "SELECT object_uuid, pg_typeof(object_uuid)::text "
+                    "INSERT INTO aowis_v62_uuid_probe (ordinal, object_uuid) VALUES (3, NULL)")));
+                pg_query.finish();
+                REQUIRE_SQL(pg_query, pg_query.exec(QStringLiteral(
+                    "SELECT object_uuid::text, object_uuid IS NULL, "
+                    "pg_typeof(object_uuid)::text "
                     "FROM aowis_v62_uuid_probe ORDER BY ordinal")));
                 REQUIRE_SQL(pg_query, pg_query.next());
-                REQUIRE(postgres_contract.readUuid(pg_query.value(0)) == id);
-                REQUIRE(pg_query.value(1).toString() == QStringLiteral("uuid"));
+                REQUIRE(pg_query.value(0).toString() == id.toString(QUuid::WithoutBraces));
+                REQUIRE(!pg_query.value(1).toBool());
+                REQUIRE(pg_query.value(2).toString() == QStringLiteral("uuid"));
                 REQUIRE_SQL(pg_query, pg_query.next());
-                REQUIRE(!pg_query.value(0).isNull());
-                REQUIRE(postgres_contract.readUuid(pg_query.value(0)).isNull());
+                REQUIRE(pg_query.value(0).toString() ==
+                        QStringLiteral("00000000-0000-0000-0000-000000000000"));
+                REQUIRE(!pg_query.value(1).toBool());
+                REQUIRE(pg_query.value(2).toString() == QStringLiteral("uuid"));
+                REQUIRE_SQL(pg_query, pg_query.next());
+                REQUIRE(pg_query.value(0).isNull());
+                REQUIRE(pg_query.value(1).toBool());
                 REQUIRE_SQL(pg_query, !pg_query.next());
+                pg_query.finish();
+                // The sentinel must also work as a bound UUID predicate.
+                REQUIRE_SQL(pg_query, pg_query.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM aowis_v62_uuid_probe WHERE object_uuid = ?")));
+                pg_query.addBindValue(postgres_contract.bindUuid(QUuid()));
+                REQUIRE_SQL(pg_query, pg_query.exec());
+                REQUIRE_SQL(pg_query, pg_query.next());
+                REQUIRE(pg_query.value(0).toInt() == 1);
                 pg_query.finish();
             }
             postgres_contract.rollback(pg_connection);

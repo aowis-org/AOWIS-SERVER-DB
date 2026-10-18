@@ -1,0 +1,23 @@
+# Disposable PostgreSQL instance exclusively for the AOWIS database tests.
+# The test runner assigns a unique Compose project name for each invocation.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: aowis_test
+      POSTGRES_USER: aowis_test
+      POSTGRES_PASSWORD: aowis_test_only_local
+    ports:
+      # A random host port avoids clashing with a developer's PostgreSQL.
+      # Never expose this disposable test database to the network.
+      - "127.0.0.1::5432"
+    tmpfs:
+      # No persistent DB volumes or production data can be left behind.
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aowis_test -d aowis_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: "no"

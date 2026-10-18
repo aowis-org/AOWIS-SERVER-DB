@@ -38,8 +38,12 @@ PostgresBackend::PostgresBackend(const QString &schema_name)
 
 QVariant PostgresBackend::bindUuid(const QUuid &uuid) const
 {
-    // QPSQL understands QUuid as PostgreSQL's native uuid, not BYTEA.
-    // In particular, QUuid() remains an all-zero UUID, not SQL NULL.
+    // QSqlResultPrivate::isVariantNull() treats a null QUuid as SQL NULL,
+    // even though AOWIS sometimes intentionally stores the all-zero UUID.
+    // Bind that one value as UUID text instead; PostgreSQL infers the native
+    // uuid type from the target column or comparison expression.
+    if (uuid.isNull())
+        return QVariant(uuid.toString(QUuid::WithoutBraces));
     return QVariant::fromValue(uuid);
 }
 

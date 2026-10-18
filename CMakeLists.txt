@@ -6,6 +6,10 @@ include(CTest)
 find_package(Qt6 REQUIRED COMPONENTS Core Sql)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
+# System-service builds use /etc for configuration and /var for writable data.
+# Normal desktop/embedded builds use Qt's platform-specific AppDataLocation.
+option(AOWIS_DB_SERVER_MODE "Use system service configuration paths" OFF)
+
 # Reuse the UUIDv7 implementation already owned by AOWIS-SERVER-MODEL.
 # The pinned Git submodule under external/ is the default.
 # Parent builds may already provide AOWIS::Model.
@@ -53,6 +57,8 @@ endif()
 
 
 add_library(aowis-db-core STATIC
+    include/aowis/db/configuration.h
+    src/configuration.cpp
     include/aowis/db/database.h
     include/aowis/db/identity.h
     src/identity.cpp
@@ -87,6 +93,9 @@ add_library(aowis-db-core STATIC
 add_library(AOWIS::DB ALIAS aowis-db-core)
 
 target_compile_features(aowis-db-core PUBLIC cxx_std_20)
+if(AOWIS_DB_SERVER_MODE)
+    target_compile_definitions(aowis-db-core PUBLIC AOWIS_DB_SERVER_MODE=1)
+endif()
 target_include_directories(aowis-db-core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -139,6 +148,7 @@ if(BUILD_TESTING)
         set_property(GLOBAL APPEND PROPERTY AOWIS_DB_TEST_EXECUTABLES ${target})
     endfunction()
 
+    aowis_add_db_test(aowis-db-configuration-tests aowis-db-configuration tests/configuration_test.cpp)
     aowis_add_db_test(aowis-db-sqlite-tests aowis-db-sqlite tests/sqlite_test.cpp)
     aowis_add_db_test(aowis-db-backend-contract-tests aowis-db-backend-contract tests/backend_contract_test.cpp)
     aowis_add_db_test(aowis-db-history-tests aowis-db-history tests/history_test.cpp)

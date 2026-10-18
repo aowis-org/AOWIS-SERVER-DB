@@ -46,6 +46,19 @@ coverage checks.
 ./compile_linux_tests.sh
 ```
 
+The Linux test script now provisions an isolated PostgreSQL Docker Compose
+instance by default when Docker is available, and runs the existing live
+PostgreSQL backend-contract coverage. Use
+`AOWIS_DB_TEST_POSTGRES=required ./compile_linux_tests.sh` to require it in CI,
+or `AOWIS_DB_TEST_POSTGRES=off` to skip explicitly. See
+[PostgreSQL Compose tests](docs/postgresql-compose-tests-v69.md).
+
+The server reads a Qt `QSettings` INI file with default database and log
+paths, both overridable. See [configuration](docs/configuration-v68.md).
+Build with `-DAOWIS_DB_SERVER_MODE=ON` for Linux system configuration at
+`/etc/aowis-server-db/config.ini`; writable data and logs default under
+`/var/lib/aowis-server-db` and `/var/log/aowis-server-db`.
+
 `./tools/zip_db.sh` produces `../db.zip` for development review.
 
 For architectural and feature details, see [architecture](docs/architecture.md),
@@ -55,7 +68,8 @@ For architectural and feature details, see [architecture](docs/architecture.md),
 PostgreSQL has an initial public `Database::openPostgres(database, schema)` path
 ([V65](docs/postgresql-core-v65.md)), using the same core and authorization
 logic as SQLite. Full feature parity is **not yet verified**: the live
-PostgreSQL integration test is optional and must be run against a dedicated
-test database before relying on PostgreSQL. SQLite remains the default.
+PostgreSQL integration test is now run through the Docker-based Linux test
+runner when available; it still needs live execution and broader validation
+before relying on PostgreSQL. SQLite remains the default.
 Complete non-hydraulic project persistence and production-grade HTTP deployment
 remain future work.
