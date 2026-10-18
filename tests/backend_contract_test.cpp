@@ -752,6 +752,52 @@ int main(int argc, char **argv)
                 REQUIRE(recovered->nodes_junctions.first().elevation_m == updated_junction.elevation_m);
                 REQUIRE(reopened.loadHydraulicNetwork(actor, design_branch->head_revision_uuid,
                                                      persisted_hydraulic_network, &error).has_value());
+
+                // Cover multiple 256-reference CTE batches and a partial last
+                // batch on QPSQL. Bound UUIDs inside VALUES must remain native
+                // PostgreSQL UUIDs; SQLite's BLOB representation is different.
+                const std::optional<aowis::db::ProjectCreation> batch_project =
+                    reopened.createProject(actor, QStringLiteral("PostgreSQL reference batches"), &error);
+                REQUIRE(batch_project.has_value());
+                NetworkHydraulic batch_network;
+                batch_network.uuid = createUuidV7();
+                batch_network.id = QStringLiteral("PG-REFERENCE-BATCH");
+                HydraulicNodeReservoir batch_source;
+                batch_source.uuid = createUuidV7();
+                batch_source.id = QStringLiteral("BATCH-SOURCE");
+                batch_network.nodes_reservoirs.append(batch_source);
+                for (int i = 0; i < 260; ++i)
+                {
+                    HydraulicNodeJunction node;
+                    node.uuid = createUuidV7();
+                    node.id = QStringLiteral("BATCH-J-%1").arg(i);
+                    batch_network.nodes_junctions.append(node);
+                    HydraulicLinkPipe link;
+                    link.uuid = createUuidV7();
+                    link.id = QStringLiteral("BATCH-P-%1").arg(i);
+                    link.node_uuid_from = batch_source.uuid;
+                    link.node_uuid_to = node.uuid;
+                    link.length_measured_m = 100.0;
+                    link.diameter_mm = 150.0;
+                    batch_network.links_pipes.append(link);
+                }
+                REQUIRE(reopened.saveHydraulicNetwork(actor, batch_project->main_branch_uuid,
+                                                      0, batch_network, &error));
+                const std::optional<NetworkHydraulic> reloaded_batch =
+                    reopened.loadHydraulicNetwork(actor, batch_project->working_revision_uuid,
+                                                  batch_network.uuid, &error);
+                REQUIRE(reloaded_batch.has_value());
+                REQUIRE(reloaded_batch->links_pipes.size() == 260);
+                REQUIRE(reloaded_batch->nodes_junctions.size() == 260);
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM hydraulic_network_references "
+                    "WHERE revision_uuid=? AND network_uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_project->working_revision_uuid));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_network.uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toInt() == 520);
+                ddl.finish();
                 reopened.close();
             }
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(core_schema)));

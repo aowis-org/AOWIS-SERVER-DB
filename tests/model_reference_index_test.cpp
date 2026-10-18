@@ -195,8 +195,9 @@ int main(int argc, char **argv)
     REQUIRE(db.openSqlite(file, &error));
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
 
-    // More than 64 references exercises multi-row inserts rather than the
-    // small-delta path. Check ordered group links and stored membership too.
+    // More than 512 references exercises two full fresh-network batches and
+    // a remainder. Duplicate graph references must be stored only once.
+    // Check ordered group links and stored membership as well.
     const std::optional<aowis::db::ProjectCreation> batch_project =
         db.createProject(actor, QStringLiteral("Reference batch"), &error);
     REQUIRE(batch_project.has_value());
@@ -205,8 +206,12 @@ int main(int argc, char **argv)
     HydraulicNodeReservoir large_source;
     large_source.uuid = createUuidV7();
     large_network.nodes_reservoirs.append(large_source);
+    large_network.options_report.selection_nodes.mode =
+        HydraulicSimulationReportSelectionMode::Selected;
+    large_network.options_report.selection_nodes.uuids.append(large_source.uuid);
+    large_network.options_report.selection_nodes.uuids.append(large_source.uuid);
     QUuid previous_node = large_source.uuid;
-    for (int index = 0; index < 75; ++index)
+    for (int index = 0; index < 265; ++index)
     {
         HydraulicNodeJunction next;
         next.uuid = createUuidV7();
@@ -221,7 +226,7 @@ int main(int argc, char **argv)
     REQUIRE(db.saveHydraulicNetwork(actor, batch_project->main_branch_uuid, 0, large_network, &error));
     const QVector<aowis::db::ObjectChange> large_history = db.objectHistoryForRevision(
         actor, batch_project->working_revision_uuid, &error);
-    REQUIRE(large_history.size() == 152);
+    REQUIRE(large_history.size() == 532);
     const QVector<aowis::db::ObjectGroup> large_groups = db.objectGroupsForRevision(
         actor, batch_project->working_revision_uuid, &error);
     REQUIRE(large_groups.size() == 1);
@@ -243,7 +248,9 @@ int main(int argc, char **argv)
         count.addBindValue(batch_project->working_revision_uuid.toRfc4122());
         count.addBindValue(large_network.uuid.toRfc4122());
         REQUIRE(count.exec() && count.next());
-        REQUIRE(count.value(0).toInt() == 150);
+        REQUIRE(count.value(0).toInt() == 531);
+        REQUIRE(referenceCount(inspector, batch_project->working_revision_uuid,
+                               large_source.uuid) == 2); // first pipe + unique report selection
         REQUIRE(referenceUuidStorage(inspector, batch_project->working_revision_uuid,
                                      large_network.uuid, large_network.links_pipes.last().uuid,
                                      large_network.nodes_junctions.last().uuid));

@@ -67,9 +67,13 @@ workloads before changing storage structures.
 
 For fresh networks, membership rows are selected directly from the newly
 committed object's event-sequence range, rather than inserting one row per
-member. Initial reference rows use standard multi-row SQL inserts with batches
-of 64 (320 parameters, under SQLite's historical 999-placeholder limit).
-Incremental network edits retain their existing reference-delta handling.
+member. Fresh-network references skip the empty-index lookup and insert the unique
+validated references in batches of up to 256. Each batch binds the revision
+and network IDs once, then source UUID, target UUID and field per reference;
+770 parameters remain below SQLite's historical 999-placeholder limit.
+Both SQLite and PostgreSQL use the same `WITH ... VALUES ... INSERT SELECT`
+statement. Existing-network edits retain the reference-delta logic, including
+their 64-row insert path.
 
 Grouped-history links are populated with an ordered `INSERT ... SELECT` using
 `ROW_NUMBER()`, on SQLite and PostgreSQL. The insertion count must exactly

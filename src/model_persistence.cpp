@@ -795,6 +795,94 @@ bool restoreList(QList<T> &target, const QList<QUuid> &uuids,
     return true;
 }
 
+// A first-time network has no reference rows to reconcile. Insert the
+// validated graph's unique references directly, without querying an empty
+// index or unpacking UUIDs from encoded diff keys. Keep batches below the
+// legacy SQLite 999-parameter limit (2 owner IDs + 256 * 3 references).
+// Both SQLite and PostgreSQL support the CTE/VALUES/INSERT SELECT syntax.
+// PostgreSQL needs explicit UUID casts for values passed through a CTE:
+// QPSQL can otherwise expose its bound values as text, unlike a direct INSERT
+// into a UUID-typed target column. SQLite must retain its BLOB UUID bindings.
+// The caller owns the write transaction, so any failed batch rolls back all
+// object, journal, membership and reference changes together.
+bool insertFreshHydraulicReferences(const StorageBackend &backend,
+                                    const QSqlDatabase &database,
+                                    const QUuid &revision_uuid,
+                                    const NetworkHydraulic &network,
+                                    QString *error)
+{
+    const QVector<HydraulicReference> references = hydraulicReferences(network);
+    if (references.isEmpty())
+        return true;
+
+    QSet<QByteArray> seen;
+    seen.reserve(references.size());
+    QVector<HydraulicReference> distinct;
+    distinct.reserve(references.size());
+    for (const HydraulicReference &reference : references)
+    {
+        QByteArray key = uuidBytes(reference.source_uuid);
+        key.append(uuidBytes(reference.target_uuid));
+        key.append(reference.field.toUtf8());
+        if (seen.contains(key))
+            continue;
+        seen.insert(std::move(key));
+        distinct.append(reference);
+    }
+
+    constexpr qsizetype batch_size = 256;
+    const QString uuid_parameter = database.driverName() == QStringLiteral("QPSQL")
+        ? QStringLiteral("CAST(? AS UUID)") : QStringLiteral("?");
+    const QVariant revision_value = backend.bindUuid(revision_uuid);
+    const QVariant network_value = backend.bindUuid(network.uuid);
+    QSqlQuery insert(database);
+    qsizetype prepared_size = 0;
+    for (qsizetype offset = 0; offset < distinct.size(); offset += batch_size)
+    {
+        const qsizetype count = qMin(batch_size, distinct.size() - offset);
+        if (count != prepared_size)
+        {
+            QString tuples;
+            tuples.reserve(count * 8);
+            for (qsizetype item = 0; item < count; ++item)
+            {
+                if (item != 0)
+                    tuples += QLatin1Char(',');
+                tuples += QStringLiteral("(%1,%1,?)").arg(uuid_parameter);
+            }
+            if (!insert.prepare(QStringLiteral(
+                    "WITH owner(revision_uuid,network_uuid) AS (VALUES (%1,%1)), "
+                    "incoming(source_uuid,target_uuid,field) AS (VALUES %2) "
+                    "INSERT INTO hydraulic_network_references "
+                    "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
+                    "SELECT owner.revision_uuid,owner.network_uuid,incoming.source_uuid,"
+                    "incoming.target_uuid,incoming.field FROM owner CROSS JOIN incoming"
+                    ).arg(uuid_parameter, tuples)))
+            {
+                assignError(error, insert.lastError().text());
+                return false;
+            }
+            prepared_size = count;
+        }
+        insert.bindValue(0, revision_value);
+        insert.bindValue(1, network_value);
+        for (qsizetype item = 0; item < count; ++item)
+        {
+            const HydraulicReference &reference = distinct.at(offset + item);
+            const qsizetype base = 2 + item * 3;
+            insert.bindValue(base, backend.bindUuid(reference.source_uuid));
+            insert.bindValue(base + 1, backend.bindUuid(reference.target_uuid));
+            insert.bindValue(base + 2, reference.field);
+        }
+        if (!insert.exec())
+        {
+            assignError(error, insert.lastError().text());
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 // References are derived from the validated Model graph, not authoritative
@@ -1196,7 +1284,14 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
             }
             if (profile)
                 membership_ms = profile_clock.elapsed();
-            if (!replaceHydraulicReferences(revision->uuid, network, error)) break;
+            if (fresh_network)
+            {
+                if (!insertFreshHydraulicReferences(*this->backend_, this->database_,
+                                                   revision->uuid, network, error))
+                    break;
+            }
+            else if (!replaceHydraulicReferences(revision->uuid, network, error))
+                break;
             if (profile)
                 indexed_ms = profile_clock.elapsed();
             if (!writeObjectGroupInTransaction(*revision, actor, QStringLiteral("edit"),
