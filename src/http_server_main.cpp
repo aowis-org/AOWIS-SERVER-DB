@@ -116,24 +116,32 @@ int main(int argc, char **argv)
     QTextStream output(stdout);
     const QStringList arguments = application.arguments();
     QString ini_file;
-    QStringList positionals;
+    QString sqlite_override;
+    const QString usage = QStringLiteral(
+        "Usage: aowis-server-db [--config ABSOLUTE_INI_FILE] [SQLITE_FILE]\n"
+        "SQLite file argument overrides Database/File for this run only.\n"
+        "In PostgreSQL mode, database selection comes exclusively from the INI.\n");
     for (int index = 1; index < arguments.size(); ++index)
     {
         const QString argument = arguments.at(index);
-        if (argument == QStringLiteral("--config") && index + 1 < arguments.size() && ini_file.isEmpty())
-            ini_file = arguments.at(++index);
-        else if (argument.startsWith(QStringLiteral("--")))
+        if (argument == QStringLiteral("--config"))
         {
-            errors << "Usage: aowis-db-server [--config ABSOLUTE_INI_FILE] [SQLITE_FILE [PORT]]\n";
+            if (!ini_file.isEmpty() || index + 1 == arguments.size() ||
+                arguments.at(index + 1).isEmpty() ||
+                arguments.at(index + 1).startsWith(QStringLiteral("--")))
+            {
+                errors << usage;
+                return 2;
+            }
+            ini_file = arguments.at(++index);
+        }
+        else if (argument.startsWith(QStringLiteral("--")) || !sqlite_override.isEmpty())
+        {
+            errors << usage;
             return 2;
         }
         else
-            positionals.append(argument);
-    }
-    if (positionals.size() > 2)
-    {
-        errors << "Usage: aowis-db-server [--config ABSOLUTE_INI_FILE] [SQLITE_FILE [PORT]]\n";
-        return 2;
+            sqlite_override = argument;
     }
 
     QString error;
@@ -144,21 +152,18 @@ int main(int argc, char **argv)
         errors << "Invalid configuration: " << error << "\n";
         return 2;
     }
-    QString sqlite_file = config->sqlite_file;
-    if (!positionals.isEmpty())
-        sqlite_file = positionals.at(0); // Preserve previous command-line behavior.
-    quint16 port = config->http_port;
-    if (positionals.size() == 2)
+    const bool use_postgres =
+        config->database_backend == aowis::db::Configuration::Backend::PostgreSQL;
+    if (use_postgres && !sqlite_override.isEmpty())
     {
-        bool ok = false;
-        const uint requested = positionals.at(1).toUInt(&ok);
-        if (!ok || requested == 0 || requested > 65535)
-        {
-            errors << "PORT must be between 1 and 65535.\n";
-            return 2;
-        }
-        port = static_cast<quint16>(requested);
+        errors << "A SQLite file override cannot be used with Database/Backend=postgres.\n";
+        return 2;
     }
+    // The INI selects the default database. A positional override is an
+    // explicit per-invocation convenience for SQLite, never persisted to INI.
+    const QString sqlite_file = sqlite_override.isEmpty() ? config->sqlite_file :
+        QDir::cleanPath(QFileInfo(sqlite_override).absoluteFilePath());
+    const quint16 port = config->http_port;
 
     ServerLog log;
     if (!log.open(config->log_file, &error))
@@ -166,17 +171,29 @@ int main(int argc, char **argv)
         errors << "Could not open log file '" << config->log_file << "': " << error << "\n";
         return 1;
     }
-    if (!QDir().mkpath(QFileInfo(sqlite_file).absolutePath()))
-    {
-        qCritical().noquote() << "Could not create database directory for" << sqlite_file;
-        return 1;
-    }
-
     aowis::db::Database database;
-    if (!database.openSqlite(sqlite_file, &error))
+    if (use_postgres)
     {
-        qCritical().noquote() << "Could not open database:" << error;
-        return 1;
+        // PostgreSQL's host, user and credentials come from libpq's PG*
+        // environment, service file or .pgpass, never from this INI.
+        if (!database.openPostgres(config->postgres_database, config->postgres_schema, &error))
+        {
+            qCritical().noquote() << "Could not open PostgreSQL database:" << error;
+            return 1;
+        }
+    }
+    else
+    {
+        if (!QDir().mkpath(QFileInfo(sqlite_file).absolutePath()))
+        {
+            qCritical().noquote() << "Could not create database directory for" << sqlite_file;
+            return 1;
+        }
+        if (!database.openSqlite(sqlite_file, &error))
+        {
+            qCritical().noquote() << "Could not open SQLite database:" << error;
+            return 1;
+        }
     }
 
     QHttpServer server;

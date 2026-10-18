@@ -1,7 +1,9 @@
+#include <aowis/db/configuration.h>
 #include <aowis/db/database.h>
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDir>
 #include <QFileInfo>
 #include <QStringList>
 #include <QTextStream>
@@ -9,69 +11,122 @@
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+    app.setOrganizationName(QStringLiteral("AOWIS"));
+    app.setApplicationName(QStringLiteral("AOWIS-SERVER-DB"));
     QTextStream output(stdout);
     QTextStream errors(stderr);
-    const QStringList args = app.arguments();
+    // Parse --config separately, leaving command operands independent of the
+    // chosen database backend. The INI is the sole source of DB parameters.
+    const QStringList supplied_arguments = app.arguments();
+    QStringList args{ supplied_arguments.first() };
+    QString ini_file;
+    for (int index = 1; index < supplied_arguments.size(); ++index)
+    {
+        const QString argument = supplied_arguments.at(index);
+        if (argument == QStringLiteral("--config"))
+        {
+            if (!ini_file.isEmpty() || index + 1 == supplied_arguments.size() ||
+                supplied_arguments.at(index + 1).isEmpty() ||
+                supplied_arguments.at(index + 1).startsWith(QStringLiteral("--")))
+            {
+                errors << "Expected one absolute INI file after --config.\n";
+                return 2;
+            }
+            ini_file = supplied_arguments.at(++index);
+        }
+        else if (argument.startsWith(QStringLiteral("--")))
+        {
+            errors << "Unknown option: " << argument << "\n";
+            return 2;
+        }
+        else
+            args.append(argument);
+    }
     const QString usage = QStringLiteral(
-        "Usage:\n"
-        "  aowis-db-admin bootstrap DB_FILE USERNAME\n"
-        "  aowis-db-admin issue DB_FILE ADMIN_UUID USER_UUID [LIFETIME_SECONDS]\n"
-        "  aowis-db-admin set-password DB_FILE ADMIN_UUID USER_UUID < PASSWORD_STDIN\n"
-        "  aowis-db-admin recover-password DB_FILE ADMIN_UUID USER_UUID [LIFETIME_SECONDS]\n"
-        "  aowis-db-admin revoke DB_FILE ADMIN_UUID SESSION_UUID\n"
-        "  aowis-db-admin disable-user DB_FILE ADMIN_UUID USER_UUID\n"
-        "  aowis-db-admin enable-user DB_FILE ADMIN_UUID USER_UUID\n"
-        "  aowis-db-admin remove-member DB_FILE ADMIN_UUID MEMBERSHIP_UUID\n"
-        "  aowis-db-admin revoke-role-permission DB_FILE ADMIN_UUID GRANT_UUID\n"
-        "  aowis-db-admin revoke-role-assignment DB_FILE ADMIN_UUID ASSIGNMENT_UUID\n"
-        "  aowis-db-admin audit DB_FILE ADMIN_UUID [AFTER_SEQUENCE [LIMIT]]\n"
-        "  aowis-db-admin audit-verify DB_FILE ADMIN_UUID\n"
-        "  aowis-db-admin redact-sessions DB_FILE ADMIN_UUID [MIN_AGE_DAYS [LIMIT]]\n"
-        "Local operator only: file-level SQLite access is trusted.\n"
+        "Usage: aowis-db-admin [--config ABSOLUTE_INI_FILE] COMMAND [ARGUMENTS...]\n"
+        "  aowis-db-admin bootstrap USERNAME\n"
+        "  aowis-db-admin issue ADMIN_UUID USER_UUID [LIFETIME_SECONDS]\n"
+        "  aowis-db-admin set-password ADMIN_UUID USER_UUID < PASSWORD_STDIN\n"
+        "  aowis-db-admin recover-password ADMIN_UUID USER_UUID [LIFETIME_SECONDS]\n"
+        "  aowis-db-admin revoke ADMIN_UUID SESSION_UUID\n"
+        "  aowis-db-admin disable-user ADMIN_UUID USER_UUID\n"
+        "  aowis-db-admin enable-user ADMIN_UUID USER_UUID\n"
+        "  aowis-db-admin remove-member ADMIN_UUID MEMBERSHIP_UUID\n"
+        "  aowis-db-admin revoke-role-permission ADMIN_UUID GRANT_UUID\n"
+        "  aowis-db-admin revoke-role-assignment ADMIN_UUID ASSIGNMENT_UUID\n"
+        "  aowis-db-admin audit ADMIN_UUID [AFTER_SEQUENCE [LIMIT]]\n"
+        "  aowis-db-admin audit-verify ADMIN_UUID\n"
+        "  aowis-db-admin redact-sessions ADMIN_UUID [MIN_AGE_DAYS [LIMIT]]\n"
+        "Database backend and location come from config.ini (SQLite by default).\n"
         "Capture issued tokens securely (umask 077); never publish or commit them.\n");
-    if (args.size() < 4)
+    if (args.size() < 3)
     {
         errors << usage;
         return 2;
     }
     const QString command = args.at(1);
-    const bool bootstrap = command == QStringLiteral("bootstrap") && args.size() == 4;
-    const bool issue = command == QStringLiteral("issue") && (args.size() == 5 || args.size() == 6);
-    const bool set_password = command == QStringLiteral("set-password") && args.size() == 5;
-    const bool recovery = command == QStringLiteral("recover-password") && (args.size() == 5 || args.size() == 6);
-    const bool revoke = command == QStringLiteral("revoke") && args.size() == 5;
-    const bool disable = command == QStringLiteral("disable-user") && args.size() == 5;
-    const bool enable = command == QStringLiteral("enable-user") && args.size() == 5;
-    const bool remove_member = command == QStringLiteral("remove-member") && args.size() == 5;
-    const bool revoke_permission = command == QStringLiteral("revoke-role-permission") && args.size() == 5;
-    const bool revoke_assignment = command == QStringLiteral("revoke-role-assignment") && args.size() == 5;
+    const bool bootstrap = command == QStringLiteral("bootstrap") && args.size() == 3;
+    const bool issue = command == QStringLiteral("issue") && (args.size() == 4 || args.size() == 5);
+    const bool set_password = command == QStringLiteral("set-password") && args.size() == 4;
+    const bool recovery = command == QStringLiteral("recover-password") && (args.size() == 4 || args.size() == 5);
+    const bool revoke = command == QStringLiteral("revoke") && args.size() == 4;
+    const bool disable = command == QStringLiteral("disable-user") && args.size() == 4;
+    const bool enable = command == QStringLiteral("enable-user") && args.size() == 4;
+    const bool remove_member = command == QStringLiteral("remove-member") && args.size() == 4;
+    const bool revoke_permission = command == QStringLiteral("revoke-role-permission") && args.size() == 4;
+    const bool revoke_assignment = command == QStringLiteral("revoke-role-assignment") && args.size() == 4;
     const bool audit = command == QStringLiteral("audit") &&
-                       (args.size() == 4 || args.size() == 5 || args.size() == 6);
-    const bool audit_verify = command == QStringLiteral("audit-verify") && args.size() == 4;
+                       (args.size() == 3 || args.size() == 4 || args.size() == 5);
+    const bool audit_verify = command == QStringLiteral("audit-verify") && args.size() == 3;
     const bool redact_sessions = command == QStringLiteral("redact-sessions") &&
-        (args.size() == 4 || args.size() == 5 || args.size() == 6);
+        (args.size() == 3 || args.size() == 4 || args.size() == 5);
     if (!bootstrap && !issue && !set_password && !recovery && !revoke && !disable && !enable && !remove_member &&
         !revoke_permission && !revoke_assignment && !audit && !audit_verify && !redact_sessions)
     {
         errors << usage;
         return 2;
     }
-    const QString file = args.at(2);
-    if (!bootstrap && !QFileInfo::exists(file))
+    QString error;
+    const std::optional<aowis::db::Configuration> config =
+        aowis::db::Configuration::load(ini_file, &error);
+    if (!config)
     {
-        errors << "Database file does not exist: " << file << "\n";
+        errors << "Invalid configuration: " << error << "\n";
         return 2;
     }
     aowis::db::Database database;
-    QString error;
-    if (!database.openSqlite(file, &error))
+    if (config->database_backend == aowis::db::Configuration::Backend::PostgreSQL)
     {
-        errors << "Unable to open database: " << error << "\n";
-        return 1;
+        // libpq supplies authentication and host/port configuration.
+        if (!database.openPostgres(config->postgres_database, config->postgres_schema, &error))
+        {
+            errors << "Unable to open PostgreSQL database: " << error << "\n";
+            return 1;
+        }
+    }
+    else
+    {
+        // A typo in the selected path must not create a second empty database
+        // during normal administrative operations.
+        if (!bootstrap && !QFileInfo::exists(config->sqlite_file))
+        {
+            errors << "Configured SQLite database does not exist: " << config->sqlite_file << "\n";
+            return 2;
+        }
+        if (bootstrap && !QDir().mkpath(QFileInfo(config->sqlite_file).absolutePath()))
+        {
+            errors << "Unable to create configured SQLite database directory.\n";
+            return 1;
+        }
+        if (!database.openSqlite(config->sqlite_file, &error))
+        {
+            errors << "Unable to open SQLite database: " << error << "\n";
+            return 1;
+        }
     }
     if (bootstrap)
     {
-        const std::optional<aowis::db::UserInfo> user = database.bootstrapAdministrator(args.at(3), &error);
+        const std::optional<aowis::db::UserInfo> user = database.bootstrapAdministrator(args.at(2), &error);
         if (!user)
         {
             errors << error << "\n";
@@ -80,7 +135,7 @@ int main(int argc, char **argv)
         output << user->uuid.toString(QUuid::WithoutBraces) << "\n";
         return 0;
     }
-    const QUuid administrator(args.at(3));
+    const QUuid administrator(args.at(2));
     if (administrator.isNull())
     {
         errors << "Invalid administrator UUID.\n";
@@ -92,15 +147,15 @@ int main(int argc, char **argv)
         bool valid = true;
         qint64 days = 30;
         int limit = 100;
-        if (args.size() >= 5)
-            days = args.at(4).toLongLong(&valid);
+        if (args.size() >= 4)
+            days = args.at(3).toLongLong(&valid);
         if (!valid || days < 0 || days > 3650)
         {
             errors << "Invalid minimum session age (0..3650 days).\n";
             return 2;
         }
-        if (args.size() == 6)
-            limit = args.at(5).toInt(&valid);
+        if (args.size() == 5)
+            limit = args.at(4).toInt(&valid);
         if (!valid || limit < 1 || limit > 500)
         {
             errors << "Invalid session-redaction batch limit (1..500).\n";
@@ -133,15 +188,15 @@ int main(int argc, char **argv)
         bool valid = true;
         qint64 after = 0;
         int limit = 100;
-        if (args.size() >= 5)
-            after = args.at(4).toLongLong(&valid);
+        if (args.size() >= 4)
+            after = args.at(3).toLongLong(&valid);
         if (!valid || after < 0)
         {
             errors << "Invalid audit sequence.\n";
             return 2;
         }
-        if (args.size() == 6)
-            limit = args.at(5).toInt(&valid);
+        if (args.size() == 5)
+            limit = args.at(4).toInt(&valid);
         if (!valid || limit < 1 || limit > 1000)
         {
             errors << "Invalid audit limit (1..1000).\n";
@@ -162,7 +217,7 @@ int main(int argc, char **argv)
         }
         return 0;
     }
-    const QUuid target(args.at(4));
+    const QUuid target(args.at(3));
     if (target.isNull())
     {
         errors << "Invalid target UUID.\n";
@@ -185,10 +240,10 @@ int main(int argc, char **argv)
     if (recovery)
     {
         qint64 lifetime_seconds = 900;
-        if (args.size() == 6)
+        if (args.size() == 5)
         {
             bool valid = false;
-            lifetime_seconds = args.at(5).toLongLong(&valid);
+            lifetime_seconds = args.at(4).toLongLong(&valid);
             if (!valid || lifetime_seconds < 1 || lifetime_seconds > 3600)
             {
                 errors << "Invalid recovery lifetime (1..3600 seconds).\n";
@@ -211,10 +266,10 @@ int main(int argc, char **argv)
     if (issue)
     {
         qint64 lifetime_seconds = 24 * 60 * 60;
-        if (args.size() == 6)
+        if (args.size() == 5)
         {
             bool ok = false;
-            lifetime_seconds = args.at(5).toLongLong(&ok);
+            lifetime_seconds = args.at(4).toLongLong(&ok);
             if (!ok)
             {
                 errors << "Invalid lifetime.\n";

@@ -483,7 +483,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V26: local password enrollment can exchange verified credentials for a
+    // Local password enrollment can exchange verified credentials for a
     // regular revocable bearer session. Never accept caller-supplied actor UUID.
     if (!server.route(QStringLiteral("/api/v1/session/login"), post,
                       [this](const QHttpServerRequest &request) {
@@ -515,7 +515,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V28: anonymous redemption of a short-lived recovery capability issued
+    // Anonymous redemption of a short-lived recovery capability issued
     // locally by a trusted administrator. No username or target user UUID is
     // accepted. The token is never logged, persisted in plaintext or reusable.
     if (!server.route(QStringLiteral("/api/v1/session/recover"), post,
@@ -544,7 +544,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V25: session self-service. The token is resolved by the DB itself;
+    // Session self-service. The token is resolved by the DB itself;
     // neither actor UUID nor session UUID can be supplied by the client.
     // The host's authenticator must also accept it, so these routes use the
     // same authentication boundary as all other protected API endpoints.
@@ -595,7 +595,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V32: revoke every other active session in one audited transaction.
+    // Revoke every other active session in one audited transaction.
     // Only the presented bearer selects the user; no user or session UUID
     // is accepted. This is deliberately separate from DELETE current.
     if (!server.route(QStringLiteral("/api/v1/session/revoke-others"), post,
@@ -626,7 +626,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V29: self-service management of the holder's OTHER sessions. Only an
+    // Self-service management of the holder's OTHER sessions. Only an
     // authenticated token decides whose sessions are visible or revocable.
     // Revoke does not accept a user UUID and never exposes token hashes.
     if (!server.route(QStringLiteral("/api/v1/sessions"), get,
@@ -718,7 +718,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V27: a bearer-session holder may rotate only their own password.
+    // A bearer-session holder may rotate only their own password.
     // The old password is mandatory; a stolen token alone is insufficient.
     // Rotation revokes every bearer session and appends a security audit event.
     if (!server.route(QStringLiteral("/api/v1/session/password"), post,
@@ -915,7 +915,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V23: mutation routes reuse the *audited* database functions. The
+    // Mutation routes reuse the *audited* database functions. The
     // authenticated host determines the actor; HTTP bodies cannot set it.
     // Bootstrap and session/token provisioning deliberately have no HTTP route.
     const std::function<bool(const QString &, const QString &,
@@ -1187,7 +1187,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
     }))
         return false;
 
-    // V44: read-only DAG and three-way merge summaries for remote GUI clients.
+    // Read-only DAG and three-way merge summaries for remote GUI clients.
     // The core enforces read access to both tips and (for preview) the merge
     // base. All failures are deliberately indistinguishable from unavailable
     // resources, so UUID probes cannot reveal private revision relationships.
@@ -1496,7 +1496,7 @@ bool HttpRoutes::registerOn(QHttpServer &server)
         !registerCompensation(QStringLiteral("/api/v1/branches/<arg>/redo"), true))
         return false;
 
-    // V45: commit a two-parent merge through the authoritative transactional
+    // Commit a two-parent merge through the authoritative transactional
     // core. Never trust a previous preview: UUID, generation, permissions and
     // physical object state are rechecked by mergeObjectRevisions().
     if (!server.route(QStringLiteral("/api/v1/branches/<arg>/merge"), post,

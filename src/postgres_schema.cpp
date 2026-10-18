@@ -355,7 +355,7 @@ $aowis$)SQL",
 BEGIN
     IF NEW.state='finalized' AND (NEW.hash_format_version!=2 OR
                 NEW.finalized_by_uuid IS NULL) THEN
-        RAISE EXCEPTION 'V2 finalization actor required' USING ERRCODE = '23514';
+        RAISE EXCEPTION 'Finalization actor required' USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END

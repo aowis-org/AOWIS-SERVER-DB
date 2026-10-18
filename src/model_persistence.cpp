@@ -1361,7 +1361,7 @@ QVector<HydraulicReference> nonAttachmentReferences(const QVector<HydraulicRefer
     return result;
 }
 
-// The V12 delta writer, scoped to one touched source instead of reconstructing
+// The reference-delta writer, scoped to one touched source instead of reconstructing
 // a network-sized desired reference set. Only call after ALL local validation
 // succeeds and within the caller's ongoing write transaction.
 bool updateLocalReferenceSource(const StorageBackend &backend, const QSqlDatabase &database, const QUuid &revision_uuid,

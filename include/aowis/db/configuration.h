@@ -14,7 +14,13 @@ namespace aowis::db
 struct Configuration
 {
     QString ini_file;
+    // SQLite is the default. PostgreSQL needs a database name and an existing
+    // schema; libpq handles connection credentials and host settings.
+    enum class Backend { SQLite, PostgreSQL };
+    Backend database_backend = Backend::SQLite;
     QString sqlite_file;
+    QString postgres_database;
+    QString postgres_schema;
     QString log_file;
     quint16 http_port = 8080;
 

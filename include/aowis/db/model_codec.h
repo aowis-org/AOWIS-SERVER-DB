@@ -10,7 +10,7 @@ namespace aowis::db
 {
 // Stable, schema-versioned, typed encoding of AOWIS-SERVER-MODEL values.
 // All fields are explicitly listed in model_codec.cpp; a new Model field
-// requires an intentional codec schema migration, never silent omission.
+// requires an intentional, compatible codec update, never silent omission.
 template<typename T> struct ModelCodec;
 template<> struct ModelCodec<CoordinateWGS84> final
 {

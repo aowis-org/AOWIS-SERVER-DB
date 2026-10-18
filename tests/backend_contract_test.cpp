@@ -172,28 +172,28 @@ int main(int argc, char **argv)
             {
                 QSqlQuery pg_query(pg_connection);
                 REQUIRE_SQL(pg_query, pg_query.exec(QStringLiteral(
-                    "CREATE TEMP TABLE aowis_v62_uuid_probe "
+                    "CREATE TEMP TABLE aowis_uuid_probe "
                     "(ordinal INTEGER PRIMARY KEY, object_uuid UUID)")));
                 REQUIRE_SQL(pg_query, pg_query.prepare(QStringLiteral(
-                    "INSERT INTO aowis_v62_uuid_probe (ordinal, object_uuid) VALUES (?, ?)")));
+                    "INSERT INTO aowis_uuid_probe (ordinal, object_uuid) VALUES (?, ?)")));
                 pg_query.addBindValue(1);
                 pg_query.addBindValue(postgres_contract.bindUuid(id));
                 REQUIRE_SQL(pg_query, pg_query.exec());
                 pg_query.finish();
                 REQUIRE_SQL(pg_query, pg_query.prepare(QStringLiteral(
-                    "INSERT INTO aowis_v62_uuid_probe (ordinal, object_uuid) VALUES (?, ?)")));
+                    "INSERT INTO aowis_uuid_probe (ordinal, object_uuid) VALUES (?, ?)")));
                 pg_query.addBindValue(2);
                 pg_query.addBindValue(postgres_contract.bindUuid(QUuid()));
                 REQUIRE_SQL(pg_query, pg_query.exec());
                 pg_query.finish();
                 // SQL NULL must remain distinct from the all-zero UUID.
                 REQUIRE_SQL(pg_query, pg_query.exec(QStringLiteral(
-                    "INSERT INTO aowis_v62_uuid_probe (ordinal, object_uuid) VALUES (3, NULL)")));
+                    "INSERT INTO aowis_uuid_probe (ordinal, object_uuid) VALUES (3, NULL)")));
                 pg_query.finish();
                 REQUIRE_SQL(pg_query, pg_query.exec(QStringLiteral(
                     "SELECT object_uuid::text, object_uuid IS NULL, "
                     "pg_typeof(object_uuid)::text "
-                    "FROM aowis_v62_uuid_probe ORDER BY ordinal")));
+                    "FROM aowis_uuid_probe ORDER BY ordinal")));
                 REQUIRE_SQL(pg_query, pg_query.next());
                 REQUIRE(pg_query.value(0).toString() == id.toString(QUuid::WithoutBraces));
                 REQUIRE(!pg_query.value(1).toBool());
@@ -210,7 +210,7 @@ int main(int argc, char **argv)
                 pg_query.finish();
                 // The sentinel must also work as a bound UUID predicate.
                 REQUIRE_SQL(pg_query, pg_query.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM aowis_v62_uuid_probe WHERE object_uuid = ?")));
+                    "SELECT COUNT(*) FROM aowis_uuid_probe WHERE object_uuid = ?")));
                 pg_query.addBindValue(postgres_contract.bindUuid(QUuid()));
                 REQUIRE_SQL(pg_query, pg_query.exec());
                 REQUIRE_SQL(pg_query, pg_query.next());
@@ -221,16 +221,16 @@ int main(int argc, char **argv)
             {
                 QSqlQuery check(pg_connection);
                 REQUIRE_SQL(check, check.exec(QStringLiteral(
-                    "SELECT to_regclass('pg_temp.aowis_v62_uuid_probe') IS NULL")));
+                    "SELECT to_regclass('pg_temp.aowis_uuid_probe') IS NULL")));
                 REQUIRE_SQL(check, check.next());
                 REQUIRE(check.value(0).toBool());
                 check.finish();
             }
-            // V63: build the entire current schema inside a newly-created
+            // Build the entire current schema inside a newly-created
             // transaction-local schema, then roll it back. This never
             // modifies the caller's existing tables or schema.
             REQUIRE(postgres_contract.beginWrite(pg_connection, &error));
-            const QString probe_schema = QStringLiteral("aowis_v63_probe_") +
+            const QString probe_schema = QStringLiteral("aowis_schema_probe_") +
                 QUuid::createUuid().toString(QUuid::Id128);
             QSqlQuery ddl(pg_connection);
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("CREATE SCHEMA %1").arg(probe_schema)));
@@ -266,7 +266,7 @@ int main(int argc, char **argv)
             // The creator guard must reject unattributed project creation.
             // Savepoints are necessary: PostgreSQL marks a transaction failed
             // after a constraint error until it is rolled back to a savepoint.
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT v63_guard_check")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT schema_guard_check")));
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "INSERT INTO projects(uuid,name,created_at_ms) VALUES (?,?,?)")));
             ddl.addBindValue(postgres_contract.bindUuid(QUuid::createUuid()));
@@ -274,11 +274,11 @@ int main(int argc, char **argv)
             ddl.addBindValue(QDateTime::currentMSecsSinceEpoch());
             REQUIRE_SQL(ddl, !ddl.exec());
             ddl.finish();
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT v63_guard_check")));
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT v63_guard_check")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT schema_guard_check")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT schema_guard_check")));
             ddl.finish();
 
-            // V64: exercise a real project/branch/revision lifecycle with the
+            // Exercise a real project/branch/revision lifecycle with the
             // PostgreSQL schema, native UUID foreign keys and immutable history.
             // All rows live in this transaction-local schema and are rolled
             // back below. No application schema upgrades or fixture cleanup.
@@ -291,13 +291,13 @@ int main(int argc, char **argv)
             const QUuid system_grant_uuid = QUuid::createUuid();
             const QUuid project_grant_uuid = QUuid::createUuid();
             const QByteArray hash(32, '\x5a');
-            const QByteArray snapshot_bytes("aowis-postgres-v64-snapshot");
+            const QByteArray snapshot_bytes("postgres-schema-smoke-snapshot");
             const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
 
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "INSERT INTO users(uuid,username,created_at_ms) VALUES (?,?,?)")));
             ddl.addBindValue(postgres_contract.bindUuid(actor_uuid));
-            ddl.addBindValue(QStringLiteral("v64-tester"));
+            ddl.addBindValue(QStringLiteral("schema-test-user"));
             ddl.addBindValue(now_ms);
             REQUIRE_SQL(ddl, ddl.exec());
             ddl.finish();
@@ -305,7 +305,7 @@ int main(int argc, char **argv)
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "INSERT INTO projects(uuid,name,created_at_ms,created_by_uuid) VALUES (?,?,?,?)")));
             ddl.addBindValue(postgres_contract.bindUuid(project_uuid));
-            ddl.addBindValue(QStringLiteral("V64 project"));
+            ddl.addBindValue(QStringLiteral("Schema constraint project"));
             ddl.addBindValue(now_ms);
             ddl.addBindValue(postgres_contract.bindUuid(actor_uuid));
             REQUIRE_SQL(ddl, ddl.exec());
@@ -346,7 +346,7 @@ int main(int argc, char **argv)
 
             // Test native UUID scope values and the system-scope SQL NULL.
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                "INSERT INTO roles(uuid,key,builtin) VALUES (?,'v64.reader',0)")));
+                "INSERT INTO roles(uuid,key,builtin) VALUES (?,'schema_test.reader',0)")));
             ddl.addBindValue(postgres_contract.bindUuid(role_uuid));
             REQUIRE_SQL(ddl, ddl.exec());
             ddl.finish();
@@ -385,16 +385,16 @@ int main(int argc, char **argv)
             REQUIRE_SQL(ddl, !ddl.next());
             ddl.finish();
 
-            // A finalized revision requires the V2 actor and history seal.
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT v64_missing_actor")));
+            // Finalized revisions require actor attribution and a history seal.
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT missing_finalize_actor")));
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "UPDATE revisions SET state='finalized',finalized_at_ms=? WHERE uuid=?")));
             ddl.addBindValue(now_ms);
             ddl.addBindValue(postgres_contract.bindUuid(revision_uuid));
             REQUIRE_SQL(ddl, !ddl.exec());
             ddl.finish();
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT v64_missing_actor")));
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT v64_missing_actor")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT missing_finalize_actor")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT missing_finalize_actor")));
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "UPDATE revisions SET state='finalized',finalized_at_ms=?,finalized_by_uuid=?,"
                 "operation_history_sha256=?,snapshot_sha256=?,chain_sha256=? WHERE uuid=?")));
@@ -409,15 +409,15 @@ int main(int argc, char **argv)
             ddl.finish();
 
             // The finalized snapshot is protected at the SQL layer.
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT v64_immutable")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT immutable_finalized_snapshot")));
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "UPDATE snapshots SET content=? WHERE revision_uuid=?")));
             ddl.addBindValue(QByteArray("tampering"));
             ddl.addBindValue(postgres_contract.bindUuid(revision_uuid));
             REQUIRE_SQL(ddl, !ddl.exec());
             ddl.finish();
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT v64_immutable")));
-            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT v64_immutable")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT immutable_finalized_snapshot")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT immutable_finalized_snapshot")));
 
             // Advance the branch atomically and retain the finalized parent.
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
@@ -457,10 +457,10 @@ int main(int argc, char **argv)
             REQUIRE_SQL(ddl, ddl.next());
             REQUIRE(ddl.value(0).toBool());
             ddl.finish();
-            // V65: exercise the *actual Database facade*, not only QPSQL DDL.
+            // Exercise the actual Database facade, not only QPSQL DDL.
             // Give it its own disposable schema in the same dedicated test
             // database. Do not touch an existing application schema.
-            const QString core_schema = QStringLiteral("aowis_v65_core_") +
+            const QString core_schema = QStringLiteral("aowis_core_api_") +
                 QUuid::createUuid().toString(QUuid::Id128);
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("CREATE SCHEMA %1").arg(core_schema)));
             QUuid saved_admin_uuid;
@@ -484,7 +484,7 @@ int main(int argc, char **argv)
                 REQUIRE(postgres_database.hasPermission(actor, QStringLiteral("project.create"),
                     aowis::db::AccessScope::system(), &error));
                 const std::optional<aowis::db::ProjectCreation> pg_project =
-                    postgres_database.createProject(actor, QStringLiteral("V65 integration project"), &error);
+                    postgres_database.createProject(actor, QStringLiteral("PostgreSQL core integration"), &error);
                 REQUIRE(pg_project.has_value());
                 saved_project_uuid = pg_project->project_uuid;
                 REQUIRE(postgres_database.projects(actor, &error).size() == 1);
@@ -492,7 +492,7 @@ int main(int argc, char **argv)
                 const std::optional<aowis::db::RevisionInfo> pg_first =
                     postgres_database.revision(actor, pg_project->working_revision_uuid, &error);
                 REQUIRE(pg_first.has_value() && !pg_first->finalized && pg_first->number == 1);
-                const QByteArray pg_snapshot("postgresql-v65-test-snapshot");
+                const QByteArray pg_snapshot("postgresql-core-snapshot");
                 REQUIRE(postgres_database.replaceWorkingSnapshot(
                     actor, pg_project->main_branch_uuid, 0, pg_snapshot, &error));
                 REQUIRE(postgres_database.snapshot(actor, pg_project->working_revision_uuid, &error) == pg_snapshot);
@@ -520,11 +520,11 @@ int main(int argc, char **argv)
                 REQUIRE(persisted->created_by_uuid == saved_admin_uuid);
                 REQUIRE(reopened.verifyProject(actor, saved_project_uuid).valid);
 
-                // V66: exercise the real granular-object and grouped-history
+                // Exercise the granular-object and grouped-history
                 // paths on PostgreSQL, using a separate object-mode project.
                 // This must not share the legacy snapshot-mode revision above.
                 const std::optional<aowis::db::ProjectCreation> object_project =
-                    reopened.createProject(actor, QStringLiteral("V66 object history"), &error);
+                    reopened.createProject(actor, QStringLiteral("PostgreSQL object history"), &error);
                 REQUIRE(object_project.has_value());
                 const QUuid working = object_project->working_revision_uuid;
                 const QUuid branch = object_project->main_branch_uuid;
@@ -601,10 +601,10 @@ int main(int argc, char **argv)
                                         finalized_pipe_uuid, &error)->content == changed_pipe);
                 REQUIRE(reopened.objectHistoryForRevision(actor, finalized_revision_uuid, &error).size() == 8);
                 REQUIRE(reopened.objectGroupsForRevision(actor, finalized_revision_uuid, &error).size() == 4);
-                // V67: real hydraulic Model persistence against PostgreSQL,
+                // Verify real hydraulic Model persistence against PostgreSQL,
                 // including native-UUID graph indexes and finalized ancestry.
                 const std::optional<aowis::db::ProjectCreation> hydraulic_project =
-                    reopened.createProject(actor, QStringLiteral("V67 hydraulic model"), &error);
+                    reopened.createProject(actor, QStringLiteral("PostgreSQL hydraulic model"), &error);
                 REQUIRE(hydraulic_project.has_value());
                 const QUuid hydraulic_branch = hydraulic_project->main_branch_uuid;
                 const QUuid hydraulic_revision = hydraulic_project->working_revision_uuid;

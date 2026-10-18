@@ -29,6 +29,9 @@ int main(int argc, char **argv)
         aowis::db::Configuration::load(absent_ini, &error);
     REQUIRE(defaults.has_value());
     REQUIRE(defaults->ini_file == absent_ini);
+    REQUIRE(defaults->database_backend == aowis::db::Configuration::Backend::SQLite);
+    REQUIRE(defaults->postgres_database.isEmpty());
+    REQUIRE(defaults->postgres_schema.isEmpty());
     REQUIRE(defaults->sqlite_file == aowis::db::Configuration::defaultSqliteFile());
     REQUIRE(defaults->log_file == aowis::db::Configuration::defaultLogFile());
     REQUIRE(defaults->http_port == 8080);
@@ -62,6 +65,7 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::Configuration> custom =
         aowis::db::Configuration::load(ini, &error);
     REQUIRE(custom.has_value());
+    REQUIRE(custom->database_backend == aowis::db::Configuration::Backend::SQLite);
     REQUIRE(custom->sqlite_file == database_file);
     REQUIRE(custom->log_file == log_file);
     REQUIRE(custom->http_port == 9234);
@@ -110,6 +114,76 @@ int main(int argc, char **argv)
     error.clear();
     REQUIRE(!aowis::db::Configuration::load(ini, &error));
     REQUIRE(error.contains(QStringLiteral("HTTP/Port")));
+
+    // PostgreSQL selection requires an explicit existing schema, but must
+    // not require or inspect a SQLite file. Connection secrets belong to libpq.
+    const QString postgres_ini = temp.filePath(QStringLiteral("postgres.ini"));
+    {
+        QSettings settings(postgres_ini, QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Database/Backend"), QStringLiteral("postgres"));
+        settings.setValue(QStringLiteral("Database/Name"), QStringLiteral("aowis_test"));
+        settings.setValue(QStringLiteral("Database/Schema"), QStringLiteral("aowis_projects"));
+        settings.setValue(QStringLiteral("Logging/File"), log_file);
+        settings.setValue(QStringLiteral("HTTP/Port"), 9321);
+        settings.sync();
+        REQUIRE(settings.status() == QSettings::NoError);
+    }
+    error.clear();
+    const std::optional<aowis::db::Configuration> pg_config =
+        aowis::db::Configuration::load(postgres_ini, &error);
+    REQUIRE(pg_config.has_value());
+    REQUIRE(pg_config->database_backend == aowis::db::Configuration::Backend::PostgreSQL);
+    REQUIRE(pg_config->postgres_database == QStringLiteral("aowis_test"));
+    REQUIRE(pg_config->postgres_schema == QStringLiteral("aowis_projects"));
+    REQUIRE(pg_config->log_file == log_file);
+    REQUIRE(pg_config->http_port == 9321);
+
+    // Reject misspelled backends, ambiguous mixed configurations, and unsafe
+    // schema identifiers instead of silently falling back to SQLite.
+    {
+        QSettings settings(postgres_ini, QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Database/Backend"), QStringLiteral("postgre"));
+        settings.sync();
+    }
+    error.clear();
+    REQUIRE(!aowis::db::Configuration::load(postgres_ini, &error));
+    REQUIRE(error.contains(QStringLiteral("Database/Backend")));
+    {
+        QSettings settings(postgres_ini, QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Database/Backend"), QStringLiteral("postgres"));
+        settings.setValue(QStringLiteral("Database/File"), database_file);
+        settings.sync();
+    }
+    error.clear();
+    REQUIRE(!aowis::db::Configuration::load(postgres_ini, &error));
+    REQUIRE(error.contains(QStringLiteral("Database/File")));
+    {
+        QSettings settings(postgres_ini, QSettings::IniFormat);
+        settings.remove(QStringLiteral("Database/File"));
+        settings.setValue(QStringLiteral("Database/Schema"), QStringLiteral("aowis;DROP TABLE users"));
+        settings.sync();
+    }
+    error.clear();
+    REQUIRE(!aowis::db::Configuration::load(postgres_ini, &error));
+    REQUIRE(error.contains(QStringLiteral("Database/Schema")));
+    {
+        QSettings settings(postgres_ini, QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Database/Schema"), QStringLiteral("aowis_projects"));
+        settings.remove(QStringLiteral("Database/Name"));
+        settings.sync();
+    }
+    error.clear();
+    REQUIRE(!aowis::db::Configuration::load(postgres_ini, &error));
+    REQUIRE(error.contains(QStringLiteral("Database/Name")));
+    {
+        QSettings settings(postgres_ini, QSettings::IniFormat);
+        settings.setValue(QStringLiteral("Database/Backend"), QStringLiteral("sqlite"));
+        settings.setValue(QStringLiteral("Database/Name"), QStringLiteral("aowis_test"));
+        settings.sync();
+    }
+    error.clear();
+    REQUIRE(!aowis::db::Configuration::load(postgres_ini, &error));
+    REQUIRE(error.contains(QStringLiteral("Database/Name")));
 
     error.clear();
     REQUIRE(!aowis::db::Configuration::load(QStringLiteral("relative.ini"), &error));

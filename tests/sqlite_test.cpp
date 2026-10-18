@@ -201,7 +201,7 @@ int main(int argc, char **argv)
         query.addBindValue(p1->working_revision_uuid.toRfc4122());
         REQUIRE(query.exec());
         // A privileged administrator also changes the finalizing actor on an
-        // independent V2 revision. Its hash must detect the altered provenance.
+        // independent finalized revision. Its hash must detect the altered provenance.
         REQUIRE(query.exec(QStringLiteral("DROP TRIGGER finalized_revision_readonly_update")));
         REQUIRE(query.prepare(QStringLiteral("UPDATE revisions SET finalized_by_uuid=? WHERE uuid=?")));
         query.addBindValue(viewer->uuid.toRfc4122());

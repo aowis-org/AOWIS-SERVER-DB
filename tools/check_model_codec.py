@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Verify that every persisted NetworkHydraulic field matches the pinned V5 codec.
+"""Ensure the persisted hydraulic codec matches the checked-out Model.
 
-This does not change the binary encoding. Changes to the Model schema require
-an explicit codec-version evolution and a new field manifest, not regeneration
-of the existing V5 format without backward compatibility.
+The manifest documents the current persisted fields, not a development patch.
+A binary codec change must consciously preserve readers for existing data.
 """
 import json
 import pathlib
@@ -62,9 +61,9 @@ def main():
     actual = inspect(pathlib.Path(sys.argv[1]))
     expected = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
     if actual != expected:
-        print('AOWIS Model layout has changed since the V5 serialization was defined.', file=sys.stderr)
+        print('AOWIS Model layout differs from the persisted codec contract.', file=sys.stderr)
         print('Review the fields, add a new codec format version with old-version readers,', file=sys.stderr)
-        print('then update the field manifest after approving the migration.', file=sys.stderr)
+        print('then update the field manifest after reviewing compatibility.', file=sys.stderr)
         for key in sorted(actual.keys() | expected.keys()):
             if actual.get(key) != expected.get(key):
                 print(' Changed struct:', key, file=sys.stderr)
@@ -82,12 +81,12 @@ def main():
                                  if len(matches) == 1 else [])
             expected_names = [name for _, name in fields]
             if member_references != expected_names:
-                print(f'V5 {operation} codec for {type_name} does not match the Model fields!',
+                print(f'{operation} codec for {type_name} does not match the Model fields!',
                       file=sys.stderr)
                 print('  Expected:', expected_names, file=sys.stderr)
                 print('  Found:', member_references, file=sys.stderr)
                 return 1
-    print(f'AOWIS V5 codec matches {len(actual)} persisted Model structures.')
+    print(f'AOWIS codec matches {len(actual)} persisted Model structures.')
     return 0
 
 

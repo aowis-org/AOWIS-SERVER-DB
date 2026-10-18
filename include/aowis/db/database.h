@@ -483,7 +483,7 @@ public:
     IntegrityReport verifyProject(const OperationContext &actor, const QUuid &project_uuid) const;
 
     // Atomic, generation-checked complete network synchronization. Each changed
-    // object produces its own V4 immutable object-history event. Network root
+    // object produces an immutable object-history event. Network root
     // stores the ordered entity UUID lists for lossless reconstruction.
     bool saveHydraulicNetwork(const OperationContext &actor, const QUuid &branch_uuid,
                               qint64 expected_generation, const NetworkHydraulic &network,
@@ -552,7 +552,7 @@ private:
                       const QUuid &branch_uuid, qint64 expected_generation, bool redo,
                       QString *error);
     // The manifest includes the exact object-change journal digest, so it is
-    // covered by the existing V2 finalized SHA-256 revision chain.
+    // covered by the finalized SHA-256 revision chain.
     // Internal reads do not require project.read: an actor authorized to edit
     // must still have their resulting hydraulic graph validated atomically.
     std::optional<NetworkHydraulic> loadHydraulicNetworkUnchecked(

@@ -2198,7 +2198,7 @@ std::optional<WaterQualityWallReaction> ModelCodec<WaterQualityWallReaction>::de
     return decodeTyped<WaterQualityWallReaction>(bytes, QStringLiteral("WaterQualityWallReaction"), error);
 }
 
-// V40: Field comparison uses the same canonical QDataStream serialization
+// Field-wise merge comparison uses the same canonical QDataStream serialization
 // primitives as ModelCodec. Never compare floats with approximate equality or
 // rely on operator== for nested Model structs; compare encoded field bytes.
 template<typename T> QByteArray encodedMergeField(const T &field)
@@ -2322,7 +2322,7 @@ std::optional<ModelFieldMerge> mergeFieldsForType(const QUuid &object_uuid,
     const QByteArray &baseline_bytes, const QByteArray &left_bytes,
     const QByteArray &right_bytes, const QMap<QString, bool> &field_choices);
 
-// These field lists match docs/model_codec_fields_v1.json and the ordered
+// These field lists match docs/model_codec_fields.json and the ordered
 // writeStruct/readStruct declarations above. A configure-time checker ensures
 // that a codec or Model schema change cannot silently omit a merge field.
 template<> std::optional<ModelFieldMerge> mergeFieldsForType<HydraulicPipeMaterial>(

@@ -266,7 +266,7 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
         R"SQL(CREATE TRIGGER finalize_actor_required BEFORE UPDATE OF state ON revisions
             WHEN NEW.state='finalized' AND (NEW.hash_format_version!=2 OR
                 NEW.finalized_by_uuid IS NULL OR length(NEW.finalized_by_uuid)!=16)
-            BEGIN SELECT RAISE(ABORT,'V2 finalization actor required'); END)SQL",
+            BEGIN SELECT RAISE(ABORT,'Finalization actor required'); END)SQL",
         R"SQL(CREATE TRIGGER finalize_requires_history_hash BEFORE UPDATE OF state ON revisions
             WHEN NEW.state='finalized' AND NEW.operation_history_sha256 IS NULL
             BEGIN SELECT RAISE(ABORT,'operation history seal required'); END)SQL",

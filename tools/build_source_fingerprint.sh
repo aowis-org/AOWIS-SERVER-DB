@@ -26,7 +26,7 @@ fi
         "${project_dir}/CMakeLists.txt" \
         "${model_dir}/CMakeLists.txt" \
         "${project_dir}/tools/check_model_codec.py" \
-        "${project_dir}/docs/model_codec_fields_v1.json" \
+        "${project_dir}/docs/model_codec_fields.json" \
         "${project_dir}/tools/build_source_fingerprint.sh"
     find "${project_dir}/include" "${project_dir}/src" "${project_dir}/tests" \
          "${model_dir}/include" "${model_dir}/src" -type f \

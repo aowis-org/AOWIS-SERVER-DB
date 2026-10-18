@@ -99,8 +99,60 @@ std::optional<Configuration> Configuration::load(const QString &ini_file, QStrin
     }
 
     QSettings settings(result.ini_file, QSettings::IniFormat);
-    if (!readFilePath(settings, QStringLiteral("Database/File"), result.sqlite_file, error) ||
-        !readFilePath(settings, QStringLiteral("Logging/File"), result.log_file, error))
+    const QString backend = settings.value(QStringLiteral("Database/Backend"),
+                                            QStringLiteral("sqlite")).toString().trimmed();
+    if (backend == QStringLiteral("sqlite"))
+    {
+        result.database_backend = Configuration::Backend::SQLite;
+        if (settings.contains(QStringLiteral("Database/Name")) ||
+            settings.contains(QStringLiteral("Database/Schema")))
+        {
+            setError(error, QStringLiteral("Database/Name and Database/Schema require Database/Backend=postgres"));
+            return std::nullopt;
+        }
+        if (!readFilePath(settings, QStringLiteral("Database/File"), result.sqlite_file, error))
+            return std::nullopt;
+    }
+    else if (backend == QStringLiteral("postgres"))
+    {
+        result.database_backend = Configuration::Backend::PostgreSQL;
+        if (settings.contains(QStringLiteral("Database/File")))
+        {
+            setError(error, QStringLiteral("Database/File is only valid with Database/Backend=sqlite"));
+            return std::nullopt;
+        }
+        result.postgres_database = settings.value(QStringLiteral("Database/Name")).toString().trimmed();
+        result.postgres_schema = settings.value(QStringLiteral("Database/Schema")).toString().trimmed();
+        if (result.postgres_database.isEmpty() || result.postgres_schema.isEmpty())
+        {
+            setError(error, QStringLiteral("PostgreSQL requires Database/Name and Database/Schema"));
+            return std::nullopt;
+        }
+        // The backend inserts the schema identifier into a SET search_path
+        // statement. Reject invalid identifiers before starting the server.
+        if (result.postgres_schema.size() > 63 ||
+            result.postgres_schema.front().isDigit())
+        {
+            setError(error, QStringLiteral("Invalid PostgreSQL Database/Schema identifier"));
+            return std::nullopt;
+        }
+        for (const QChar ch : result.postgres_schema)
+        {
+            const ushort c = ch.unicode();
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+            {
+                setError(error, QStringLiteral("Invalid PostgreSQL Database/Schema identifier"));
+                return std::nullopt;
+            }
+        }
+    }
+    else
+    {
+        setError(error, QStringLiteral("Database/Backend must be sqlite or postgres"));
+        return std::nullopt;
+    }
+
+    if (!readFilePath(settings, QStringLiteral("Logging/File"), result.log_file, error))
         return std::nullopt;
 
     if (settings.contains(QStringLiteral("HTTP/Port")))

@@ -56,7 +56,7 @@ void appendField(QByteArray &bytes, const QByteArray &field)
     bytes.append(field);
 }
 
-// V1 is explicitly domain-separated and byte-order-defined. Do not change
+// The original digest format is explicitly domain-separated and byte-order-defined. Do not change
 // this encoding for old finalized revisions; introduce a new hash version.
 QByteArray chainDigest(const QUuid &project_uuid,
                        const QUuid &branch_uuid,

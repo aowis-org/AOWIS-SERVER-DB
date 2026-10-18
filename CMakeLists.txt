@@ -31,7 +31,7 @@ execute_process(
     COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_codec.py"
         "${AOWIS_MODEL_SOURCE_DIR}/include/aowis/model"
-        "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields_v1.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields.json"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
     RESULT_VARIABLE AOWIS_MODEL_CODEC_CHECK_RESULT
     OUTPUT_VARIABLE AOWIS_MODEL_CODEC_CHECK_OUTPUT
@@ -45,7 +45,7 @@ message(STATUS "${AOWIS_MODEL_CODEC_CHECK_OUTPUT}")
 execute_process(
     COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_model_field_merge.py"
-        "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields_v1.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/docs/model_codec_fields.json"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/model_codec.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/aowis/db/model_persistence.h"
     RESULT_VARIABLE AOWIS_MODEL_FIELD_MERGE_CHECK_RESULT
@@ -129,8 +129,8 @@ if(AOWIS_DB_BUILD_HTTP)
             $<INSTALL_INTERFACE:include>
         )
         target_link_libraries(aowis-db-http PUBLIC aowis-db-core Qt6::HttpServer Qt6::Network)
-        add_executable(aowis-db-server src/http_server_main.cpp)
-        target_link_libraries(aowis-db-server PRIVATE aowis-db-http)
+        add_executable(aowis-server-db src/http_server_main.cpp)
+        target_link_libraries(aowis-server-db PRIVATE aowis-db-http)
         message(STATUS "AOWIS optional HTTP server enabled")
     else()
         message(STATUS "AOWIS HTTP server not built (Qt6 HttpServer/Network unavailable)")
@@ -149,6 +149,12 @@ if(BUILD_TESTING)
     endfunction()
 
     aowis_add_db_test(aowis-db-configuration-tests aowis-db-configuration tests/configuration_test.cpp)
+    add_executable(aowis-db-admin-cli-tests tests/admin_cli_test.cpp)
+    target_link_libraries(aowis-db-admin-cli-tests PRIVATE aowis-db-core)
+    add_dependencies(aowis-db-admin-cli-tests aowis-db-admin)
+    add_test(NAME aowis-db-admin-cli COMMAND aowis-db-admin-cli-tests $<TARGET_FILE:aowis-db-admin>)
+    set_tests_properties(aowis-db-admin-cli PROPERTIES LABELS "aowis;database")
+    set_property(GLOBAL APPEND PROPERTY AOWIS_DB_TEST_EXECUTABLES aowis-db-admin-cli-tests)
     aowis_add_db_test(aowis-db-sqlite-tests aowis-db-sqlite tests/sqlite_test.cpp)
     aowis_add_db_test(aowis-db-backend-contract-tests aowis-db-backend-contract tests/backend_contract_test.cpp)
     aowis_add_db_test(aowis-db-history-tests aowis-db-history tests/history_test.cpp)
@@ -183,6 +189,14 @@ if(BUILD_TESTING)
     aowis_add_db_test(aowis-db-security-admin-tests aowis-db-security-admin tests/security_admin_test.cpp)
     aowis_add_db_test(aowis-db-security-catalog-tests aowis-db-security-catalog tests/security_catalog_test.cpp)
     if(TARGET aowis-db-http)
+        # Exercise INI default and optional SQLite command-line override in
+        # the actual HTTP server executable, not only the configuration parser.
+        add_executable(aowis-server-db-cli-tests tests/server_cli_test.cpp)
+        target_link_libraries(aowis-server-db-cli-tests PRIVATE Qt6::Core Qt6::Network)
+        add_dependencies(aowis-server-db-cli-tests aowis-server-db)
+        add_test(NAME aowis-server-db-cli COMMAND aowis-server-db-cli-tests $<TARGET_FILE:aowis-server-db>)
+        set_tests_properties(aowis-server-db-cli PROPERTIES LABELS "aowis;database")
+        set_property(GLOBAL APPEND PROPERTY AOWIS_DB_TEST_EXECUTABLES aowis-server-db-cli-tests)
         aowis_add_db_test(aowis-db-http-tests aowis-db-http tests/http_test.cpp)
         target_link_libraries(aowis-db-http-tests PRIVATE aowis-db-http)
         aowis_add_db_test(aowis-db-http-mutations-tests aowis-db-http-mutations tests/http_mutations_test.cpp)
@@ -217,4 +231,9 @@ if(BUILD_TESTING)
 
     get_property(aowis_db_test_executables GLOBAL PROPERTY AOWIS_DB_TEST_EXECUTABLES)
     add_custom_target(aowis-db-tests DEPENDS ${aowis_db_test_executables})
+    # Build the actual server executable as part of the normal test build too.
+    # The target name is part of the public distribution interface.
+    if(TARGET aowis-server-db)
+        add_dependencies(aowis-db-tests aowis-server-db)
+    endif()
 endif()

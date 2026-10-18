@@ -33,7 +33,7 @@ void appendInt64(QByteArray &buffer, quint64 value)
 
 QByteArray eventHash(const SecurityAuditEvent &event)
 {
-    // Format V1: domain separator, previous hash, sequence, UTC ms, event,
+    // Frozen audit encoding: domain separator, previous hash, sequence, UTC ms, event,
     // actor, subject UUIDs, and length-prefixed UTF-8 action. Frozen format.
     QByteArray bytes("AOWIS-SECURITY-AUDIT-V1", 23);
     bytes.append('\0');

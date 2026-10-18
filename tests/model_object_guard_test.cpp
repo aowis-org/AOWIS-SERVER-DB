@@ -72,8 +72,8 @@ int main(int argc, char **argv)
     const QByteArray original_pipe = db.object(actor, revision, pipe.uuid, &error)->content;
 
     // Verify the persisted root actually indexes this pipe, and that the
-    // V7 reference validator rejects the proposed value before testing the
-    // V8 transactional guard. These preconditions distinguish a guard bypass
+    // Reference validator rejects the proposed value before testing the
+    // Transactional integrity guard. These preconditions distinguish a guard bypass
     // from a malformed fixture or an unindexed object.
     const std::optional<NetworkHydraulic> stored_network =
         db.loadHydraulicNetwork(actor, revision, network.uuid, &error);

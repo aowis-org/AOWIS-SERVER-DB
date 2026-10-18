@@ -135,7 +135,7 @@ int main(int argc, char **argv)
     REQUIRE(db.finalize(actor, alternate->uuid, 1, QStringLiteral("alt"), {}, &error));
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
 
-    // Immutability at SQL level and tampering detected by the V5 manifest.
+    // Immutability at SQL level and tampering detected by the finalized object manifest.
     {
         QSqlDatabase inspect = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("groups-inspect"));
         inspect.setDatabaseName(path);

@@ -274,7 +274,7 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
             setError(error, QStringLiteral("Merge target object state changed since preview"));
         return fail();
     }
-    // Preserve V38's stricter invariant for generation-zero heads: no
+    // Preserve the stricter invariant for generation-zero heads: no
     // unjournaled physical difference from the finalized parent is allowed.
     if (latest->generation == 0 &&
         !samePhysicalObjects(this->database_, *this->backend_, latest->uuid, left_uuid, error))

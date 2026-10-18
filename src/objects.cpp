@@ -118,7 +118,7 @@ bool Database::copyObjects(const QUuid &from_revision, const QUuid &to_revision,
 }
 
 // Contains the full ordered journal (including before/after bytes) and live
-// object state. The historic V4/V5 manifest format is frozen: UUIDs in hash
+// object state. The immutable manifest format is frozen: UUIDs in hash
 // preimages are always 16 RFC-4122 bytes, independent of the SQL backend.
 // This must remain byte-identical for SQLite and for future native UUID types.
 std::optional<QByteArray> Database::objectManifest(const QUuid &revision_uuid, QString *error) const
@@ -192,8 +192,8 @@ std::optional<QByteArray> Database::objectManifest(const QUuid &revision_uuid, Q
     if (!run(format, error) || !format.next())
         return std::nullopt;
     if (format.value(0).toInt() == 1)
-        return manifest; // Byte-identical V4 manifest for old finalized hashes.
-    // V5 appends an ordered, domain-separated representation of immutable
+        return manifest; // Preserve the exact historical manifest encoding for finalized hashes.
+    // Grouped edits append an ordered, domain-separated representation of immutable
     // groups and their exact member-event identities.
     QByteArray grouped("AOWIS-OBJECT-GROUPS-V1\0", 23);
     QSqlQuery groups(this->database_);
