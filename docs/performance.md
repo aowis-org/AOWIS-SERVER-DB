@@ -62,3 +62,21 @@ continue through the ordinary version-checked object mutation path.
 The journal still contains one immutable event per entity and one group per
 user-visible save. Compare both speed and SQLite file size across identical
 workloads before changing storage structures.
+
+## Set-based network indexing and journal grouping
+
+For fresh networks, membership rows are selected directly from the newly
+committed object's event-sequence range, rather than inserting one row per
+member. Initial reference rows use standard multi-row SQL inserts with batches
+of 64 (320 parameters, under SQLite's historical 999-placeholder limit).
+Incremental network edits retain their existing reference-delta handling.
+
+Grouped-history links are populated with an ordered `INSERT ... SELECT` using
+`ROW_NUMBER()`, on SQLite and PostgreSQL. The insertion count must exactly
+match the revision generation delta or the entire save is rolled back.
+Event UUIDs, sequence numbers, journal payloads, hashes and revision behavior
+are unchanged.
+
+Profiling now separately prints `membership_ms` and `references_ms`, which
+sum to `index_ms`. Compare those and `group_ms` to previous runs, ideally on
+both 1,000- and 10,000-pipe workloads. Timings are not acceptance thresholds.

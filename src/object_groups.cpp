@@ -77,40 +77,25 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
     if (!run(query, error))
         return std::nullopt;
 
-    QSqlQuery member_events(this->database_);
-    if (!prepare(member_events, QStringLiteral(
-            "SELECT uuid FROM object_events WHERE revision_uuid=? AND sequence>? AND sequence<=? "
-            "ORDER BY sequence"), error))
+    // Let the database copy and sequence the journal links in one statement.
+    // The object-event sequence is unique per revision. ROW_NUMBER preserves
+    // the same zero-based group order as the former per-event insert loop,
+    // without thousands of client/driver round trips on large imports.
+    QSqlQuery links(this->database_);
+    if (!prepare(links, QStringLiteral(
+            "INSERT INTO object_group_events(group_uuid,position,object_event_uuid) "
+            "SELECT ?,ROW_NUMBER() OVER (ORDER BY sequence)-1,uuid "
+            "FROM object_events WHERE revision_uuid=? AND sequence>? AND sequence<=? "
+            "AND actor_uuid=?"), error))
         return std::nullopt;
-    member_events.addBindValue(this->backend_->bindUuid(revision.uuid));
-    member_events.addBindValue(before_generation);
-    member_events.addBindValue(after->generation);
-    if (!run(member_events, error))
+    links.addBindValue(this->backend_->bindUuid(group_uuid));
+    links.addBindValue(this->backend_->bindUuid(revision.uuid));
+    links.addBindValue(before_generation);
+    links.addBindValue(after->generation);
+    links.addBindValue(this->backend_->bindUuid(actor.actor_uuid));
+    if (!run(links, error))
         return std::nullopt;
-    QSqlQuery insert(this->database_);
-    if (!prepare(insert, QStringLiteral(
-            "INSERT INTO object_group_events(group_uuid,position,object_event_uuid) VALUES(?,?,?)"), error))
-        return std::nullopt;
-    insert.bindValue(0, this->backend_->bindUuid(group_uuid));
-    qint64 position = 0;
-    while (member_events.next())
-    {
-        // Convert through the backend: SQLite returns RFC-4122 BLOBs, while
-        // PostgreSQL returns native UUID values. Never forward a raw driver
-        // QVariant from one query as an unvalidated UUID parameter.
-        const QUuid event_uuid = this->backend_->readUuid(member_events.value(0));
-        if (member_events.value(0).isNull() || event_uuid.isNull())
-        {
-            fail(error, QStringLiteral("Invalid object-event UUID in group journal"));
-            return std::nullopt;
-        }
-        insert.bindValue(1, position);
-        insert.bindValue(2, this->backend_->bindUuid(event_uuid));
-        if (!run(insert, error))
-            return std::nullopt;
-        ++position;
-    }
-    if (position != after->generation - before_generation)
+    if (links.numRowsAffected() != after->generation - before_generation)
     {
         fail(error, QStringLiteral("Group does not cover all committed object edits"));
         return std::nullopt;

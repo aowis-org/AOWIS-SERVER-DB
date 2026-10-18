@@ -194,5 +194,80 @@ int main(int argc, char **argv)
     db.close();
     REQUIRE(db.openSqlite(file, &error));
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
+
+    // More than 64 references exercises multi-row inserts rather than the
+    // small-delta path. Check ordered group links and stored membership too.
+    const std::optional<aowis::db::ProjectCreation> batch_project =
+        db.createProject(actor, QStringLiteral("Reference batch"), &error);
+    REQUIRE(batch_project.has_value());
+    NetworkHydraulic large_network;
+    large_network.uuid = createUuidV7();
+    HydraulicNodeReservoir large_source;
+    large_source.uuid = createUuidV7();
+    large_network.nodes_reservoirs.append(large_source);
+    QUuid previous_node = large_source.uuid;
+    for (int index = 0; index < 75; ++index)
+    {
+        HydraulicNodeJunction next;
+        next.uuid = createUuidV7();
+        large_network.nodes_junctions.append(next);
+        HydraulicLinkPipe link;
+        link.uuid = createUuidV7();
+        link.node_uuid_from = previous_node;
+        link.node_uuid_to = next.uuid;
+        large_network.links_pipes.append(link);
+        previous_node = next.uuid;
+    }
+    REQUIRE(db.saveHydraulicNetwork(actor, batch_project->main_branch_uuid, 0, large_network, &error));
+    const QVector<aowis::db::ObjectChange> large_history = db.objectHistoryForRevision(
+        actor, batch_project->working_revision_uuid, &error);
+    REQUIRE(large_history.size() == 152);
+    const QVector<aowis::db::ObjectGroup> large_groups = db.objectGroupsForRevision(
+        actor, batch_project->working_revision_uuid, &error);
+    REQUIRE(large_groups.size() == 1);
+    REQUIRE(large_groups.first().object_event_uuids.size() == large_history.size());
+    for (qsizetype item = 0; item < large_history.size(); ++item)
+    {
+        REQUIRE(large_history.at(item).sequence == item + 1);
+        REQUIRE(large_groups.first().object_event_uuids.at(item) == large_history.at(item).uuid);
+    }
+    {
+        QSqlDatabase inspector = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+                                                          QStringLiteral("references-batch"));
+        inspector.setDatabaseName(file);
+        REQUIRE(inspector.open());
+        QSqlQuery count(inspector);
+        REQUIRE(count.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM hydraulic_network_references "
+            "WHERE revision_uuid=? AND network_uuid=?")));
+        count.addBindValue(batch_project->working_revision_uuid.toRfc4122());
+        count.addBindValue(large_network.uuid.toRfc4122());
+        REQUIRE(count.exec() && count.next());
+        REQUIRE(count.value(0).toInt() == 150);
+        REQUIRE(referenceUuidStorage(inspector, batch_project->working_revision_uuid,
+                                     large_network.uuid, large_network.links_pipes.last().uuid,
+                                     large_network.nodes_junctions.last().uuid));
+        count.finish();
+        inspector.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("references-batch"));
+    REQUIRE(db.undoObjectGroup(actor, batch_project->main_branch_uuid,
+        db.revision(actor, batch_project->working_revision_uuid, &error)->generation, &error).has_value());
+    REQUIRE(!db.loadHydraulicNetwork(actor, batch_project->working_revision_uuid,
+                                     large_network.uuid, &error));
+    REQUIRE(db.redoObjectGroup(actor, batch_project->main_branch_uuid,
+        db.revision(actor, batch_project->working_revision_uuid, &error)->generation, &error).has_value());
+    REQUIRE(db.loadHydraulicNetwork(actor, batch_project->working_revision_uuid,
+                                    large_network.uuid, &error).has_value());
+    const std::optional<aowis::db::RevisionInfo> batch_revision = db.revision(
+        actor, batch_project->working_revision_uuid, &error);
+    REQUIRE(batch_revision.has_value());
+    const std::optional<aowis::db::Finalization> batch_final = db.finalize(
+        actor, batch_project->main_branch_uuid, batch_revision->generation,
+        QStringLiteral("Batched network"), {}, &error);
+    REQUIRE(batch_final.has_value());
+    REQUIRE(db.verifyProject(actor, batch_project->project_uuid).valid);
+    REQUIRE(db.loadHydraulicNetwork(actor, batch_final->new_working_revision_uuid,
+                                    large_network.uuid, &error).has_value());
     return 0;
 }

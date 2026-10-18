@@ -209,6 +209,46 @@ bool insertFreshNetworkObjects(const StorageBackend &backend,
     return true;
 }
 
+// A fresh network's event range contains precisely its root and new members.
+// Populate ownership from those already-validated immutable events in one
+// statement, instead of crossing the SQL driver once per model entity.
+// Rollback of the enclosing transaction also rolls back all derived rows.
+bool insertFreshNetworkMembership(const StorageBackend &backend,
+                                  const QSqlDatabase &database,
+                                  const RevisionInfo &revision,
+                                  const QUuid &network_uuid,
+                                  qint64 expected_member_count,
+                                  QString *error)
+{
+    QSqlQuery query(database);
+    if (!query.prepare(QStringLiteral(
+            "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
+            "SELECT ?,?,object_uuid FROM object_events "
+            "WHERE revision_uuid=? AND sequence>? AND sequence<=? "
+            "AND action='put' AND before_version=-1 AND object_uuid<>?")))
+    {
+        assignError(error, query.lastError().text());
+        return false;
+    }
+    query.addBindValue(backend.bindUuid(revision.uuid));
+    query.addBindValue(backend.bindUuid(network_uuid));
+    query.addBindValue(backend.bindUuid(revision.uuid));
+    query.addBindValue(revision.generation);
+    query.addBindValue(revision.generation + expected_member_count + 1);
+    query.addBindValue(backend.bindUuid(network_uuid));
+    if (!query.exec())
+    {
+        assignError(error, query.lastError().text());
+        return false;
+    }
+    if (query.numRowsAffected() != expected_member_count)
+    {
+        assignError(error, QStringLiteral("Fresh network membership/event count mismatch"));
+        return false;
+    }
+    return true;
+}
+
 // Derived ownership is indexed by (revision_uuid, entity_uuid). Checking all
 // incoming UUIDs (including the root) also catches accidental collisions with
 // another network's entity, even if the object payload was tombstoned.
@@ -831,6 +871,74 @@ bool Database::replaceHydraulicReferences(const QUuid &revision_uuid,
         }
     }
 
+    // Insert full batches in one SQL statement rather than issuing a command
+    // per reference. 64 * 5 = 320 parameters, below SQLite's historical 999
+    // parameter limit; PostgreSQL accepts the same standard INSERT syntax.
+    // Keep small deltas on the original single-row path.
+    constexpr qsizetype reference_batch_size = 64;
+    if (previous.isEmpty() && wanted.size() >= reference_batch_size)
+    {
+        const QList<QByteArray> keys = wanted.values();
+        QString tuples;
+        for (qsizetype item = 0; item < reference_batch_size; ++item)
+            tuples += (item == 0 ? QStringLiteral("(?,?,?,?,?)")
+                                 : QStringLiteral(",(?,?,?,?,?)"));
+        QSqlQuery batch(this->database_);
+        if (!batch.prepare(QStringLiteral(
+                "INSERT INTO hydraulic_network_references "
+                "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES %1").arg(tuples)))
+        {
+            assignError(error, batch.lastError().text());
+            return false;
+        }
+        qsizetype position = 0;
+        while (position + reference_batch_size <= keys.size())
+        {
+            for (qsizetype item = 0; item < reference_batch_size; ++item)
+            {
+                const QByteArray &key = keys.at(position + item);
+                const qsizetype base = item * 5;
+                batch.bindValue(base, revision_value);
+                batch.bindValue(base + 1, network_value);
+                batch.bindValue(base + 2, this->backend_->bindUuid(QUuid::fromRfc4122(key.left(16))));
+                batch.bindValue(base + 3, this->backend_->bindUuid(QUuid::fromRfc4122(key.mid(16, 16))));
+                batch.bindValue(base + 4, QString::fromUtf8(key.constData() + 32, key.size() - 32));
+            }
+            if (!batch.exec())
+            {
+                assignError(error, batch.lastError().text());
+                return false;
+            }
+            position += reference_batch_size;
+        }
+        if (position == keys.size())
+            return true;
+        // The remaining fewer-than-64 rows use a single prepared statement.
+        QSqlQuery remainder(this->database_);
+        if (!remainder.prepare(QStringLiteral(
+                "INSERT INTO hydraulic_network_references "
+                "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES(?,?,?,?,?)")))
+        {
+            assignError(error, remainder.lastError().text());
+            return false;
+        }
+        for (; position < keys.size(); ++position)
+        {
+            const QByteArray &key = keys.at(position);
+            remainder.bindValue(0, revision_value);
+            remainder.bindValue(1, network_value);
+            remainder.bindValue(2, this->backend_->bindUuid(QUuid::fromRfc4122(key.left(16))));
+            remainder.bindValue(3, this->backend_->bindUuid(QUuid::fromRfc4122(key.mid(16, 16))));
+            remainder.bindValue(4, QString::fromUtf8(key.constData() + 32, key.size() - 32));
+            if (!remainder.exec())
+            {
+                assignError(error, remainder.lastError().text());
+                return false;
+            }
+        }
+        return true;
+    }
+
     QSqlQuery insert(this->database_);
     if (!insert.prepare(QStringLiteral(
             "INSERT INTO hydraulic_network_references "
@@ -926,6 +1034,7 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
     qint64 looked_up_ms = prepared_ms;
     qint64 written_ms = prepared_ms;
     qint64 indexed_ms = prepared_ms;
+    qint64 membership_ms = prepared_ms;
     qint64 grouped_ms = prepared_ms;
     bool used_fresh_insert = false;
     bool ok = false;
@@ -1073,9 +1182,20 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
             // and list reordering do not alter ownership, so avoid deleting
             // and reinserting every member of a large network on those saves.
             const QSet<QUuid> new_members = referencedIds(index);
-            if (old_ids != new_members &&
-                !replaceNetworkMembership(revision->uuid, network.uuid, new_members, error))
-                break;
+            if (old_ids != new_members)
+            {
+                if (fresh_network)
+                {
+                    if (!insertFreshNetworkMembership(*this->backend_, this->database_,
+                                                      *revision, network.uuid,
+                                                      new_members.size(), error))
+                        break;
+                }
+                else if (!replaceNetworkMembership(revision->uuid, network.uuid, new_members, error))
+                    break;
+            }
+            if (profile)
+                membership_ms = profile_clock.elapsed();
             if (!replaceHydraulicReferences(revision->uuid, network, error)) break;
             if (profile)
                 indexed_ms = profile_clock.elapsed();
@@ -1085,7 +1205,10 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
         if (profile)
         {
             if (after->generation == expected_generation)
+            {
                 indexed_ms = profile_clock.elapsed();
+                membership_ms = indexed_ms;
+            }
             grouped_ms = profile_clock.elapsed();
         }
         ok = true;
@@ -1104,6 +1227,8 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
             << " lookup_ms=" << (looked_up_ms - prepared_ms)
             << " writes_ms=" << (written_ms - looked_up_ms)
             << " index_ms=" << (indexed_ms - written_ms)
+            << " membership_ms=" << (membership_ms - written_ms)
+            << " references_ms=" << (indexed_ms - membership_ms)
             << " group_ms=" << (grouped_ms - indexed_ms)
             << " commit_ms=" << (total_ms - grouped_ms)
             << " total_ms=" << total_ms;
