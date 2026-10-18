@@ -1,3 +1,15 @@
+## SQLite schema during development
+
+AOWIS-SERVER-DB currently creates one complete SQLite schema from
+`src/sqlite_schema.cpp`. There is no SQL schema-version counter, historical
+upgrade sequence, or migration/backfill support. Discard disposable development
+DB files when the schema changes. Existing nonempty databases are validated,
+not automatically rewritten.
+
+The V1/V2 *revision hash formats* mentioned below identify immutable
+cryptographic encodings, not SQL schema versions. They remain necessary for
+verifying finalized engineering history.
+
 # Persistence architecture and contracts (v5 typed hydraulic persistence)
 
 ## Stable vocabulary
@@ -46,7 +58,7 @@ V2 uses the same encoding with two changes: the prefix becomes ASCII
 and the 16-byte finalizing actor UUID, followed by the unsigned 64-bit
 big-endian revision creation timestamp, are inserted immediately after the
 revision UUID. Newly finalized revisions use V2; original finalized V1 revisions continue
-to verify unchanged, including after schema migration. A legacy working revision
+to verify unchanged across reopen and long-lived project history. A legacy working revision
 has unknown (null UUID) creator but gets a real finalizer UUID.
 
 The schema permits multiple ordered parents, so future merge commits need no
@@ -75,7 +87,7 @@ revision until copy-on-write object references become available.
 - HTTP authentication and user session/credential management are not implemented.
 - Full edit-operation and security audit histories come after this foundation.
 
-## SQLite operation history: schema V3
+## SQLite operation history
 
 Migration V2 -> V3 adds `operation_events` and `revisions.operation_history_sha256`.
 Every accepted snapshot write creates a UUIDv7 event with actor UUID, revision,
@@ -112,7 +124,7 @@ fine-grained simultaneous editing. Later replace this with per-entity change
 sets, durable grouped transactions, Model-specific inverse commands, and an
 independent security audit trail.
 
-## SQLite model-object foundation: schema V4
+## SQLite model-object persistence
 
 Migration V3 -> V4 adds `revisions.object_mode`, `revision_objects` and an
 append-only `object_events` journal. Existing databases remain in legacy

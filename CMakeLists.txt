@@ -72,8 +72,13 @@ add_library(aowis-db-core STATIC
     include/aowis/db/model_codec.h
     include/aowis/db/model_persistence.h
     src/database.cpp
+    src/storage_backend.h
     src/sqlite_backend.h
     src/sqlite_backend.cpp
+    src/postgres_backend.h
+    src/postgres_backend.cpp
+    src/postgres_schema.cpp
+    src/sqlite_schema.cpp
     src/revision_ancestry.cpp
     src/object_merge_preview.cpp
     src/object_merge_state.h
@@ -136,7 +141,6 @@ if(BUILD_TESTING)
 
     aowis_add_db_test(aowis-db-sqlite-tests aowis-db-sqlite tests/sqlite_test.cpp)
     aowis_add_db_test(aowis-db-backend-contract-tests aowis-db-backend-contract tests/backend_contract_test.cpp)
-    aowis_add_db_test(aowis-db-migration-tests aowis-db-migration tests/sqlite_migration_test.cpp)
     aowis_add_db_test(aowis-db-history-tests aowis-db-history tests/history_test.cpp)
     aowis_add_db_test(aowis-db-revision-ancestry-tests aowis-db-revision-ancestry tests/revision_ancestry_test.cpp)
     aowis_add_db_test(aowis-db-object-merge-preview-tests aowis-db-object-merge-preview tests/object_merge_preview_test.cpp)

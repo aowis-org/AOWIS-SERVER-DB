@@ -1,5 +1,7 @@
 #include <aowis/db/database.h>
 
+#include "storage_backend.h"
+
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
@@ -8,18 +10,13 @@ namespace aowis::db
 {
 namespace
 {
-QUuid readUuid(const QVariant &value)
-{
-    return QUuid::fromRfc4122(value.toByteArray());
-}
-
 void setError(QString *error, const QString &message)
 {
     if (error != nullptr)
         *error = message;
 }
 
-bool selectPage(QSqlQuery &query, const QString &sql,
+bool selectPage(QSqlQuery &query, const StorageBackend &backend, const QString &sql,
                 const QVector<QVariant> &filter_values,
                 const SecurityListOptions &options, QString *error)
 {
@@ -35,8 +32,8 @@ bool selectPage(QSqlQuery &query, const QString &sql,
     }
     for (const QVariant &value : filter_values)
         query.addBindValue(value);
-    query.addBindValue(options.after_uuid.isNull() ? QByteArray(16, '\0')
-                                                     : options.after_uuid.toRfc4122());
+    // A zero UUID is the lower-bound cursor, not SQL NULL.
+    query.addBindValue(backend.bindUuid(options.after_uuid));
     query.addBindValue(options.limit);
     if (!query.exec())
     {
@@ -67,13 +64,13 @@ QVector<UserInfo> Database::securityUsers(const OperationContext &actor,
     if (!requirePermission(actor, QStringLiteral("security.manage"), AccessScope::system(), error))
         return records;
     QSqlQuery query(this->database_);
-    if (!selectPage(query, pagedSql(QStringLiteral(
+    if (!selectPage(query, *this->backend_, pagedSql(QStringLiteral(
             "SELECT uuid,username,disabled_at_ms FROM users WHERE 1=1"),
             QStringLiteral("uuid"), QStringLiteral("disabled_at_ms"), options.include_inactive),
             {}, options, error))
         return records;
     while (query.next())
-        records.append(UserInfo{readUuid(query.value(0)), query.value(1).toString(),
+        records.append(UserInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString(),
                                 !query.value(2).isNull()});
     return records;
 }
@@ -85,13 +82,13 @@ QVector<GroupInfo> Database::securityGroups(const OperationContext &actor,
     if (!requirePermission(actor, QStringLiteral("security.manage"), AccessScope::system(), error))
         return records;
     QSqlQuery query(this->database_);
-    if (!selectPage(query, pagedSql(QStringLiteral(
+    if (!selectPage(query, *this->backend_, pagedSql(QStringLiteral(
             "SELECT uuid,name,disabled_at_ms FROM groups WHERE 1=1"),
             QStringLiteral("uuid"), QStringLiteral("disabled_at_ms"), options.include_inactive),
             {}, options, error))
         return records;
     while (query.next())
-        records.append(GroupInfo{readUuid(query.value(0)), query.value(1).toString(),
+        records.append(GroupInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString(),
                                  !query.value(2).isNull()});
     return records;
 }
@@ -103,12 +100,12 @@ QVector<RoleInfo> Database::securityRoles(const OperationContext &actor,
     if (!requirePermission(actor, QStringLiteral("security.manage"), AccessScope::system(), error))
         return records;
     QSqlQuery query(this->database_);
-    if (!selectPage(query, QStringLiteral(
+    if (!selectPage(query, *this->backend_, QStringLiteral(
             "SELECT uuid,key,builtin FROM roles WHERE uuid>? ORDER BY uuid LIMIT ?"),
             {}, options, error))
         return records;
     while (query.next())
-        records.append(RoleInfo{readUuid(query.value(0)), query.value(1).toString(),
+        records.append(RoleInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString(),
                                 query.value(2).toBool()});
     return records;
 }
@@ -120,12 +117,12 @@ QVector<PermissionInfo> Database::securityPermissions(const OperationContext &ac
     if (!requirePermission(actor, QStringLiteral("security.manage"), AccessScope::system(), error))
         return records;
     QSqlQuery query(this->database_);
-    if (!selectPage(query, QStringLiteral(
+    if (!selectPage(query, *this->backend_, QStringLiteral(
             "SELECT uuid,key,builtin FROM permissions WHERE uuid>? ORDER BY uuid LIMIT ?"),
             {}, options, error))
         return records;
     while (query.next())
-        records.append(PermissionInfo{readUuid(query.value(0)), query.value(1).toString(),
+        records.append(PermissionInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString(),
                                       query.value(2).toBool()});
     return records;
 }
@@ -144,16 +141,19 @@ QVector<GroupMembershipInfo> Database::securityGroupMembers(const OperationConte
         return records;
     }
     QSqlQuery query(this->database_);
-    if (!selectPage(query, pagedSql(QStringLiteral(
+    if (!selectPage(query, *this->backend_, pagedSql(QStringLiteral(
             "SELECT uuid,group_uuid,user_uuid,created_by_uuid,created_at_ms,revoked_at_ms "
             "FROM group_memberships WHERE group_uuid=?"),
             QStringLiteral("uuid"), QStringLiteral("revoked_at_ms"), options.include_inactive),
-            {QVariant(group_uuid.toRfc4122())}, options, error))
+            {this->backend_->bindUuid(group_uuid)}, options, error))
         return records;
     while (query.next())
         records.append(GroupMembershipInfo{
-            readUuid(query.value(0)), readUuid(query.value(1)), readUuid(query.value(2)),
-            readUuid(query.value(3)), query.value(4).toLongLong(), !query.value(5).isNull()});
+            this->backend_->readUuid(query.value(0)),
+            this->backend_->readUuid(query.value(1)),
+            this->backend_->readUuid(query.value(2)),
+            this->backend_->readUuid(query.value(3)),
+            query.value(4).toLongLong(), !query.value(5).isNull()});
     return records;
 }
 
@@ -171,15 +171,17 @@ QVector<RolePermissionGrantInfo> Database::securityRolePermissions(const Operati
         return records;
     }
     QSqlQuery query(this->database_);
-    if (!selectPage(query, pagedSql(QStringLiteral(
+    if (!selectPage(query, *this->backend_, pagedSql(QStringLiteral(
             "SELECT uuid,role_uuid,permission_uuid,revoked_at_ms "
             "FROM role_permissions WHERE role_uuid=?"),
             QStringLiteral("uuid"), QStringLiteral("revoked_at_ms"), options.include_inactive),
-            {QVariant(role_uuid.toRfc4122())}, options, error))
+            {this->backend_->bindUuid(role_uuid)}, options, error))
         return records;
     while (query.next())
         records.append(RolePermissionGrantInfo{
-            readUuid(query.value(0)), readUuid(query.value(1)), readUuid(query.value(2)),
+            this->backend_->readUuid(query.value(0)),
+            this->backend_->readUuid(query.value(1)),
+            this->backend_->readUuid(query.value(2)),
             !query.value(3).isNull()});
     return records;
 }
@@ -199,26 +201,28 @@ QVector<RoleAssignmentInfo> Database::securityRoleAssignments(const OperationCon
         return records;
     }
     QSqlQuery query(this->database_);
-    if (!selectPage(query, pagedSql(QStringLiteral(
+    if (!selectPage(query, *this->backend_, pagedSql(QStringLiteral(
             "SELECT uuid,principal_kind,principal_uuid,role_uuid,scope_kind,scope_uuid,"
             "created_by_uuid,created_at_ms,revoked_at_ms FROM role_assignments "
             "WHERE principal_kind=? AND principal_uuid=?"),
             QStringLiteral("uuid"), QStringLiteral("revoked_at_ms"), options.include_inactive),
             {QVariant(kind == PrincipalKind::User ? QStringLiteral("user") : QStringLiteral("group")),
-             QVariant(principal_uuid.toRfc4122())}, options, error))
+             this->backend_->bindUuid(principal_uuid)}, options, error))
         return records;
     while (query.next())
     {
         const QString scope_kind = query.value(4).toString();
         AccessScope scope = AccessScope::system();
         if (scope_kind == QStringLiteral("project"))
-            scope = AccessScope::project(readUuid(query.value(5)));
+            scope = AccessScope::project(this->backend_->readUuid(query.value(5)));
         else if (scope_kind == QStringLiteral("branch"))
-            scope = AccessScope::branch(readUuid(query.value(5)));
+            scope = AccessScope::branch(this->backend_->readUuid(query.value(5)));
         records.append(RoleAssignmentInfo{
-            readUuid(query.value(0)), kind, readUuid(query.value(2)), readUuid(query.value(3)),
-            scope, readUuid(query.value(6)), query.value(7).toLongLong(),
-            !query.value(8).isNull()});
+            this->backend_->readUuid(query.value(0)), kind,
+            this->backend_->readUuid(query.value(2)),
+            this->backend_->readUuid(query.value(3)), scope,
+            this->backend_->readUuid(query.value(6)),
+            query.value(7).toLongLong(), !query.value(8).isNull()});
     }
     return records;
 }

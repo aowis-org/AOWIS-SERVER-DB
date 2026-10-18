@@ -2,6 +2,7 @@
 #include <aowis/model/uuid.h>
 
 #include "sqlite_backend.h"
+#include "postgres_backend.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -19,11 +20,6 @@ constexpr int digest_length = 32;
 QByteArray uuidBytes(const QUuid &uuid)
 {
     return uuid.toRfc4122();
-}
-
-QUuid readUuid(const QVariant &value)
-{
-    return QUuid::fromRfc4122(value.toByteArray());
 }
 
 void setError(QString *error, const QString &message)
@@ -123,33 +119,48 @@ Database::~Database()
 
 bool Database::openSqlite(const QString &file_path, QString *error)
 {
+    return openWithBackend(std::make_unique<SqliteBackend>(), file_path, error);
+}
+
+bool Database::openPostgres(const QString &database_name, const QString &schema_name,
+                            QString *error)
+{
+    return openWithBackend(std::make_unique<PostgresBackend>(schema_name), database_name, error);
+}
+
+bool Database::openWithBackend(std::unique_ptr<StorageBackend> backend,
+                               const QString &location, QString *error)
+{
     if (this->database_.isValid())
     {
         setError(error, QStringLiteral("Database is already open"));
         return false;
     }
-
-    if (!sqlite_backend::open(this->database_, this->connection_name_, file_path, error) ||
-        !sqlite_backend::configure(this->database_, error) ||
-        !migrate(error) ||
-        !sqlite_backend::verifySchema(this->database_, error))
+    this->backend_ = std::move(backend);
+    if (!this->backend_->open(this->database_, this->connection_name_, location, error) ||
+        !this->backend_->configure(this->database_, error) ||
+        !initializeSchema(error) ||
+        !this->backend_->verifySchema(this->database_, error))
     {
         close();
         return false;
     }
-
     return true;
 }
 
 void Database::close()
 {
     if (!this->database_.isValid())
+    {
+        this->backend_.reset();
         return;
+    }
 
     const QString name = this->connection_name_;
     this->database_.close();
     this->database_ = QSqlDatabase();
     QSqlDatabase::removeDatabase(name);
+    this->backend_.reset();
 }
 
 bool Database::isOpen() const
@@ -168,179 +179,37 @@ bool Database::exec(const QString &sql, QString *error) const
 
 bool Database::beginWrite(QString *error) const
 {
-    return sqlite_backend::beginWrite(this->database_, error);
+    return this->backend_ && this->backend_->beginWrite(this->database_, error);
 }
 
 bool Database::commit(QString *error) const
 {
-    return sqlite_backend::commit(this->database_, error);
+    return this->backend_ && this->backend_->commit(this->database_, error);
 }
 
 void Database::rollback() const
 {
-    sqlite_backend::rollback(this->database_);
+    if (this->backend_)
+        this->backend_->rollback(this->database_);
 }
 
-bool Database::setSchemaVersion(int version, QString *error)
+bool Database::initializeSchema(QString *error)
 {
-    return sqlite_backend::setSchemaVersion(this->database_, version, error);
-}
-
-bool Database::migrate(QString *error)
-{
-    const std::optional<int> stored_version = sqlite_backend::schemaVersion(this->database_, error);
-    if (!stored_version.has_value())
+    const std::optional<bool> existing = this->backend_->hasSchema(this->database_, error);
+    if (!existing)
         return false;
-    const int current = *stored_version;
-    if (current > sqlite_backend::current_schema_version)
-    {
-        setError(error, QStringLiteral("Database schema is newer than this library"));
-        return false;
-    }
-    if (current == sqlite_backend::current_schema_version)
-        return true;
-    if (current == 12)
-        return migrateSessionRedactionV13(error);
-    if (current == 11)
-        return migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 10)
-        return migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 9)
-        return migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 8)
-        return migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 7)
-        return migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 6)
-        return migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 5)
-        return migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 4)
-        return migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 3)
-        return migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 2)
-        return migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current == 1)
-        return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
-    if (current != 0 || !beginWrite(error))
-        return false;
+    if (*existing)
+        return true; // An existing database must pass verifySchema; never upgrade it.
 
-    // SQLite schema v1. All primary identifiers are RFC 4122 16-byte BLOBs.
-    const char *const statements[] = {
-        R"SQL(CREATE TABLE projects (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            name TEXT NOT NULL CHECK(length(name)>0),
-            created_at_ms INTEGER NOT NULL,
-            archived_at_ms INTEGER
-        ))SQL",
-        R"SQL(CREATE TABLE branches (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            project_uuid BLOB NOT NULL REFERENCES projects(uuid) ON DELETE RESTRICT,
-            name TEXT NOT NULL,
-            head_revision_uuid BLOB REFERENCES revisions(uuid) DEFERRABLE INITIALLY DEFERRED,
-            UNIQUE(project_uuid, name),
-            UNIQUE(uuid, project_uuid)
-        ))SQL",
-        R"SQL(CREATE TABLE revisions (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            project_uuid BLOB NOT NULL,
-            branch_uuid BLOB NOT NULL,
-            number INTEGER NOT NULL CHECK(number>=1),
-            state TEXT NOT NULL CHECK(state IN ('working','finalized')),
-            generation INTEGER NOT NULL DEFAULT 0 CHECK(generation>=0),
-            created_at_ms INTEGER NOT NULL,
-            finalized_at_ms INTEGER,
-            title TEXT NOT NULL DEFAULT '',
-            message TEXT NOT NULL DEFAULT '',
-            snapshot_sha256 BLOB CHECK(snapshot_sha256 IS NULL OR length(snapshot_sha256)=32),
-            chain_sha256 BLOB CHECK(chain_sha256 IS NULL OR length(chain_sha256)=32),
-            FOREIGN KEY (branch_uuid, project_uuid) REFERENCES branches(uuid, project_uuid),
-            UNIQUE(branch_uuid, number),
-            CHECK(state!='finalized' OR (finalized_at_ms IS NOT NULL AND snapshot_sha256 IS NOT NULL AND chain_sha256 IS NOT NULL))
-        ))SQL",
-        R"SQL(CREATE TABLE revision_parents (
-            revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,
-            parent_position INTEGER NOT NULL CHECK(parent_position>=0),
-            parent_revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,
-            PRIMARY KEY(revision_uuid,parent_position),
-            UNIQUE(revision_uuid,parent_revision_uuid)
-        ))SQL",
-        R"SQL(CREATE UNIQUE INDEX one_working_revision_per_branch
-            ON revisions(branch_uuid) WHERE state='working')SQL",
-        R"SQL(CREATE INDEX revisions_by_project ON revisions(project_uuid))SQL",
-        R"SQL(CREATE TABLE snapshots (
-            revision_uuid BLOB PRIMARY KEY NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,
-            format_version INTEGER NOT NULL DEFAULT 1 CHECK(format_version=1),
-            content BLOB NOT NULL
-        ))SQL",
-        R"SQL(CREATE TRIGGER finalized_revision_readonly_update
-            BEFORE UPDATE ON revisions WHEN OLD.state='finalized'
-            BEGIN SELECT RAISE(ABORT, 'finalized revisions are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER finalized_revision_readonly_delete
-            BEFORE DELETE ON revisions WHEN OLD.state='finalized'
-            BEGIN SELECT RAISE(ABORT, 'finalized revisions cannot be deleted'); END)SQL",
-        R"SQL(CREATE TRIGGER immutable_revision_identity
-            BEFORE UPDATE ON revisions WHEN OLD.uuid!=NEW.uuid
-                OR OLD.project_uuid!=NEW.project_uuid OR OLD.branch_uuid!=NEW.branch_uuid
-                OR OLD.number!=NEW.number
-            BEGIN SELECT RAISE(ABORT, 'revision identity and ancestry are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER finalized_parents_readonly_insert
-            BEFORE INSERT ON revision_parents
-            WHEN (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized'
-            BEGIN SELECT RAISE(ABORT, 'finalized revision parents are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER parents_readonly_update
-            BEFORE UPDATE ON revision_parents
-            BEGIN SELECT RAISE(ABORT, 'revision parent edges are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER parents_readonly_delete
-            BEFORE DELETE ON revision_parents
-            BEGIN SELECT RAISE(ABORT, 'revision parent edges cannot be deleted'); END)SQL",
-        R"SQL(CREATE TRIGGER parent_must_be_finalized_in_same_project
-            BEFORE INSERT ON revision_parents
-            WHEN NOT EXISTS (
-                SELECT 1 FROM revisions child JOIN revisions parent
-                    ON parent.uuid=NEW.parent_revision_uuid
-                WHERE child.uuid=NEW.revision_uuid AND parent.state='finalized'
-                    AND parent.project_uuid=child.project_uuid)
-            BEGIN SELECT RAISE(ABORT, 'parent must be finalized in same project'); END)SQL",
-        R"SQL(CREATE TRIGGER finalized_snapshot_readonly_update
-            BEFORE UPDATE ON snapshots
-            WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
-            BEGIN SELECT RAISE(ABORT, 'finalized snapshots are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER finalized_snapshot_readonly_delete
-            BEFORE DELETE ON snapshots
-            WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
-            BEGIN SELECT RAISE(ABORT, 'finalized snapshots cannot be deleted'); END)SQL",
-        R"SQL(CREATE TRIGGER finalized_snapshot_readonly_insert
-            BEFORE INSERT ON snapshots
-            WHEN (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized'
-            BEGIN SELECT RAISE(ABORT, 'finalized snapshots cannot be inserted'); END)SQL",
-        R"SQL(CREATE TRIGGER branch_head_must_be_working
-            BEFORE UPDATE OF head_revision_uuid ON branches
-            WHEN NEW.head_revision_uuid IS NOT NULL AND NOT EXISTS (
-                SELECT 1 FROM revisions WHERE uuid=NEW.head_revision_uuid
-                AND branch_uuid=NEW.uuid AND state='working')
-            BEGIN SELECT RAISE(ABORT, 'branch head must be its working revision'); END)SQL",
-        R"SQL(CREATE TRIGGER finalize_requires_snapshot
-            BEFORE UPDATE OF state ON revisions WHEN NEW.state='finalized'
-            AND NOT EXISTS(SELECT 1 FROM snapshots WHERE revision_uuid=NEW.uuid)
-            BEGIN SELECT RAISE(ABORT, 'cannot finalize without a snapshot'); END)SQL"
-    };
-
-    for (const char *statement : statements)
-    {
-        if (!exec(QString::fromUtf8(statement), error))
-        {
-            rollback();
-            return false;
-        }
-    }
-    if (!setSchemaVersion(1, error) || !commit(error))
+    if (!beginWrite(error))
+        return false;
+    if (!this->backend_->createSchema(this->database_, error) ||
+        !seedBuiltinSecurity(error) || !commit(error))
     {
         rollback();
         return false;
     }
-    return migrateSecurityV2(error) && migrateHistoryV3(error) && migrateObjectsV4(error) && migrateObjectGroupsV5(error) && migrateHydraulicMembershipV6(error) && migrateHydraulicReferencesV7(error) && migrateSessionsV8(error) && migrateSecurityAuditV9(error) && migrateSecurityAdminV10(error) && migratePasswordCredentialsV11(error) && migratePasswordRecoveryV12(error) && migrateSessionRedactionV13(error);
+    return true;
 }
 
 std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &actor_uuid, const QString &name, QString *error)
@@ -365,10 +234,10 @@ std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &act
         "INSERT INTO projects (uuid,name,created_at_ms,created_by_uuid) VALUES (?,?,?,?)"), error);
     if (ok)
     {
-        query.addBindValue(uuidBytes(result.project_uuid));
+        query.addBindValue(this->backend_->bindUuid(result.project_uuid));
         query.addBindValue(name.trimmed());
         query.addBindValue(now);
-        query.addBindValue(uuidBytes(actor_uuid));
+        query.addBindValue(this->backend_->bindUuid(actor_uuid));
         ok = run(query, error);
     }
     if (ok)
@@ -377,9 +246,9 @@ std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &act
             "INSERT INTO branches (uuid,project_uuid,name,created_by_uuid) VALUES (?,?,'main',?)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.main_branch_uuid));
-            query.addBindValue(uuidBytes(result.project_uuid));
-            query.addBindValue(uuidBytes(actor_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.main_branch_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.project_uuid));
+            query.addBindValue(this->backend_->bindUuid(actor_uuid));
             ok = run(query, error);
         }
     }
@@ -390,11 +259,11 @@ std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &act
             "VALUES (?,?,?,1,'working',?,?)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.working_revision_uuid));
-            query.addBindValue(uuidBytes(result.project_uuid));
-            query.addBindValue(uuidBytes(result.main_branch_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.working_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.project_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.main_branch_uuid));
             query.addBindValue(now);
-            query.addBindValue(uuidBytes(actor_uuid));
+            query.addBindValue(this->backend_->bindUuid(actor_uuid));
             ok = run(query, error);
         }
     }
@@ -404,8 +273,8 @@ std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &act
             "UPDATE branches SET head_revision_uuid=? WHERE uuid=?"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.working_revision_uuid));
-            query.addBindValue(uuidBytes(result.main_branch_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.working_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.main_branch_uuid));
             ok = run(query, error);
         }
     }
@@ -419,18 +288,24 @@ std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &act
             ok = run(role, error) && role.next();
         if (ok)
         {
-            const QByteArray role_uuid = role.value(0).toByteArray();
+            const QUuid role_uuid = this->backend_->readUuid(role.value(0));
             role.finish();
-            ok = prepare(query, QStringLiteral(
-                "INSERT INTO role_assignments(uuid,principal_kind,principal_uuid,role_uuid,scope_kind,"
-                "scope_uuid,created_by_uuid,created_at_ms) VALUES (?,'user',?,?,'project',?,?,?)"), error);
+            if (role_uuid.isNull())
+            {
+                setError(error, QStringLiteral("Invalid built-in project.owner role UUID"));
+                ok = false;
+            }
+            if (ok)
+                ok = prepare(query, QStringLiteral(
+                    "INSERT INTO role_assignments(uuid,principal_kind,principal_uuid,role_uuid,scope_kind,"
+                    "scope_uuid,created_by_uuid,created_at_ms) VALUES (?,'user',?,?,'project',?,?,?)"), error);
             if (ok)
             {
-                query.addBindValue(uuidBytes(createUuidV7()));
-                query.addBindValue(uuidBytes(actor_uuid));
-                query.addBindValue(role_uuid);
-                query.addBindValue(uuidBytes(result.project_uuid));
-                query.addBindValue(uuidBytes(actor_uuid));
+                query.addBindValue(this->backend_->bindUuid(createUuidV7()));
+                query.addBindValue(this->backend_->bindUuid(actor_uuid));
+                query.addBindValue(this->backend_->bindUuid(role_uuid));
+                query.addBindValue(this->backend_->bindUuid(result.project_uuid));
+                query.addBindValue(this->backend_->bindUuid(actor_uuid));
                 query.addBindValue(now);
                 ok = run(query, error);
             }
@@ -451,7 +326,7 @@ std::optional<ProjectInfo> Database::projectUnchecked(const QUuid &project_uuid,
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("SELECT uuid,name,created_by_uuid FROM projects WHERE uuid=?"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(project_uuid));
+    query.addBindValue(this->backend_->bindUuid(project_uuid));
     if (!run(query, error))
         return std::nullopt;
     if (!query.next())
@@ -459,8 +334,8 @@ std::optional<ProjectInfo> Database::projectUnchecked(const QUuid &project_uuid,
         setError(error, QStringLiteral("Project not found"));
         return std::nullopt;
     }
-    return ProjectInfo{readUuid(query.value(0)), query.value(1).toString(),
-                       readUuid(query.value(2))};
+    return ProjectInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString(),
+                       this->backend_->readUuid(query.value(2))};
 }
 
 QVector<ProjectInfo> Database::projectsUnchecked(QString *error) const
@@ -473,8 +348,8 @@ QVector<ProjectInfo> Database::projectsUnchecked(QString *error) const
         return result;
     }
     while (query.next())
-        result.append(ProjectInfo{readUuid(query.value(0)), query.value(1).toString(),
-                                  readUuid(query.value(2))});
+        result.append(ProjectInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString(),
+                                  this->backend_->readUuid(query.value(2))});
     return result;
 }
 
@@ -486,12 +361,12 @@ QVector<BranchInfo> Database::branchesUnchecked(const QUuid &project_uuid, QStri
             "SELECT uuid,project_uuid,name,head_revision_uuid,created_by_uuid FROM branches "
             "WHERE project_uuid=? ORDER BY name"), error))
         return result;
-    query.addBindValue(uuidBytes(project_uuid));
+    query.addBindValue(this->backend_->bindUuid(project_uuid));
     if (!run(query, error))
         return result;
     while (query.next())
-        result.append(BranchInfo{readUuid(query.value(0)), readUuid(query.value(1)),
-                                 query.value(2).toString(), readUuid(query.value(3)), readUuid(query.value(4))});
+        result.append(BranchInfo{this->backend_->readUuid(query.value(0)), this->backend_->readUuid(query.value(1)),
+                                 query.value(2).toString(), this->backend_->readUuid(query.value(3)), this->backend_->readUuid(query.value(4))});
     return result;
 }
 
@@ -502,12 +377,12 @@ QVector<RevisionInfo> Database::revisionsUnchecked(const QUuid &branch_uuid, QSt
     if (!prepare(query, QStringLiteral(
             "SELECT uuid FROM revisions WHERE branch_uuid=? ORDER BY number"), error))
         return result;
-    query.addBindValue(uuidBytes(branch_uuid));
+    query.addBindValue(this->backend_->bindUuid(branch_uuid));
     if (!run(query, error))
         return result;
     while (query.next())
     {
-        const std::optional<RevisionInfo> item = revisionUnchecked(readUuid(query.value(0)), error);
+        const std::optional<RevisionInfo> item = revisionUnchecked(this->backend_->readUuid(query.value(0)), error);
         if (!item)
             return {};
         result.append(*item);
@@ -521,7 +396,7 @@ std::optional<BranchInfo> Database::branchUnchecked(const QUuid &branch_uuid, QS
     if (!prepare(query, QStringLiteral(
             "SELECT uuid,project_uuid,name,head_revision_uuid,created_by_uuid FROM branches WHERE uuid=?"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(branch_uuid));
+    query.addBindValue(this->backend_->bindUuid(branch_uuid));
     if (!run(query, error))
         return std::nullopt;
     if (!query.next())
@@ -529,8 +404,8 @@ std::optional<BranchInfo> Database::branchUnchecked(const QUuid &branch_uuid, QS
         setError(error, QStringLiteral("Branch not found"));
         return std::nullopt;
     }
-    return BranchInfo{readUuid(query.value(0)), readUuid(query.value(1)),
-                      query.value(2).toString(), readUuid(query.value(3)), readUuid(query.value(4))};
+    return BranchInfo{this->backend_->readUuid(query.value(0)), this->backend_->readUuid(query.value(1)),
+                      query.value(2).toString(), this->backend_->readUuid(query.value(3)), this->backend_->readUuid(query.value(4))};
 }
 
 std::optional<RevisionInfo> Database::revisionUnchecked(const QUuid &revision_uuid, QString *error) const
@@ -541,7 +416,7 @@ std::optional<RevisionInfo> Database::revisionUnchecked(const QUuid &revision_uu
             "snapshot_sha256,chain_sha256,created_at_ms,created_by_uuid,finalized_by_uuid,hash_format_version "
             "FROM revisions WHERE uuid=?"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(revision_uuid));
+    query.addBindValue(this->backend_->bindUuid(revision_uuid));
     if (!run(query, error))
         return std::nullopt;
     if (!query.next())
@@ -550,28 +425,28 @@ std::optional<RevisionInfo> Database::revisionUnchecked(const QUuid &revision_uu
         return std::nullopt;
     }
     RevisionInfo result;
-    result.uuid = readUuid(query.value(0));
-    result.project_uuid = readUuid(query.value(1));
-    result.branch_uuid = readUuid(query.value(2));
+    result.uuid = this->backend_->readUuid(query.value(0));
+    result.project_uuid = this->backend_->readUuid(query.value(1));
+    result.branch_uuid = this->backend_->readUuid(query.value(2));
     result.number = query.value(3).toLongLong();
     result.created_at_ms = query.value(8).toLongLong();
     result.finalized = query.value(4).toString() == QStringLiteral("finalized");
     result.generation = query.value(5).toLongLong();
     result.snapshot_sha256 = query.value(6).toByteArray();
     result.chain_sha256 = query.value(7).toByteArray();
-    result.created_by_uuid = readUuid(query.value(9));
-    result.finalized_by_uuid = readUuid(query.value(10));
+    result.created_by_uuid = this->backend_->readUuid(query.value(9));
+    result.finalized_by_uuid = this->backend_->readUuid(query.value(10));
     result.hash_version = query.value(11).toInt();
     QSqlQuery parents(this->database_);
     if (!prepare(parents, QStringLiteral(
             "SELECT parent_revision_uuid FROM revision_parents WHERE revision_uuid=? "
             "ORDER BY parent_position"), error))
         return std::nullopt;
-    parents.addBindValue(uuidBytes(revision_uuid));
+    parents.addBindValue(this->backend_->bindUuid(revision_uuid));
     if (!run(parents, error))
         return std::nullopt;
     while (parents.next())
-        result.parent_revision_uuids.append(readUuid(parents.value(0)));
+        result.parent_revision_uuids.append(this->backend_->readUuid(parents.value(0)));
     return result;
 }
 
@@ -607,10 +482,10 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
         "INSERT INTO branches (uuid,project_uuid,name,created_by_uuid) VALUES (?,?,?,?)"), error);
     if (ok)
     {
-        query.addBindValue(uuidBytes(result.uuid));
-        query.addBindValue(uuidBytes(project_uuid));
+        query.addBindValue(this->backend_->bindUuid(result.uuid));
+        query.addBindValue(this->backend_->bindUuid(project_uuid));
         query.addBindValue(result.name);
-        query.addBindValue(uuidBytes(actor_uuid));
+        query.addBindValue(this->backend_->bindUuid(actor_uuid));
         ok = run(query, error);
     }
     if (ok)
@@ -620,11 +495,11 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             "VALUES (?,?,?,1,'working',?,?)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.head_revision_uuid));
-            query.addBindValue(uuidBytes(project_uuid));
-            query.addBindValue(uuidBytes(result.uuid));
+            query.addBindValue(this->backend_->bindUuid(result.head_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(project_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.uuid));
             query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-            query.addBindValue(uuidBytes(actor_uuid));
+            query.addBindValue(this->backend_->bindUuid(actor_uuid));
             ok = run(query, error);
         }
     }
@@ -635,8 +510,8 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             "VALUES (?,0,?)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.head_revision_uuid));
-            query.addBindValue(uuidBytes(base_finalized_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.head_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(base_finalized_revision_uuid));
             ok = run(query, error);
         }
     }
@@ -647,8 +522,8 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             "SELECT ?,format_version,content FROM snapshots WHERE revision_uuid=?"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.head_revision_uuid));
-            query.addBindValue(uuidBytes(base_finalized_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.head_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(base_finalized_revision_uuid));
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
@@ -660,8 +535,8 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             "UPDATE revisions SET object_mode=(SELECT object_mode FROM revisions WHERE uuid=?) WHERE uuid=?"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(base_finalized_revision_uuid));
-            query.addBindValue(uuidBytes(result.head_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(base_finalized_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.head_revision_uuid));
             ok = run(query, error);
         }
     }
@@ -671,8 +546,8 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             "UPDATE branches SET head_revision_uuid=? WHERE uuid=?"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.head_revision_uuid));
-            query.addBindValue(uuidBytes(result.uuid));
+            query.addBindValue(this->backend_->bindUuid(result.head_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.uuid));
             ok = run(query, error);
         }
     }
@@ -735,7 +610,7 @@ std::optional<QByteArray> Database::snapshotUnchecked(const QUuid &revision_uuid
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("SELECT content FROM snapshots WHERE revision_uuid=?"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(revision_uuid));
+    query.addBindValue(this->backend_->bindUuid(revision_uuid));
     if (!run(query, error))
         return std::nullopt;
     if (!query.next())
@@ -797,7 +672,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
         {
                 return std::nullopt;
         }
-        stored.addBindValue(uuidBytes(r->uuid));
+        stored.addBindValue(this->backend_->bindUuid(r->uuid));
         stored.addBindValue(*body);
         if (!run(stored, error))
         {
@@ -844,9 +719,9 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
         query.addBindValue(message.isNull() ? QStringLiteral("") : message);
         query.addBindValue(result.snapshot_sha256);
         query.addBindValue(result.chain_sha256);
-        query.addBindValue(uuidBytes(actor_uuid));
+        query.addBindValue(this->backend_->bindUuid(actor_uuid));
         query.addBindValue(*operation_digest);
-        query.addBindValue(uuidBytes(r->uuid));
+        query.addBindValue(this->backend_->bindUuid(r->uuid));
         query.addBindValue(expected_generation);
         ok = run(query, error) && query.numRowsAffected() == 1;
     }
@@ -857,12 +732,12 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             "VALUES (?,?,?,?, 'working',?,?,?)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.new_working_revision_uuid));
-            query.addBindValue(uuidBytes(r->project_uuid));
-            query.addBindValue(uuidBytes(branch_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(r->project_uuid));
+            query.addBindValue(this->backend_->bindUuid(branch_uuid));
             query.addBindValue(r->number + 1);
             query.addBindValue(now);
-            query.addBindValue(uuidBytes(actor_uuid));
+            query.addBindValue(this->backend_->bindUuid(actor_uuid));
             query.addBindValue(*mode);
             ok = run(query, error);
         }
@@ -874,8 +749,8 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             "VALUES (?,0,?)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.new_working_revision_uuid));
-            query.addBindValue(uuidBytes(r->uuid));
+            query.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(r->uuid));
             ok = run(query, error);
         }
     }
@@ -886,8 +761,8 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             "SELECT ?,format_version,content FROM snapshots WHERE revision_uuid=?"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.new_working_revision_uuid));
-            query.addBindValue(uuidBytes(r->uuid));
+            query.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(r->uuid));
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
@@ -899,8 +774,8 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             "UPDATE branches SET head_revision_uuid=? WHERE uuid=?"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(result.new_working_revision_uuid));
-            query.addBindValue(uuidBytes(branch_uuid));
+            query.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(branch_uuid));
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
@@ -930,7 +805,7 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
         report.error = error;
         return report;
     }
-    revisions.addBindValue(uuidBytes(project_uuid));
+    revisions.addBindValue(this->backend_->bindUuid(project_uuid));
     if (!run(revisions, &error))
     {
         report.error = error;
@@ -939,8 +814,8 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
 
     while (revisions.next())
     {
-        const QUuid current_uuid = readUuid(revisions.value(0));
-        const QUuid branch_uuid = readUuid(revisions.value(1));
+        const QUuid current_uuid = this->backend_->readUuid(revisions.value(0));
+        const QUuid branch_uuid = this->backend_->readUuid(revisions.value(1));
         const qint64 number = revisions.value(2).toLongLong();
         const qint64 when = revisions.value(3).toLongLong();
         const QString title = revisions.value(4).toString();
@@ -948,8 +823,8 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
         const QByteArray recorded_snapshot_hash = revisions.value(6).toByteArray();
         const QByteArray recorded_chain_hash = revisions.value(7).toByteArray();
         const int hash_version = revisions.value(8).toInt();
-        const QUuid creator_uuid = readUuid(revisions.value(9));
-        const QUuid finalizer_uuid = readUuid(revisions.value(10));
+        const QUuid creator_uuid = this->backend_->readUuid(revisions.value(9));
+        const QUuid finalizer_uuid = this->backend_->readUuid(revisions.value(10));
         const qint64 created_at_ms = revisions.value(11).toLongLong();
 
         report.failed_revision_uuid = current_uuid;
@@ -968,7 +843,7 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
                 report.error = error;
                 return report;
             }
-            stored.addBindValue(uuidBytes(current_uuid));
+            stored.addBindValue(this->backend_->bindUuid(current_uuid));
             if (!run(stored, &error) || !stored.next() || !body || stored.value(0).toByteArray() != *body)
             {
                 report.error = QStringLiteral("Finalized object manifest differs from persisted snapshot");
@@ -993,7 +868,7 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
             report.error = error;
             return report;
         }
-        operation_seal.addBindValue(uuidBytes(current_uuid));
+        operation_seal.addBindValue(this->backend_->bindUuid(current_uuid));
         if (!run(operation_seal, &error) || !operation_seal.next())
         {
             report.error = error;

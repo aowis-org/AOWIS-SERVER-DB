@@ -47,6 +47,15 @@ int main(int argc, char **argv)
         group->uuid, role->uuid, scope, &error);
     REQUIRE(membership && grant && assignment);
     REQUIRE(db.hasPermission(worker, QStringLiteral("project.model.write"), branch));
+    // Authorization must resolve persisted UUIDs for group, principal, role,
+    // project and branch scopes consistently, not only during SQL insertion.
+    const std::optional<aowis::db::RoleInfo> stored_role =
+        db.role(root, QStringLiteral("local.editor"), &error);
+    const std::optional<aowis::db::PermissionInfo> stored_permission =
+        db.permission(root, QStringLiteral("project.model.write"), &error);
+    REQUIRE(stored_role && stored_role->uuid == role->uuid);
+    REQUIRE(stored_permission && stored_permission->uuid == perm->uuid);
+    REQUIRE(!db.hasPermission(worker, QStringLiteral("project.model.write"), AccessScope::system()));
     const qint64 baseline = db.verifySecurityAudit(root).checked_events;
     REQUIRE(!db.removeGroupMember(worker, *membership, &error));
     REQUIRE(!db.revokeRolePermission(worker, *grant, &error));
@@ -137,64 +146,5 @@ int main(int argc, char **argv)
     REQUIRE(!db.authenticateSession(session->bearer_token, &error));
     REQUIRE(db.authenticateSession(new_session->bearer_token, &error).has_value());
 
-    // Simulate an actual V9 security catalog: old uniqueness constraints and
-    // no revocation columns. The original grants must survive migration.
-    const QString legacy_path = directory.filePath(QStringLiteral("legacy-v9.sqlite"));
-    Database older;
-    REQUIRE(older.openSqlite(legacy_path, &error));
-    const std::optional<aowis::db::UserInfo> legacy_admin = older.bootstrapAdministrator(QStringLiteral("legacy"), &error);
-    REQUIRE(legacy_admin.has_value());
-    const OperationContext legacy_root{legacy_admin->uuid};
-    const std::optional<aowis::db::UserInfo> legacy_user = older.createUser(legacy_root, QStringLiteral("legacy-worker"), &error);
-    const std::optional<aowis::db::GroupInfo> legacy_group = older.createGroup(legacy_root, QStringLiteral("legacy-team"), &error);
-    REQUIRE(legacy_user && legacy_group);
-    const std::optional<QUuid> legacy_membership = older.addGroupMember(
-        legacy_root, legacy_group->uuid, legacy_user->uuid, &error);
-    REQUIRE(legacy_membership.has_value());
-    older.close();
-    {
-        QSqlDatabase inspector = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("legacy-inspector"));
-        inspector.setDatabaseName(legacy_path);
-        REQUIRE(inspector.open());
-        QSqlQuery q(inspector);
-        REQUIRE(q.exec(QStringLiteral("PRAGMA foreign_keys=ON")));
-        REQUIRE(q.exec(QStringLiteral("CREATE TABLE legacy_members_v9 AS SELECT uuid,group_uuid,user_uuid,created_by_uuid,created_at_ms FROM group_memberships")));
-        REQUIRE(q.exec(QStringLiteral("CREATE TABLE legacy_permissions_v9 AS SELECT uuid,role_uuid,permission_uuid FROM role_permissions")));
-        REQUIRE(q.exec(QStringLiteral("CREATE TABLE legacy_assignments_v9 AS SELECT uuid,principal_kind,principal_uuid,role_uuid,scope_kind,scope_uuid,created_by_uuid,created_at_ms FROM role_assignments")));
-        REQUIRE(q.exec(QStringLiteral("DROP TABLE group_memberships")));
-        REQUIRE(q.exec(QStringLiteral("DROP TABLE role_permissions")));
-        REQUIRE(q.exec(QStringLiteral("DROP TABLE role_assignments")));
-        REQUIRE(q.exec(QStringLiteral("ALTER TABLE legacy_members_v9 RENAME TO group_memberships")));
-        REQUIRE(q.exec(QStringLiteral("ALTER TABLE legacy_permissions_v9 RENAME TO role_permissions")));
-        REQUIRE(q.exec(QStringLiteral("ALTER TABLE legacy_assignments_v9 RENAME TO role_assignments")));
-        REQUIRE(q.exec(QStringLiteral("CREATE TRIGGER role_assignment_no_update BEFORE UPDATE ON role_assignments BEGIN SELECT RAISE(ABORT,'legacy'); END")));
-        REQUIRE(q.exec(QStringLiteral("CREATE TRIGGER role_assignment_valid BEFORE INSERT ON role_assignments BEGIN SELECT 1; END")));
-        REQUIRE(q.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
-        REQUIRE(q.exec(QStringLiteral("PRAGMA user_version=9")));
-        q.finish();
-        inspector.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("legacy-inspector"));
-    REQUIRE(older.openSqlite(legacy_path, &error));
-    REQUIRE(older.hasPermission(legacy_root, QStringLiteral("security.manage"), AccessScope::system()));
-    REQUIRE(older.removeGroupMember(legacy_root, *legacy_membership, &error));
-    REQUIRE(older.addGroupMember(legacy_root, legacy_group->uuid, legacy_user->uuid, &error));
-    REQUIRE(older.verifySecurityAudit(legacy_root).valid);
-
-    // A file claiming V10 but missing an essential security trigger is invalid.
-    older.close();
-    {
-        QSqlDatabase inspector = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("broken-v10"));
-        inspector.setDatabaseName(legacy_path);
-        REQUIRE(inspector.open());
-        QSqlQuery query(inspector);
-        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER role_assignment_revoke_only")));
-        query.finish();
-        inspector.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("broken-v10"));
-    error.clear();
-    REQUIRE(!older.openSqlite(legacy_path, &error));
-    REQUIRE(error.contains(QStringLiteral("V10 security grant schema")));
     return 0;
 }

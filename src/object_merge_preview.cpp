@@ -29,10 +29,12 @@ void setError(QString *error, const QString &message)
 struct LiveObjectCursor
 {
     QSqlQuery query;
+    const StorageBackend &backend_;
     std::optional<ModelObject> current;
     QByteArray previous_id;
 
-    explicit LiveObjectCursor(const QSqlDatabase &database) : query(database)
+    LiveObjectCursor(const QSqlDatabase &database, const StorageBackend &backend)
+        : query(database), backend_(backend)
     {
         // SQLite supports interleaved forward-only statements on the same
         // connection. PostgreSQL cannot safely use that access pattern.
@@ -49,7 +51,7 @@ struct LiveObjectCursor
             setError(error, this->query.lastError().text());
             return false;
         }
-        this->query.addBindValue(revision_uuid.toRfc4122());
+        this->query.addBindValue(this->backend_.bindUuid(revision_uuid));
         if (!this->query.exec())
         {
             setError(error, this->query.lastError().text());
@@ -71,9 +73,9 @@ struct LiveObjectCursor
             this->query.finish();
             return true;
         }
-        const QByteArray raw_uuid = this->query.value(0).toByteArray();
-        const QUuid uuid = QUuid::fromRfc4122(raw_uuid);
-        if (uuid.isNull() || raw_uuid.size() != 16 ||
+        const QUuid uuid = this->backend_.readUuid(this->query.value(0));
+        const QByteArray raw_uuid = uuid.toRfc4122();
+        if (uuid.isNull() ||
             (!this->previous_id.isEmpty() && raw_uuid <= this->previous_id))
         {
             setError(error, QStringLiteral("Invalid or duplicate object UUID in revision"));
@@ -101,7 +103,7 @@ bool sameContent(const std::optional<ModelObject> &a, const std::optional<ModelO
 
 } // namespace
 
-std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database,
+std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database, const StorageBackend &backend,
     const QUuid &revision_uuid, QString *error)
 {
     QSqlQuery query(database);
@@ -112,7 +114,7 @@ std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database
         setError(error, query.lastError().text());
         return std::nullopt;
     }
-    query.addBindValue(revision_uuid.toRfc4122());
+    query.addBindValue(backend.bindUuid(revision_uuid));
     if (!query.exec())
     {
         setError(error, query.lastError().text());
@@ -128,7 +130,15 @@ std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database
     };
     while (query.next())
     {
-        addField(query.value(0).toByteArray());
+        const QUuid object_uuid = backend.readUuid(query.value(0));
+        if (object_uuid.isNull())
+        {
+            setError(error, QStringLiteral("Invalid object UUID in physical merge digest"));
+            return std::nullopt;
+        }
+        // The digest remains the same RFC-4122 byte stream, not the SQL
+        // driver's UUID representation. SQLite's historical digest is stable.
+        addField(object_uuid.toRfc4122());
         addField(query.value(1).toString().toUtf8());
         addField(query.value(2).toByteArray());
         addField(QByteArray::number(query.value(3).toLongLong()));
@@ -211,9 +221,9 @@ std::optional<ObjectMergePreview> Database::previewObjectMergeBounded(const Oper
         return fail();
     }
 
-    LiveObjectCursor base_cursor(this->database_);
-    LiveObjectCursor left_cursor(this->database_);
-    LiveObjectCursor right_cursor(this->database_);
+    LiveObjectCursor base_cursor(this->database_, *this->backend_);
+    LiveObjectCursor left_cursor(this->database_, *this->backend_);
+    LiveObjectCursor right_cursor(this->database_, *this->backend_);
     const auto failScan = [&]() -> std::optional<ObjectMergePreview> {
         base_cursor.finish();
         left_cursor.finish();
@@ -229,7 +239,7 @@ std::optional<ObjectMergePreview> Database::previewObjectMergeBounded(const Oper
     // an unjournaled update cannot silently alter the working head between
     // this preview and a subsequent write transaction.
     const std::optional<QByteArray> physical = mergePhysicalObjectDigest(
-        this->database_, left_revision_uuid, error);
+        this->database_, *this->backend_, left_revision_uuid, error);
     if (!physical)
         return failScan();
 

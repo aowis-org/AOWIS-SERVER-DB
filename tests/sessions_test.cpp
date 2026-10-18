@@ -38,6 +38,10 @@ int main(int argc, char **argv)
     REQUIRE(issued->bearer_token.size() == 64);
     REQUIRE(issued->uuid != guest->uuid);
     REQUIRE(db.authenticateSession(issued->bearer_token, &error)->actor_uuid == guest->uuid);
+    const std::optional<aowis::db::ActiveSession> active =
+        db.activeSession(issued->bearer_token, &error);
+    REQUIRE(active.has_value());
+    REQUIRE(active->uuid == issued->uuid && active->user_uuid == guest->uuid);
     REQUIRE(!db.authenticateSession(QByteArrayLiteral("not-a-valid-session"), &error));
     REQUIRE(!db.authenticateSession(issued->bearer_token.toUpper(), &error));
     QByteArray altered = issued->bearer_token;
@@ -51,24 +55,24 @@ int main(int argc, char **argv)
         inspect.setDatabaseName(path);
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 13);
-        REQUIRE(query.exec(QStringLiteral("SELECT token_sha256,uuid FROM user_sessions")));
+        REQUIRE(query.exec(QStringLiteral(
+            "SELECT token_sha256,uuid,user_uuid,created_by_uuid FROM user_sessions")));
         REQUIRE(query.next() && query.value(0).toByteArray().size() == 32);
         REQUIRE(query.value(0).toByteArray() != issued->bearer_token);
         REQUIRE(query.value(1).toByteArray() == issued->uuid.toRfc4122());
+        REQUIRE(query.value(2).toByteArray() == guest->uuid.toRfc4122());
+        REQUIRE(query.value(3).toByteArray() == admin->uuid.toRfc4122());
         query.finish();
-        // Force expiry using privileged SQL solely for the test. V13 renamed
-        // the immutability trigger; preserve and restore its exact definition
-        // so subsequent database opens still validate the complete schema.
+        // Force expiry using privileged SQL solely for this test.
+        // Preserve and restore the guard so subsequent opens remain valid.
         REQUIRE(query.exec(QStringLiteral(
             "SELECT sql FROM sqlite_master WHERE type='trigger' "
-            "AND name='user_sessions_immutable_identity_v13'")));
+            "AND name='user_sessions_immutable_identity'")));
         REQUIRE(query.next());
         const QString original_trigger = query.value(0).toString();
         REQUIRE(!original_trigger.isEmpty());
         query.finish();
-        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER user_sessions_immutable_identity_v13")));
+        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER user_sessions_immutable_identity")));
         REQUIRE(query.prepare(QStringLiteral("UPDATE user_sessions SET expires_at_ms=created_at_ms+1 WHERE uuid=?")));
         query.addBindValue(issued->uuid.toRfc4122());
         REQUIRE(query.exec());
@@ -99,35 +103,5 @@ int main(int argc, char **argv)
     REQUIRE(project.has_value());
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
 
-    // V7 -> V9: simulate a valid V7 installation with existing users and
-    // projects, without session or security-audit tables. Both migrations
-    // must preserve those users and grant audit.read to system admins.
-    const QString legacy_path = directory.filePath(QStringLiteral("upgrade-v7.sqlite"));
-    Database legacy;
-    REQUIRE(legacy.openSqlite(legacy_path, &error));
-    const auto old_admin = legacy.bootstrapAdministrator(QStringLiteral("legacy-admin"), &error);
-    REQUIRE(old_admin.has_value());
-    const auto old_project = legacy.createProject({old_admin->uuid}, QStringLiteral("Historical project"), &error);
-    REQUIRE(old_project.has_value());
-    legacy.close();
-    {
-        QSqlDatabase inspector = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
-                                                            QStringLiteral("downgrade-v7"));
-        inspector.setDatabaseName(legacy_path);
-        REQUIRE(inspector.open());
-        QSqlQuery query(inspector);
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE security_audit_events")));
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE user_sessions")));
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=7")));
-        query.finish();
-        inspector.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("downgrade-v7"));
-    REQUIRE(legacy.openSqlite(legacy_path, &error));
-    REQUIRE(legacy.hasPermission({old_admin->uuid}, QStringLiteral("security.audit.read"),
-        aowis::db::AccessScope::system(), &error));
-    REQUIRE(legacy.project({old_admin->uuid}, old_project->project_uuid, &error).has_value());
-    REQUIRE(legacy.issueSession({old_admin->uuid}, old_admin->uuid, 60, &error).has_value());
     return 0;
 }

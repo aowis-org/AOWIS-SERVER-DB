@@ -34,6 +34,10 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::IssuedSession> first_login =
         db.loginWithPassword(QStringLiteral("engineer"), old_password, 3600, &error);
     REQUIRE(first_login.has_value());
+    const std::optional<aowis::db::ActiveSession> first_active =
+        db.activeSession(first_login->bearer_token, &error);
+    REQUIRE(first_active.has_value());
+    REQUIRE(first_active->uuid == first_login->uuid && first_active->user_uuid == user->uuid);
 
     REQUIRE(!db.issuePasswordRecovery(guest, user->uuid, 900, &error));
     REQUIRE(!db.issuePasswordRecovery(root, user->uuid, 3601, &error));
@@ -48,8 +52,6 @@ int main(int argc, char **argv)
         inspect.setDatabaseName(path);
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 13);
         query.finish();
         REQUIRE(query.exec(QStringLiteral("SELECT token_sha256 FROM password_recovery_tokens")));
         REQUIRE(query.next());
@@ -171,26 +173,5 @@ int main(int argc, char **argv)
     REQUIRE(db.verifySecurityAudit(root).valid);
     REQUIRE(!db.redeemPasswordRecovery(second->token, old_password, &error));
 
-    // An authentic V11 file has no recovery table. Verify V11 -> V12 upgrade.
-    const QString old_path = temp.filePath(QStringLiteral("upgrade-v11.sqlite"));
-    Database legacy;
-    REQUIRE(legacy.openSqlite(old_path, &error));
-    const std::optional<aowis::db::UserInfo> old_admin = legacy.bootstrapAdministrator(QStringLiteral("old-admin"), &error);
-    REQUIRE(old_admin.has_value());
-    legacy.close();
-    {
-        QSqlDatabase inspect = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("recovery-upgrade"));
-        inspect.setDatabaseName(old_path);
-        REQUIRE(inspect.open());
-        QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=11")));
-        query.finish();
-        inspect.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("recovery-upgrade"));
-    REQUIRE(legacy.openSqlite(old_path, &error));
-    REQUIRE(legacy.issuePasswordRecovery({old_admin->uuid}, old_admin->uuid, 900, &error).has_value());
-    REQUIRE(legacy.verifySecurityAudit({old_admin->uuid}).valid);
     return 0;
 }

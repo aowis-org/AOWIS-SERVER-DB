@@ -2,6 +2,7 @@
 #include <aowis/model/uuid.h>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QTemporaryDir>
@@ -53,8 +54,12 @@ int main(int argc, char **argv)
     const std::optional<QUuid> first = db.commitObjectGroup(actor, branch, 0, initial, &error);
     REQUIRE(first.has_value());
     REQUIRE(db.revision(actor, rev1, &error)->generation == 2);
-    REQUIRE(db.objectGroupsForRevision(actor, rev1, &error).size() == 1);
-    REQUIRE(db.objectGroupsForRevision(actor, rev1, &error).first().object_event_uuids.size() == 2);
+    const QVector<aowis::db::ObjectGroup> first_groups = db.objectGroupsForRevision(actor, rev1, &error);
+    REQUIRE(first_groups.size() == 1);
+    REQUIRE(first_groups.first().uuid == *first);
+    REQUIRE(first_groups.first().actor_uuid == actor.actor_uuid);
+    REQUIRE(first_groups.first().target_group_uuid.isNull());
+    REQUIRE(first_groups.first().object_event_uuids.size() == 2);
     REQUIRE(db.objectHistoryForRevision(actor, rev1, &error).size() == 2);
     REQUIRE(db.object(actor, rev1, pipe, &error)->content == QByteArray("pipe A"));
     REQUIRE(!db.commitObjectGroup(actor, branch, 2, {
@@ -74,6 +79,11 @@ int main(int argc, char **argv)
     REQUIRE(db.object(actor, rev1, junction, &error)->deleted);
     REQUIRE(!db.undoObjectGroup(actor, branch, 3, &error));
     REQUIRE(db.undoObjectGroup(actor, branch, 4, &error) == second);
+    const QVector<aowis::db::ObjectGroup> after_group_undo = db.objectGroupsForRevision(actor, rev1, &error);
+    REQUIRE(after_group_undo.size() == 3);
+    REQUIRE(after_group_undo.last().action == QStringLiteral("undo"));
+    REQUIRE(after_group_undo.last().actor_uuid == actor.actor_uuid);
+    REQUIRE(after_group_undo.last().target_group_uuid == *second);
     REQUIRE(db.object(actor, rev1, pipe, &error)->content == QByteArray("pipe A"));
     REQUIRE(!db.object(actor, rev1, junction, &error)->deleted);
     REQUIRE(db.redoObjectGroup(actor, branch, 6, &error) == second);
@@ -109,6 +119,8 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::Finalization> final = db.finalize(actor, branch, 20,
                     QStringLiteral("Grouped history"), QStringLiteral("Undo/redo journal"), &error);
     REQUIRE(final.has_value());
+    REQUIRE(final->snapshot_sha256 == QCryptographicHash::hash(
+        *manifest, QCryptographicHash::Sha256));
     REQUIRE(db.snapshot(actor, rev1, &error) == manifest);
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
     REQUIRE(!db.undoObjectGroup(actor, branch, 0, &error)); // successor has no events

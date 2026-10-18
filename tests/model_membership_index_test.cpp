@@ -50,6 +50,30 @@ int membershipCount(QSqlDatabase &inspection, const QUuid &revision_uuid,
         return -1;
     return query.value(0).toInt();
 }
+// The SQLite adapter must continue storing RFC-4122 BLOBs after the model
+// persistence paths have been routed through StorageBackend::bindUuid().
+bool membershipUuidStorage(QSqlDatabase &inspection, const QUuid &revision_uuid,
+                           const QUuid &network_uuid, const QUuid &entity_uuid)
+{
+    QSqlQuery query(inspection);
+    if (!query.prepare(QStringLiteral(
+            "SELECT typeof(revision_uuid),revision_uuid,typeof(network_uuid),network_uuid,"
+            "typeof(entity_uuid),entity_uuid FROM hydraulic_network_members "
+            "WHERE revision_uuid=? AND network_uuid=? AND entity_uuid=?")))
+        return false;
+    query.addBindValue(revision_uuid.toRfc4122());
+    query.addBindValue(network_uuid.toRfc4122());
+    query.addBindValue(entity_uuid.toRfc4122());
+    if (!query.exec() || !query.next())
+        return false;
+    return query.value(0).toString() == QStringLiteral("blob") &&
+           query.value(1).toByteArray() == revision_uuid.toRfc4122() &&
+           query.value(2).toString() == QStringLiteral("blob") &&
+           query.value(3).toByteArray() == network_uuid.toRfc4122() &&
+           query.value(4).toString() == QStringLiteral("blob") &&
+           query.value(5).toByteArray() == entity_uuid.toRfc4122();
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -78,6 +102,10 @@ int main(int argc, char **argv)
         REQUIRE(inspection.open());
         REQUIRE(membershipCount(inspection, project->working_revision_uuid, first.uuid) == 3);
         REQUIRE(membershipCount(inspection, project->working_revision_uuid, second.uuid) == 3);
+        REQUIRE(membershipUuidStorage(inspection, project->working_revision_uuid,
+                                      first.uuid, first.links_pipes.first().uuid));
+        REQUIRE(membershipUuidStorage(inspection, project->working_revision_uuid,
+                                      second.uuid, second.nodes_junctions.first().uuid));
         inspection.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("index-check"));
@@ -121,50 +149,10 @@ int main(int argc, char **argv)
     }
     QSqlDatabase::removeDatabase(QStringLiteral("index-clone"));
 
-    // Simulate a historical V5 database containing real finalized network
-    // objects: drop only the derived V6 index, retaining every hashed byte.
-    db.close();
-    {
-        QSqlDatabase older = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("v5-backfill"));
-        older.setDatabaseName(path);
-        REQUIRE(older.open());
-        QSqlQuery sql(older);
-        REQUIRE(sql.exec(QStringLiteral("DROP TABLE security_audit_events")));
-        // Verify the synthetic legacy fixture no longer contains V9 objects;
-        // otherwise re-running the V9 migration must reject this database.
-        REQUIRE(sql.exec(QStringLiteral(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
-            "AND name='security_audit_events'")));
-        REQUIRE(sql.next() && sql.value(0).toInt() == 0);
-        sql.finish();
-        REQUIRE(sql.exec(QStringLiteral("DROP TABLE user_sessions")));
-        REQUIRE(sql.exec(QStringLiteral("DROP TABLE hydraulic_network_references")));
-        REQUIRE(sql.exec(QStringLiteral("DROP TABLE hydraulic_network_members")));
-        REQUIRE(sql.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
-        REQUIRE(sql.exec(QStringLiteral("PRAGMA user_version=5")));
-        sql.finish();
-        older.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("v5-backfill"));
-
-    REQUIRE(db.openSqlite(path, &error));
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
     REQUIRE(db.loadHydraulicNetwork(actor, sealed->new_working_revision_uuid, first.uuid, &error).has_value());
-    {
-        QSqlDatabase inspection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("index-backfill"));
-        inspection.setDatabaseName(path);
-        REQUIRE(inspection.open());
-        REQUIRE(membershipCount(inspection, project->working_revision_uuid, first.uuid) == 3);
-        REQUIRE(membershipCount(inspection, sealed->new_working_revision_uuid, second.uuid) == 3);
-        REQUIRE(membershipCount(inspection, branch->head_revision_uuid, second.uuid) == 3);
-        QSqlQuery query(inspection);
-        REQUIRE(query.prepare(QStringLiteral(
-            "DELETE FROM hydraulic_network_members WHERE revision_uuid=?")));
-        query.addBindValue(project->working_revision_uuid.toRfc4122());
-        REQUIRE(!query.exec()); // Finalized revisions retain immutable membership.
-        query.finish();
-        inspection.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("index-backfill"));
+    db.close();
+    REQUIRE(db.openSqlite(path, &error));
+    REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
     return 0;
 }

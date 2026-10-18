@@ -151,31 +151,5 @@ int main(int argc, char **argv)
     REQUIRE(db.activeSession(active->bearer_token).has_value());
     REQUIRE(db.verifySecurityAudit(root).valid);
 
-    // V12 -> V13 migration retains session metadata and seals the same audit
-    // chain. Simulate the exact predecessor trigger and declared schema.
-    const QByteArray existing_active_digest = digestFor(file, active->uuid, QStringLiteral("before-migration"));
-    db.close();
-    {
-        QSqlDatabase inspect = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("redact-v12-fixture"));
-        inspect.setDatabaseName(file);
-        REQUIRE(inspect.open());
-        QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER user_sessions_immutable_identity_v13")));
-        REQUIRE(query.exec(QStringLiteral(
-            "CREATE TRIGGER user_sessions_immutable_identity BEFORE UPDATE ON user_sessions "
-            "WHEN NEW.uuid!=OLD.uuid OR NEW.user_uuid!=OLD.user_uuid "
-            "OR NEW.token_sha256!=OLD.token_sha256 OR NEW.created_by_uuid!=OLD.created_by_uuid "
-            "OR NEW.created_at_ms!=OLD.created_at_ms OR NEW.expires_at_ms!=OLD.expires_at_ms "
-            "OR OLD.revoked_at_ms IS NOT NULL OR NEW.revoked_at_ms IS NULL "
-            "BEGIN SELECT RAISE(ABORT,'session identity is immutable; revoke only once'); END")));
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=12")));
-        query.finish();
-        inspect.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("redact-v12-fixture"));
-    REQUIRE(db.openSqlite(file, &error));
-    REQUIRE(digestFor(file, active->uuid, QStringLiteral("after-migration")) == existing_active_digest);
-    REQUIRE(db.activeSession(active->bearer_token).has_value());
-    REQUIRE(db.verifySecurityAudit(root).valid);
     return 0;
 }

@@ -1,6 +1,8 @@
 #include <aowis/db/database.h>
 #include <aowis/model/uuid.h>
 
+#include "storage_backend.h"
+
 #include <QDateTime>
 #include <QHash>
 #include <QSet>
@@ -12,16 +14,6 @@ namespace aowis::db
 {
 namespace
 {
-QByteArray idBytes(const QUuid &id)
-{
-    return id.toRfc4122();
-}
-
-QUuid asUuid(const QVariant &value)
-{
-    return QUuid::fromRfc4122(value.toByteArray());
-}
-
 void fail(QString *error, const QString &message)
 {
     if (error != nullptr)
@@ -57,74 +49,6 @@ struct StoredEdit
 
 } // namespace
 
-bool Database::migrateObjectGroupsV5(QString *error)
-{
-    if (!beginWrite(error))
-        return false;
-    const char *const statements[] = {
-        R"SQL(ALTER TABLE revisions ADD COLUMN object_journal_version INTEGER NOT NULL DEFAULT 1
-             CHECK(object_journal_version IN (1,2)))SQL",
-        R"SQL(CREATE TABLE object_groups (
-             uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-             revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,
-             actor_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-             action TEXT NOT NULL CHECK(action IN ('edit','undo','redo')),
-             target_group_uuid BLOB REFERENCES object_groups(uuid) ON DELETE RESTRICT,
-             first_sequence INTEGER NOT NULL CHECK(first_sequence>=1),
-             last_sequence INTEGER NOT NULL CHECK(last_sequence>=first_sequence),
-             occurred_at_ms INTEGER NOT NULL,
-             UNIQUE(revision_uuid,first_sequence),
-             CHECK((action='edit' AND target_group_uuid IS NULL) OR
-                   (action!='edit' AND target_group_uuid IS NOT NULL))
-        ))SQL",
-        R"SQL(CREATE INDEX object_groups_by_revision
-              ON object_groups(revision_uuid,last_sequence))SQL",
-        R"SQL(CREATE TABLE object_group_events (
-              group_uuid BLOB NOT NULL REFERENCES object_groups(uuid) ON DELETE RESTRICT,
-              position INTEGER NOT NULL CHECK(position>=0),
-              object_event_uuid BLOB NOT NULL UNIQUE REFERENCES object_events(uuid) ON DELETE RESTRICT,
-              PRIMARY KEY(group_uuid,position)
-        ))SQL",
-        R"SQL(CREATE TRIGGER object_group_insert_guard BEFORE INSERT ON object_groups
-              WHEN NOT EXISTS(SELECT 1 FROM revisions WHERE uuid=NEW.revision_uuid
-                AND state='working' AND object_mode=1 AND generation=NEW.last_sequence)
-                OR (NEW.target_group_uuid IS NOT NULL AND NOT EXISTS (
-                  SELECT 1 FROM object_groups prior WHERE prior.uuid=NEW.target_group_uuid
-                    AND prior.revision_uuid=NEW.revision_uuid AND prior.action='edit'))
-              BEGIN SELECT RAISE(ABORT,'invalid object group or target'); END)SQL",
-        R"SQL(CREATE TRIGGER object_group_update_guard BEFORE UPDATE ON object_groups
-              BEGIN SELECT RAISE(ABORT,'object groups are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER object_group_delete_guard BEFORE DELETE ON object_groups
-              BEGIN SELECT RAISE(ABORT,'object groups are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER object_group_member_insert_guard BEFORE INSERT ON object_group_events
-              WHEN NOT EXISTS(
-                SELECT 1 FROM object_groups g JOIN object_events e ON e.uuid=NEW.object_event_uuid
-                JOIN revisions r ON r.uuid=g.revision_uuid
-                WHERE g.uuid=NEW.group_uuid AND e.revision_uuid=g.revision_uuid
-                  AND e.actor_uuid=g.actor_uuid AND r.state='working'
-                  AND e.sequence BETWEEN g.first_sequence AND g.last_sequence)
-              BEGIN SELECT RAISE(ABORT,'object event/group mismatch'); END)SQL",
-        R"SQL(CREATE TRIGGER object_group_member_update_guard BEFORE UPDATE ON object_group_events
-              BEGIN SELECT RAISE(ABORT,'object group members are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER object_group_member_delete_guard BEFORE DELETE ON object_group_events
-              BEGIN SELECT RAISE(ABORT,'object group members are immutable'); END)SQL"
-    };
-    for (const char *statement : statements)
-    {
-        if (!exec(QString::fromUtf8(statement), error))
-        {
-            rollback();
-            return false;
-        }
-    }
-    if (!setSchemaVersion(5, error) || !commit(error))
-    {
-        rollback();
-        return false;
-    }
-    return true;
-}
-
 std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo &revision,
                                  const OperationContext &actor, const QString &action,
                                  const QUuid &target_uuid, qint64 before_generation,
@@ -142,11 +66,11 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
             "INSERT INTO object_groups(uuid,revision_uuid,actor_uuid,action,target_group_uuid,"
             "first_sequence,last_sequence,occurred_at_ms) VALUES(?,?,?,?,?,?,?,?)"), error))
         return std::nullopt;
-    query.addBindValue(idBytes(group_uuid));
-    query.addBindValue(idBytes(revision.uuid));
-    query.addBindValue(idBytes(actor.actor_uuid));
+    query.addBindValue(this->backend_->bindUuid(group_uuid));
+    query.addBindValue(this->backend_->bindUuid(revision.uuid));
+    query.addBindValue(this->backend_->bindUuid(actor.actor_uuid));
     query.addBindValue(action);
-    query.addBindValue(target_uuid.isNull() ? QVariant() : QVariant(idBytes(target_uuid)));
+    query.addBindValue(target_uuid.isNull() ? QVariant() : this->backend_->bindUuid(target_uuid));
     query.addBindValue(before_generation + 1);
     query.addBindValue(after->generation);
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
@@ -158,7 +82,7 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
             "SELECT uuid FROM object_events WHERE revision_uuid=? AND sequence>? AND sequence<=? "
             "ORDER BY sequence"), error))
         return std::nullopt;
-    member_events.addBindValue(idBytes(revision.uuid));
+    member_events.addBindValue(this->backend_->bindUuid(revision.uuid));
     member_events.addBindValue(before_generation);
     member_events.addBindValue(after->generation);
     if (!run(member_events, error))
@@ -170,9 +94,18 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
         if (!prepare(insert, QStringLiteral(
                 "INSERT INTO object_group_events(group_uuid,position,object_event_uuid) VALUES(?,?,?)"), error))
             return std::nullopt;
-        insert.addBindValue(idBytes(group_uuid));
+        // Convert through the backend: SQLite returns RFC-4122 BLOBs, while
+        // PostgreSQL returns native UUID values. Never forward a raw driver
+        // QVariant from one query as an unvalidated UUID parameter.
+        const QUuid event_uuid = this->backend_->readUuid(member_events.value(0));
+        if (member_events.value(0).isNull() || event_uuid.isNull())
+        {
+            fail(error, QStringLiteral("Invalid object-event UUID in group journal"));
+            return std::nullopt;
+        }
+        insert.addBindValue(this->backend_->bindUuid(group_uuid));
         insert.addBindValue(position);
-        insert.addBindValue(member_events.value(0));
+        insert.addBindValue(this->backend_->bindUuid(event_uuid));
         if (!run(insert, error))
             return std::nullopt;
         ++position;
@@ -186,7 +119,7 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
     if (!prepare(format, QStringLiteral(
             "UPDATE revisions SET object_journal_version=2 WHERE uuid=? AND state='working'"), error))
         return std::nullopt;
-    format.addBindValue(idBytes(revision.uuid));
+    format.addBindValue(this->backend_->bindUuid(revision.uuid));
     if (!run(format, error) || format.numRowsAffected() != 1)
         return std::nullopt;
     return group_uuid;
@@ -259,17 +192,17 @@ QVector<ObjectGroup> Database::objectGroupsForRevision(const OperationContext &a
             "SELECT uuid,actor_uuid,action,target_group_uuid,first_sequence,last_sequence,occurred_at_ms "
             "FROM object_groups WHERE revision_uuid=? ORDER BY first_sequence"), error))
         return result;
-    query.addBindValue(idBytes(revision_uuid));
+    query.addBindValue(this->backend_->bindUuid(revision_uuid));
     if (!run(query, error))
         return result;
     while (query.next())
     {
         ObjectGroup group;
-        group.uuid = asUuid(query.value(0));
+        group.uuid = this->backend_->readUuid(query.value(0));
         group.revision_uuid = revision_uuid;
-        group.actor_uuid = asUuid(query.value(1));
+        group.actor_uuid = this->backend_->readUuid(query.value(1));
         group.action = query.value(2).toString();
-        group.target_group_uuid = query.value(3).isNull() ? QUuid() : asUuid(query.value(3));
+        group.target_group_uuid = query.value(3).isNull() ? QUuid() : this->backend_->readUuid(query.value(3));
         group.first_sequence = query.value(4).toLongLong();
         group.last_sequence = query.value(5).toLongLong();
         group.occurred_at_ms = query.value(6).toLongLong();
@@ -277,11 +210,11 @@ QVector<ObjectGroup> Database::objectGroupsForRevision(const OperationContext &a
         if (!prepare(links, QStringLiteral(
                 "SELECT object_event_uuid FROM object_group_events WHERE group_uuid=? ORDER BY position"), error))
             return {};
-        links.addBindValue(idBytes(group.uuid));
+        links.addBindValue(this->backend_->bindUuid(group.uuid));
         if (!run(links, error))
             return {};
         while (links.next())
-            group.object_event_uuids.append(asUuid(links.value(0)));
+            group.object_event_uuids.append(this->backend_->readUuid(links.value(0)));
         result.append(group);
     }
     return result;
@@ -377,15 +310,15 @@ std::optional<QUuid> Database::compensateObjectGroup(const OperationContext &act
             rollback();
             return std::nullopt;
         }
-        query.addBindValue(idBytes(event_id));
+        query.addBindValue(this->backend_->bindUuid(event_id));
         if (!run(query, error) || !query.next())
         {
             fail(error, QStringLiteral("Missing original object event"));
             rollback();
             return std::nullopt;
         }
-        touched_uuids.insert(asUuid(query.value(0)));
-        edits.append(StoredEdit{asUuid(query.value(0)), query.value(1).toString(),
+        touched_uuids.insert(this->backend_->readUuid(query.value(0)));
+        edits.append(StoredEdit{this->backend_->readUuid(query.value(0)), query.value(1).toString(),
                  query.value(2).toByteArray(), query.value(3).toByteArray(),
                  query.value(2).isNull(), query.value(3).isNull(), query.value(4).toBool()});
     }
@@ -402,8 +335,8 @@ std::optional<QUuid> Database::compensateObjectGroup(const OperationContext &act
             rollback();
             return std::nullopt;
         }
-        current.addBindValue(idBytes(r->uuid));
-        current.addBindValue(idBytes(edit.object_uuid));
+        current.addBindValue(this->backend_->bindUuid(r->uuid));
+        current.addBindValue(this->backend_->bindUuid(edit.object_uuid));
         if (!run(current, error) || !current.next())
         {
             fail(error, QStringLiteral("Undo/redo object missing"));

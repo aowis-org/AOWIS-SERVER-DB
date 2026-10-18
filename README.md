@@ -1,388 +1,61 @@
 # AOWIS-SERVER-DB
 
-AOWIS multi-project, multi-branch revision database. The repository is being rebuilt
-in stages, beginning with an embedded SQLite core. An optional REST server and a
-PostgreSQL adapter are planned, but **not implemented yet**.
+C++ library and optional HTTP/REST server for AOWIS projects. Standalone uses
+SQLite; PostgreSQL is under implementation. `AOWIS-SERVER-MODEL` owns the Model types and
+UUIDv7 generator. WebAssembly clients communicate through the HTTP API.
 
-## Identity and history
+## Current capabilities
 
-- **Project**: independently managed AOWIS project; permanent UUIDv7.
-- **Branch**: named development line belonging to one project; permanent UUIDv7.
-- **Revision**: an individual state on a branch; permanent UUIDv7, with a
-  branch-local sequence number.
-- Creating a project creates its `main` branch and revision 1 (working).
-- Branching is currently allowed only from a finalized revision of the same
-  project. The new branch starts at working revision 1 using that snapshot.
-- Each branch has exactly one current working revision. Finalization creates
-  the next working revision in the same atomic SQLite transaction.
-- Finalized revisions and their snapshot bytes cannot be edited through the
-  library or ordinary SQL updates. SQL triggers enforce this invariant.
-- SHA-256 hashes bind immutable revision metadata, a complete opaque snapshot,
-  and the parent revision's hash. Branches can therefore have different
-  histories with a common finalized ancestor.
-- **Entity-level merges:** `compareRevisions()` reports ancestry and finalized
-  merge bases; `previewObjectMerge()` compares entity states against one merge
-  base; `mergeObjectRevisions()` creates atomic two-parent revisions with
-  explicit entity conflict choices. V39 supports local edits already present
-  on the target working revision while preserving its journal. V40 can also
-  synthesize nonoverlapping top-level field changes for 18 typed hydraulic
-  entity kinds. V41 lets the caller resolve overlapping top-level fields
-  individually while preserving independent changes from both sides, with
-  the prior whole-entity choices remaining available. Merge support remains
-  limited to canonical object-mode data, diverged source lineages and a single
-  finalized merge base. See [V40](docs/model-field-merge-v40.md) and
-  [V41](docs/model-field-resolutions-v41.md).
-- Editing concurrent working snapshots requires an expected edit generation.
-  Stale writes are rejected rather than silently overwriting another client.
+- Multiple projects with separate branches and UUIDv7 revisions.
+- One editable revision per branch; finalized revisions are immutable and
+  SHA-256-linked, including parent hashes and author attribution.
+- Typed hydraulic-model storage, granular objects, reference/membership
+  indexes, edit history, grouped undo/redo, and branch merge operations.
+- User, group, role and permission management, security audit records, bearer
+  sessions, local password credentials, and recovery tokens.
+- Embedded SQLite library and optional HTTP server using the same core.
 
-The schema-v2 security foundation adds UUIDv7 users, groups, custom roles,
-permissions, memberships, grants and scoped role assignments; fixed UUIDs for
-built-in role/permission definitions; and explicit actor-aware reads/writes.
-New finalizations use an authorship-aware SHA-256 V2 chain while v1 finalized
-hashes are preserved. Persistent bearer sessions, password credentials, and password login are now available; see [V26](docs/http-password-login-v26.md).
+## SQLite development database: one schema, no migrations
 
-See [docs/architecture.md](docs/architecture.md) and
-[docs/identity-and-access.md](docs/identity-and-access.md) for the contracts.
+**There is only one current SQLite schema:** `src/sqlite_schema.cpp`.
+
+Opening an empty SQLite database creates the full schema and built-in security
+catalog together in one transaction. Opening an existing database checks that
+its schema and security guards are present. It does not upgrade or silently
+replace an older schema.
+
+**No historical SQLite schema migrations are supported.** This repository is
+still under active development and there is no production data to preserve.
+After schema changes, delete your *development* SQLite file and let the DB
+create a fresh one. Never do this to a database containing data you care about.
+
+Revision hash format identifiers, model codec compatibility checks, and
+immutable project history remain important and are **not** database schema
+migrations. They must not be discarded merely because we rebuild the SQL
+schema while developing.
 
 ## Build and test
 
-Requirements: CMake 3.21+, a C++20 compiler, Qt 6 Core/Sql, OpenSSL libcrypto, Python 3 for schema compatibility checks, the Qt SQLite SQL
-plugin, and the initialized `external/AOWIS-SERVER-MODEL` Git submodule. The Model's existing `createUuidV7()` function is used for IDs.
+Requires CMake 3.21+, C++20, Qt 6 Core/Sql/HttpServer (for HTTP builds),
+OpenSSL, and the checked-out Model submodule. Python 3 is used for Model-codec
+coverage checks.
 
 ```bash
 ./git_submodule_init.sh
 ./compile_linux.sh
 ./compile_linux_tests.sh
-# Optional: ./compile_linux_tests.sh --both
 ```
 
-From the DB repository root, `./git_submodule_update.sh` explicitly moves
-Model to the latest tracked remote revision; review and commit that new gitlink.
-Do not use the update script for normal builds: `git_submodule_init.sh` checks
-out the **pinned** version. The scripts are independent of the shell's working
-directory. The compile script builds the core and enabled HTTP and local admin tools (there is no DB GUI executable).
-
-Alternatively set `-DAOWIS_MODEL_SOURCE_DIR=/path/to/AOWIS-SERVER-MODEL`.
-The library target is `aowis-db-core` (`AOWIS::DB` alias). All Qt SQL connections
-are thread-affine: create one `Database` instance per thread, not one shared
-connection across threads.
-
-## Current scope and limitations
-
-For local initialization, the trusted application must call
-`bootstrapAdministrator(username)` once, then pass an `OperationContext` with
-that actor's UUID to all project APIs. Remote callers use authenticated, revocable sessions, including locally enrolled password login. Database files in schema V1/V2/V3 are
-upgraded transactionally to V4 without changing existing finalized hashes.
-
-The core persists project/branch/revision history, legacy whole snapshots,
-and UUID-keyed object records. **V5 now encodes and reconstructs the entire
-`NetworkHydraulic` structure** with nested metadata, simulation options,
-water-quality/MSX configuration, curves, controls, pipe materials, meters,
-demand points and the 18 entity collections, preserving order and UUIDs.
-`saveHydraulicNetwork` stores each top-level entity separately and records
-per-entity changes in one SQLite transaction. Individual entity updates use
-`putHydraulicEntity` with an expected object version, and can be read through
-`loadHydraulicEntity`. The previous `replaceWorkingSnapshot` interface remains
-only for legacy-mode revisions.
-
-This is typed hydraulic-network persistence, **not yet production-ready full
-project persistence**: project descriptions, external attachment file contents,
-other non-network model domains, domain-reference validation, grouped object
-and additional non-network domains are still outstanding.
-
-The HTTP API, sessions, credentials, model validation, and grouped history are implemented,
-but production internet deployment, complete branch-merge semantics, and the PostgreSQL backend remain incomplete.
-The SQLite file and hash chain are not tamper-proof against the database
-administrator, by design.
-
-## SQLite operation history (schema v3)
-
-Each complete snapshot replacement, undo, and redo is stored as an immutable
-`operation_events` entry in the **same transaction** as the corresponding
-working snapshot update and generation increment. Each entry has a UUIDv7,
-actor UUID, revision/branch/project UUID, timestamp, operation type, target
-when undoing/redoing, and before/after snapshot contents. History survives
-reopening the DB. Existing history is never erased to implement Undo.
-
-`historyForRevision()` reads old finalized revision events (subject to
-`project.history.read`). Finalization stores a separate SHA-256 digest of that
-revision's operation journal, and `verifyProject()` verifies it. **For legacy whole-snapshot revisions, the journal seal is not included
-in the V2 parent hash chain yet**; the verifier checks it separately.
-For object-mode revisions, the manifest hashes its object journal digest, and
-the existing V2 chain authenticates that manifest.
-
-This is a deliberately transitional *whole-snapshot* implementation. It has
-O(snapshot size) storage per edit, and undo/redo reject divergent state rather
-than attempting semantic merges. V4 starts incremental per-object storage and a separate object history,
-but grouped changes and object-level undo/redo are now implemented (V6). Older edits from before the schema-v3 migration
-cannot be reconstructed into journal events, and only working-revision edits
-are undoable. Security administration events are now audited separately in schema V9.
-
-## Share the repository for development
-
-`./tools/zip_db.sh` creates `../db.zip`, packaging tracked and non-ignored
-untracked files (including the initialized Model submodule source tree)
-without Git metadata, secrets, or ignored build artifacts.
-To choose another path, run `./tools/zip_db.sh /path/to/db.zip`.
-
-## Granular object storage (initial V4 foundation)
-
-A new `putObject` / `deleteObject` / `object` / `objects` API persists
-versioned, UUID-keyed model-object blobs with transactionally recorded
-`object_events`. The first write to an empty working revision switches it
-into object mode. Revisions with existing legacy whole-snapshot data stay in
-legacy mode; mixing modes within a revision is prohibited.
-
-Object-mode edits are guarded by **per-object optimistic versions**, allowing
-unrelated objects to change without forcing a branch-wide expected generation
-match. Deletions retain tombstones. Finalization hashes a deterministic
-manifest of the complete object set **and edit journal**, while preserving
-previously finalized hashes. Objects are copied into a new working revision
-after finalization and when branching.
-
-The low-level object API still accepts caller-supplied bytes for compatibility.
-Prefer the V5 typed API for hydraulic networks and entities. See
-[model-persistence.md](docs/model-persistence.md) for the binary contract,
-serialization coverage, migration limitations and current risks.
-
-## Grouped persistence and undo/redo: V6
-
-Use `commitObjectGroup(actor, branch, expected_generation, edits)` to apply
-multiple optimistic-versioned object changes as one durable action. The
-operation rolls back completely on any failure. `undoObjectGroup` and
-`redoObjectGroup` persist inverse/forward changes without deleting prior
-history. Typed whole-network saves, single-object puts and deletes now produce
-undoable groups when they change state. A new V5 SQLite schema migration
-protects grouped history; the finalized manifest covers it without changing
-old V4 hashes. See [object-history-v6.md](docs/object-history-v6.md) for
-exact semantics and limitations.
-
-## Hydraulic model reference validation (V7)
-
-`saveHydraulicNetwork` checks non-null inter-entity references, typed UUID
-relationships (nodes, links, patterns, curves, controls, demand points and
-MSX), plus pipe-position and assigned-junction constraints before committing.
-Use `validateHydraulicNetwork` to retrieve individual diagnostics. Incomplete
-drafts with null link endpoints remain valid. Low-level object writes and
-object-level undo/redo are **not yet** transactionally validated as full models.
-See [model-validation-v7.md](docs/model-validation-v7.md).
-
-## Transactional hydraulic reference validation (V8)
-
-Indexed hydraulic entity edits, low-level grouped object commits, and grouped
-undo/redo validate the final network graph before committing. Invalid changes
-roll back both state and history. See
-[docs/model-object-integrity-v8.md](docs/model-object-integrity-v8.md).
-
-## Indexed network membership (V9; SQLite schema version 6)
-
-`hydraulic_network_members` maps each indexed hydraulic entity to its owning
-network within a revision. A low-level edit now uses indexed ownership lookup
-and reconstructs only the affected network, rather than scanning every root
-and all unrelated model objects. The migration backfills existing finalized
-and working revisions without modifying their hashed snapshots. See
-[model-membership-v9.md](docs/model-membership-v9.md) for details and limits.
-
-## V10 reference index
-
-Schema V7 maintains a derived reverse-reference index for hydraulic networks.
-Simple pipe/junction attribute edits can skip whole-network reconstruction when
-all reference-sensitive fields are unchanged. See [V10 notes](docs/model-references-v10.md).
-
-Full-network SQLite saves use bounded indexed lookups limited to the affected
-network, without scanning objects from unrelated networks. See
-[model-indexed-save-v11.md](docs/model-indexed-save-v11.md).
-
-## Optional development HTTP transport (V17)
-
-When Qt6 HttpServer and Network are installed, CMake additionally builds
-`aowis-db-http`, the local-only `aowis-db-server` executable, and the
-`aowis-db-http` network test. It does not change the SQLite core or require
-HTTP for embedded deployments (`-DAOWIS_DB_BUILD_HTTP=OFF` disables it).
-Read [docs/http-foundation-v17.md](docs/http-foundation-v17.md) for the
-current endpoints, authentication boundary, setup, and security limitations.
-This is a local development transport, **not** an internet-facing service.
-
-## V18 REST model and history operations
-
-The optional HTTP adapter now supports full typed hydraulic network reads and
-atomic saves, generic non-hydraulic grouped object writes, and persistent
-object-group undo/redo and history reads. All requests use the same core
-permissions and transactions as embedded applications. See
-[docs/http-model-and-history-v18.md](docs/http-model-and-history-v18.md)
-for endpoint contracts, request size limits, and the current security boundary.
-
-## V19 persistent HTTP sessions (SQLite schema V8)
-
-The single static development bearer token has been removed. The HTTP server
-now resolves random, per-user bearer sessions through the DB core. Only the
-SHA-256 token digest is persisted, with expiry and revocation; disabling a user
-blocks all their sessions. A local operator can provision sessions through
-`aowis-db-admin` and the server remains bound to loopback. See
-[docs/http-sessions-v19.md](docs/http-sessions-v19.md) for provisioning,
-security boundaries and limitations. Existing revision hashes are unchanged.
-
-## Security administration audit (schema V9)
-
-Security mutations now append hash-linked audit records atomically. Authorized
-operators can page and verify the journal through the C++ API or via
-`aowis-db-admin audit` / `aowis-db-admin audit-verify`. See
-[docs/security-audit-v20.md](docs/security-audit-v20.md). Existing revision
-hashes and model data are unaffected.
-
-## Security administration lifecycle (V21)
-
-Grants and memberships can now be revoked and later re-granted using fresh
-UUIDs, without deleting the original relationships. Disabled users can be
-reactivated, but must receive new sessions. All successful changes are atomic
-with the security audit chain. See [security-admin-v21](docs/security-admin-v21.md).
-
-## Security administration catalog (V22)
-
-Administrative catalog reads are available through the C++ `Database` API
-and authenticated, system-admin-only HTTP GET routes. Pages use UUID cursors
-and include revoked grants only when explicitly requested. See
-[docs/security-catalog-v22.md](docs/security-catalog-v22.md).
-
-## HTTP deployment safety (V24)
-
-The optional HTTP server is loopback-only. It must not be exposed directly to
-an untrusted network. The server has version-aware request limits and
-non-cacheable response headers; remote access requires a separate maintained
-TLS reverse proxy on the same host. See
-[docs/http-hardening-v24.md](docs/http-hardening-v24.md) for the deployment
-boundary and an example reverse-proxy configuration.
-
-## Session self-service (V25)
-
-Authenticated clients can inspect and revoke their current bearer session
-through `GET` and `DELETE /api/v1/session/current`. Logout is atomic with a
-`session.logout` security-audit event and never revokes other sessions. See
-[docs/http-session-self-service-v25.md](docs/http-session-self-service-v25.md).
-
-## Test execution and authentication workload (V30)
-
-`./compile_linux_tests.sh` builds incrementally using Ninja and runs independent
-CTest executables concurrently (four jobs by default). Each executable creates
-its own temporary SQLite database, so tests do not share database files.
-Set `AOWIS_DB_TEST_JOBS=1` for serial test execution or another value from 1
-through 32 to control concurrency. The password KDF remains PBKDF2-HMAC-SHA-256
-with 600,000 iterations in both tests and production; there is no insecure
-"fast test password" mode. Password-change requests reject current-password
-buffers larger than 1024 bytes before running the KDF.
-
-## Password login (V26 / SQLite V11)
-
-Administrators can provision a local password using the trusted
-`aowis-db-admin set-password DB_FILE ADMIN_UUID USER_UUID` command, reading
-the password from stdin. Clients can then obtain 1-hour bearer sessions with
-`POST /api/v1/session/login`. See
-[http-password-login-v26.md](docs/http-password-login-v26.md) for enrollment,
-cryptographic choices, account lockout, and deployment caveats.
-
-## Password recovery (V28)
-
-A trusted local system administrator can issue a short-lived one-time recovery
-token using `aowis-db-admin recover-password`. A user redeems it using
-`POST /api/v1/session/recover`. Tokens are hashed in SQLite, expire within one
-hour, and are invalidated by password changes or account disable. No email
-verification or delivery is implemented. Details: [V28 recovery](docs/http-password-recovery-v28.md).
-
-**Recovery attribution (V35):** issuance is audited under the issuing
-administrator, while redemption and `changed_by_uuid` identify the affected
-account. Possession of its bearer recovery token does not prove the human
-identity of the redeemer; issuer identity remains separately recorded on the
-token. Historical audit hashes are not rewritten.
-
-For local HTTP login throttling and deployment limitations, see
-[docs/http-login-throttle-v31.md](docs/http-login-throttle-v31.md).
-
-## Revoke other sessions (V32)
-
-Authenticated clients can revoke every other active session of their account
-in one audited transaction using `POST /api/v1/session/revoke-others` with an
-empty body. The current bearer session remains valid, and the response reports
-how many sessions were revoked. See
-[docs/http-revoke-others-v32.md](docs/http-revoke-others-v32.md).
-
-## Spent session credential retention (V34 / SQLite V13)
-
-A trusted local administrator can redact the stored bearer-token digests of
-sessions that expired or were revoked before a selected cutoff. Session records,
-UUIDs, timestamps, and the security audit chain remain intact. The default
-maintenance threshold is 30 days and work is limited to 100 sessions per call:
-
-```bash
-./build-linux/aowis-db-admin redact-sessions DATABASE.sqlite ADMIN_UUID [MIN_AGE_DAYS [LIMIT]]
-```
-
-This is a one-way, audited operation; it does **not** delete session records or
-change model revision hashes. See
-[session credential redaction](docs/security-session-redaction-v34.md).
-
-## Read-only entity merge preview (V37)
-
-`Database::previewObjectMerge` provides a three-way object-level change and
-conflict summary for two revisions with exactly one finalized common ancestor.
-It compares canonical kind/content rather than version counters, handles
-creation and deletion, and requires read access on all three source branches
-(including the merge base). Multiple merge bases and legacy snapshot mode
-are rejected. It **does not perform a merge or validate a combined model**.
-See [docs/object-merge-preview-v37.md](docs/object-merge-preview-v37.md).
-
-## Atomic finalized object merges (V38)
-
-`Database::mergeObjectRevisions` builds an atomic two-parent revision from two
-finalized divergent branches using V37 object-level conflicts and explicit
-left/right choices. V39 also permits local edits in the working revision,
-preserving existing journal groups. Changed objects are journaled and affected
-networks undergo structural/reference-consistency checks before finalization. A successful merge returns
-the finalized merge and a new working head. Failures roll back every part.
-See [docs/object-merge-commit-v38.md](docs/object-merge-commit-v38.md) for
-preconditions, permissions, limitations and the no-schema-change guarantee.
-
-## Field-aware merge and append-only tags (V39–V43)
-
-The V39 merge commit preserves existing working edits and object journal groups.
-V40–V42 add typed top-level and `EntityMetadata` subfield-aware merging, plus
-explicit per-field conflict choices. V43 can automatically combine disjoint
-append-only `metadata.tags` changes in deterministic left-then-right order.
-Removals, reordering and overlapping tag additions still conflict. See
-[metadata merge](docs/model-metadata-merge-v42.md) and
-[append-only tags](docs/model-tag-append-merge-v43.md). None of these merges
-runs EPANET; network validation is structural and reference-based.
-
-## V44 — Remote merge inspection
-
-Read-only REST routes for revision ancestry and bounded three-way object merge summaries are documented in [`docs/http-merge-preview-v44.md`](docs/http-merge-preview-v44.md). No merge commit is performed over HTTP.
-
-## V45 — Atomic merges over REST
-
-`POST /api/v1/branches/{branch_uuid}/merge` exposes the existing atomic,
-field-aware two-parent merge commit to authenticated clients. It requires the
-working head UUID and decimal-string generation, a finalized remote revision,
-a title, a message, and explicit choices for conflicts. The core rechecks
-permissions and revision state before committing; no client preview acts as
-an authorization token. See [REST merge commit](docs/http-merge-commit-v45.md).
-
-## V46 — Streaming, bounded merge previews
-
-`Database::previewObjectMerge()` now merges three UUID-ordered SQLite read
-cursors rather than retaining complete base/left/right entity maps. Unchanged
-entities are released as the scan advances. Its C++ return type and existing
-merge-commit behavior are unchanged.
-
-The new `previewObjectMergeBounded()` overload lets remote callers limit both
-changed-entity count and the canonical payload bytes retained for those
-changes. The REST merge preview uses 1,024 changed entities, 16 MiB of source
-contents, and its existing 1 MiB JSON response limit, returning HTTP 409
-without partial data when exceeded. This is a memory bound on materialized
-preview data, not a bounded scan time or pagination system. See
-[HTTP merge-preview limits](docs/http-merge-preview-v44.md).
-
-## SQLite backend boundary (V47)
-
-SQLite connection setup, migration version PRAGMAs, transaction primitives and
-security-schema verification are isolated in `src/sqlite_backend.cpp`; see
-[the V47 backend separation notes](docs/backend-separation-v47.md).
-**PostgreSQL is not implemented yet.**
+`./tools/zip_db.sh` produces `../db.zip` for development review.
+
+For architectural and feature details, see [architecture](docs/architecture.md),
+[model persistence](docs/model-persistence.md), and
+[identity and access](docs/identity-and-access.md).
+
+PostgreSQL has an initial public `Database::openPostgres(database, schema)` path
+([V65](docs/postgresql-core-v65.md)), using the same core and authorization
+logic as SQLite. Full feature parity is **not yet verified**: the live
+PostgreSQL integration test is optional and must be run against a dedicated
+test database before relying on PostgreSQL. SQLite remains the default.
+Complete non-hydraulic project persistence and production-grade HTTP deployment
+remain future work.

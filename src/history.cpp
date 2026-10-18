@@ -1,6 +1,8 @@
 #include <aowis/db/database.h>
 #include <aowis/model/uuid.h>
 
+#include "storage_backend.h"
+
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QHash>
@@ -15,11 +17,6 @@ namespace
 QByteArray uuidBytes(const QUuid &uuid)
 {
     return uuid.toRfc4122();
-}
-
-QUuid readUuid(const QVariant &value)
-{
-    return value.isNull() ? QUuid() : QUuid::fromRfc4122(value.toByteArray());
 }
 
 void setError(QString *error, const QString &message)
@@ -65,6 +62,7 @@ struct HistoryRow
 };
 
 std::optional<QVector<HistoryRow>> loadRows(const QSqlDatabase &database,
+                                             const StorageBackend &backend,
                                              const QUuid &revision_uuid, QString *error)
 {
     QVector<HistoryRow> result;
@@ -74,19 +72,19 @@ std::optional<QVector<HistoryRow>> loadRows(const QSqlDatabase &database,
             "before_present,before_snapshot,after_snapshot,after_present FROM operation_events "
             "WHERE revision_uuid=? ORDER BY sequence"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(revision_uuid));
+    query.addBindValue(backend.bindUuid(revision_uuid));
     if (!run(query, error))
         return std::nullopt;
     while (query.next())
     {
         HistoryRow row;
-        row.event.uuid = readUuid(query.value(0));
+        row.event.uuid = backend.readUuid(query.value(0));
         row.event.revision_uuid = revision_uuid;
-        row.event.actor_uuid = readUuid(query.value(1));
+        row.event.actor_uuid = backend.readUuid(query.value(1));
         row.event.sequence = query.value(2).toLongLong();
         row.event.occurred_at_ms = query.value(3).toLongLong();
         row.event.kind = query.value(4).toString();
-        row.event.target_event_uuid = readUuid(query.value(5));
+        row.event.target_event_uuid = backend.readUuid(query.value(5));
         row.event.had_previous_snapshot = query.value(6).toBool();
         row.before = query.value(7).toByteArray();
         row.after = query.value(8).toByteArray();
@@ -149,70 +147,6 @@ std::optional<Stacks> replay(const QVector<HistoryRow> &rows, QString *error)
 
 } // namespace
 
-bool Database::migrateHistoryV3(QString *error)
-{
-    if (!beginWrite(error))
-        return false;
-    const char *const statements[] = {
-        R"SQL(ALTER TABLE revisions ADD COLUMN operation_history_sha256 BLOB
-            CHECK(operation_history_sha256 IS NULL OR length(operation_history_sha256)=32))SQL",
-        R"SQL(CREATE TABLE operation_events (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            project_uuid BLOB NOT NULL REFERENCES projects(uuid) ON DELETE RESTRICT,
-            branch_uuid BLOB NOT NULL REFERENCES branches(uuid) ON DELETE RESTRICT,
-            revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,
-            sequence INTEGER NOT NULL CHECK(sequence>=1),
-            actor_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-            occurred_at_ms INTEGER NOT NULL,
-            kind TEXT NOT NULL CHECK(kind IN ('replace','undo','redo')),
-            target_event_uuid BLOB REFERENCES operation_events(uuid) ON DELETE RESTRICT,
-            before_present INTEGER NOT NULL CHECK(before_present IN (0,1)),
-            before_snapshot BLOB,
-            after_snapshot BLOB,
-            after_present INTEGER NOT NULL CHECK(after_present IN (0,1)),
-            UNIQUE(revision_uuid,sequence),
-            CHECK((before_present=1 AND before_snapshot IS NOT NULL) OR
-                  (before_present=0 AND before_snapshot IS NULL)),
-            CHECK((kind='replace' AND target_event_uuid IS NULL) OR
-                  (kind IN ('undo','redo') AND target_event_uuid IS NOT NULL)),
-            CHECK((after_present=1 AND after_snapshot IS NOT NULL) OR
-                  (after_present=0 AND after_snapshot IS NULL)),
-            CHECK(kind='undo' OR after_present=1)
-        ))SQL",
-        R"SQL(CREATE INDEX operation_events_by_project ON operation_events(project_uuid,occurred_at_ms))SQL",
-        R"SQL(CREATE TRIGGER operation_events_insert_guard BEFORE INSERT ON operation_events
-            WHEN NOT EXISTS (
-                SELECT 1 FROM revisions r WHERE r.uuid=NEW.revision_uuid
-                AND r.project_uuid=NEW.project_uuid AND r.branch_uuid=NEW.branch_uuid
-                AND r.state='working' AND r.generation=NEW.sequence)
-              OR (NEW.kind IN ('undo','redo') AND NOT EXISTS (
-                SELECT 1 FROM operation_events prior WHERE prior.uuid=NEW.target_event_uuid
-                AND prior.revision_uuid=NEW.revision_uuid AND prior.kind='replace'))
-            BEGIN SELECT RAISE(ABORT,'operation must match current working revision and generation'); END)SQL",
-        R"SQL(CREATE TRIGGER operation_events_update_guard BEFORE UPDATE ON operation_events
-            BEGIN SELECT RAISE(ABORT,'operation history is immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER operation_events_delete_guard BEFORE DELETE ON operation_events
-            BEGIN SELECT RAISE(ABORT,'operation history cannot be deleted'); END)SQL",
-        R"SQL(CREATE TRIGGER finalize_requires_history_hash BEFORE UPDATE OF state ON revisions
-            WHEN NEW.state='finalized' AND NEW.operation_history_sha256 IS NULL
-            BEGIN SELECT RAISE(ABORT,'operation history seal required'); END)SQL"
-    };
-    for (const char *statement : statements)
-    {
-        if (!exec(QString::fromUtf8(statement), error))
-        {
-            rollback();
-            return false;
-        }
-    }
-    if (!setSchemaVersion(3, error) || !commit(error))
-    {
-        rollback();
-        return false;
-    }
-    return true;
-}
-
 // An untrusted snapshot write is never performed directly: it must pass
 // permission and generation checks, and use this helper inside the SAME SQLite
 // transaction as the immutable history record.
@@ -224,7 +158,7 @@ bool Database::applySnapshotOperation(const RevisionInfo &revision, const QUuid 
     QSqlQuery old(this->database_);
     if (!prepare(old, QStringLiteral("SELECT content FROM snapshots WHERE revision_uuid=?"), error))
         return false;
-    old.addBindValue(uuidBytes(revision.uuid));
+    old.addBindValue(this->backend_->bindUuid(revision.uuid));
     if (!run(old, error))
         return false;
     std::optional<QByteArray> previous;
@@ -246,7 +180,7 @@ bool Database::applySnapshotOperation(const RevisionInfo &revision, const QUuid 
             "ON CONFLICT(revision_uuid) DO UPDATE SET content=excluded.content"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(revision.uuid));
+            query.addBindValue(this->backend_->bindUuid(revision.uuid));
             query.addBindValue(*new_snapshot);
             ok = run(query, error);
         }
@@ -256,7 +190,7 @@ bool Database::applySnapshotOperation(const RevisionInfo &revision, const QUuid 
         ok = prepare(query, QStringLiteral("DELETE FROM snapshots WHERE revision_uuid=?"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(revision.uuid));
+            query.addBindValue(this->backend_->bindUuid(revision.uuid));
             ok = run(query, error);
         }
     }
@@ -267,7 +201,7 @@ bool Database::applySnapshotOperation(const RevisionInfo &revision, const QUuid 
         "UPDATE revisions SET generation=generation+1 WHERE uuid=? AND state='working' AND generation=?"), error);
     if (ok)
     {
-        query.addBindValue(uuidBytes(revision.uuid));
+        query.addBindValue(this->backend_->bindUuid(revision.uuid));
         query.addBindValue(revision.generation);
         ok = run(query, error) && query.numRowsAffected() == 1;
     }
@@ -283,15 +217,15 @@ bool Database::applySnapshotOperation(const RevisionInfo &revision, const QUuid 
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"), error);
     if (ok)
     {
-        query.addBindValue(uuidBytes(createUuidV7()));
-        query.addBindValue(uuidBytes(revision.project_uuid));
-        query.addBindValue(uuidBytes(revision.branch_uuid));
-        query.addBindValue(uuidBytes(revision.uuid));
+        query.addBindValue(this->backend_->bindUuid(createUuidV7()));
+        query.addBindValue(this->backend_->bindUuid(revision.project_uuid));
+        query.addBindValue(this->backend_->bindUuid(revision.branch_uuid));
+        query.addBindValue(this->backend_->bindUuid(revision.uuid));
         query.addBindValue(revision.generation + 1);
-        query.addBindValue(uuidBytes(actor_uuid));
+        query.addBindValue(this->backend_->bindUuid(actor_uuid));
         query.addBindValue(QDateTime::currentMSecsSinceEpoch());
         query.addBindValue(kind);
-        query.addBindValue(target_uuid.isNull() ? QVariant() : QVariant(uuidBytes(target_uuid)));
+        query.addBindValue(target_uuid.isNull() ? QVariant() : this->backend_->bindUuid(target_uuid));
         query.addBindValue(previous.has_value() ? 1 : 0);
         query.addBindValue(previous ? QVariant(*previous) : QVariant());
         query.addBindValue(new_snapshot ? QVariant(*new_snapshot) : QVariant());
@@ -303,7 +237,7 @@ bool Database::applySnapshotOperation(const RevisionInfo &revision, const QUuid 
 
 std::optional<QByteArray> Database::historyDigest(const QUuid &revision_uuid, QString *error) const
 {
-    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, revision_uuid, error);
+    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, *this->backend_, revision_uuid, error);
     if (!rows)
         return std::nullopt;
     QByteArray bytes("AOWIS-OPERATIONS-V1\0", 20);
@@ -338,7 +272,7 @@ QVector<HistoryEvent> Database::history(const OperationContext &actor,
     const std::optional<RevisionInfo> revision_info = revisionUnchecked(branch_info->head_revision_uuid, error);
     if (!revision_info)
         return {};
-    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, revision_info->uuid, error);
+    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, *this->backend_, revision_info->uuid, error);
     if (!rows)
         return {};
     QVector<HistoryEvent> result;
@@ -356,7 +290,7 @@ QVector<HistoryEvent> Database::historyForRevision(const OperationContext &actor
     if (!requirePermission(actor, QStringLiteral("project.history.read"),
                            AccessScope::branch(revision_info->branch_uuid), error))
         return {};
-    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, revision_uuid, error);
+    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, *this->backend_, revision_uuid, error);
     if (!rows)
         return {};
     QVector<HistoryEvent> result;
@@ -410,7 +344,7 @@ std::optional<QUuid> Database::undoLastChange(const OperationContext &actor,
         rollback();
         return std::nullopt;
     }
-    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, revision_info->uuid, error);
+    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, *this->backend_, revision_info->uuid, error);
     const std::optional<Stacks> stacks = rows ? replay(*rows, error) : std::nullopt;
     const std::optional<QUuid> target = performReversal(stacks, true, error);
     if (!target)
@@ -426,7 +360,7 @@ std::optional<QUuid> Database::undoLastChange(const OperationContext &actor,
         rollback();
         return std::nullopt;
     }
-    current.addBindValue(uuidBytes(revision_info->uuid));
+    current.addBindValue(this->backend_->bindUuid(revision_info->uuid));
     if (!run(current, error) || !current.next() || current.value(0).toByteArray() != original.after)
     {
         setError(error, QStringLiteral("Undo conflict: snapshot differs from recorded operation"));
@@ -472,7 +406,7 @@ std::optional<QUuid> Database::redoLastChange(const OperationContext &actor,
         rollback();
         return std::nullopt;
     }
-    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, revision_info->uuid, error);
+    const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, *this->backend_, revision_info->uuid, error);
     const std::optional<Stacks> stacks = rows ? replay(*rows, error) : std::nullopt;
     const std::optional<QUuid> target = performReversal(stacks, false, error);
     if (!target)
@@ -487,7 +421,7 @@ std::optional<QUuid> Database::redoLastChange(const OperationContext &actor,
         rollback();
         return std::nullopt;
     }
-    current.addBindValue(uuidBytes(revision_info->uuid));
+    current.addBindValue(this->backend_->bindUuid(revision_info->uuid));
     if (!run(current, error))
     {
         rollback();

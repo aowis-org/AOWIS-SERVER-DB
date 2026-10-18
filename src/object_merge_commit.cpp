@@ -35,8 +35,8 @@ bool execute(QSqlQuery &query, QString *error)
 
 // A new working head is copied byte-for-byte from its finalized parent.
 // Guard against unjournaled SQL edits, including tombstone/version changes.
-bool samePhysicalObjects(const QSqlDatabase &database, const QUuid &working_uuid,
-                         const QUuid &parent_uuid, QString *error)
+bool samePhysicalObjects(const QSqlDatabase &database, const StorageBackend &backend,
+                         const QUuid &working_uuid, const QUuid &parent_uuid, QString *error)
 {
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
@@ -52,10 +52,10 @@ bool samePhysicalObjects(const QSqlDatabase &database, const QUuid &working_uuid
         setError(error, query.lastError().text());
         return false;
     }
-    query.addBindValue(working_uuid.toRfc4122());
-    query.addBindValue(parent_uuid.toRfc4122());
-    query.addBindValue(parent_uuid.toRfc4122());
-    query.addBindValue(working_uuid.toRfc4122());
+    query.addBindValue(backend.bindUuid(working_uuid));
+    query.addBindValue(backend.bindUuid(parent_uuid));
+    query.addBindValue(backend.bindUuid(parent_uuid));
+    query.addBindValue(backend.bindUuid(working_uuid));
     if (!execute(query, error) || !query.next())
         return false;
     if (query.value(0).toBool())
@@ -267,7 +267,7 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
     // captured with the preview. This catches non-journal SQL modifications
     // even if they bypass revision generation counters.
     const std::optional<QByteArray> locked_state = mergePhysicalObjectDigest(
-        this->database_, latest->uuid, error);
+        this->database_, *this->backend_, latest->uuid, error);
     if (!locked_state || *locked_state != preview->left_physical_sha256)
     {
         if (locked_state)
@@ -277,7 +277,7 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
     // Preserve V38's stricter invariant for generation-zero heads: no
     // unjournaled physical difference from the finalized parent is allowed.
     if (latest->generation == 0 &&
-        !samePhysicalObjects(this->database_, latest->uuid, left_uuid, error))
+        !samePhysicalObjects(this->database_, *this->backend_, latest->uuid, left_uuid, error))
         return fail();
     QSqlQuery lookup(this->database_);
     if (!lookup.prepare(QStringLiteral(
@@ -288,8 +288,8 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
     }
     for (ObjectEdit &edit : edits)
     {
-        lookup.bindValue(0, latest->uuid.toRfc4122());
-        lookup.bindValue(1, edit.object_uuid.toRfc4122());
+        lookup.bindValue(0, this->backend_->bindUuid(latest->uuid));
+        lookup.bindValue(1, this->backend_->bindUuid(edit.object_uuid));
         if (!execute(lookup, error))
             return fail();
         edit.expected_version = -1;
@@ -319,8 +319,8 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
         setError(error, parent.lastError().text());
         return fail();
     }
-    parent.addBindValue(latest->uuid.toRfc4122());
-    parent.addBindValue(right_finalized_revision_uuid.toRfc4122());
+    parent.addBindValue(this->backend_->bindUuid(latest->uuid));
+    parent.addBindValue(this->backend_->bindUuid(right_finalized_revision_uuid));
     if (!execute(parent, error))
         return fail();
     const std::optional<RevisionInfo> after = revisionUnchecked(latest->uuid, error);

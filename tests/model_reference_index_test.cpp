@@ -48,6 +48,33 @@ bool hasReference(QSqlDatabase &inspector, const QUuid &revision,
     query.addBindValue(target.toRfc4122());
     return query.exec() && query.next();
 }
+
+// Verify the backend leaves the indexed reference IDs as exact SQLite BLOBs.
+bool referenceUuidStorage(QSqlDatabase &inspector, const QUuid &revision,
+                          const QUuid &network, const QUuid &source, const QUuid &target)
+{
+    QSqlQuery query(inspector);
+    if (!query.prepare(QStringLiteral(
+            "SELECT typeof(revision_uuid),revision_uuid,typeof(network_uuid),network_uuid,"
+            "typeof(source_uuid),source_uuid,typeof(target_uuid),target_uuid "
+            "FROM hydraulic_network_references WHERE revision_uuid=? AND network_uuid=? "
+            "AND source_uuid=? AND target_uuid=? LIMIT 1")))
+        return false;
+    query.addBindValue(revision.toRfc4122());
+    query.addBindValue(network.toRfc4122());
+    query.addBindValue(source.toRfc4122());
+    query.addBindValue(target.toRfc4122());
+    if (!query.exec() || !query.next())
+        return false;
+    const QUuid uuids[]{revision, network, source, target};
+    for (int index = 0; index < 4; ++index)
+    {
+        if (query.value(index * 2).toString() != QStringLiteral("blob") ||
+            query.value(index * 2 + 1).toByteArray() != uuids[index].toRfc4122())
+            return false;
+    }
+    return true;
+}
 }
 
 int main(int argc, char **argv)
@@ -98,6 +125,8 @@ int main(int argc, char **argv)
         REQUIRE(inspector.open());
         REQUIRE(referenceCount(inspector, revision, junction.uuid) == 2); // pipe + point
         REQUIRE(hasReference(inspector, revision, pipe.uuid, reservoir.uuid));
+        REQUIRE(referenceUuidStorage(inspector, revision, network.uuid, pipe.uuid, reservoir.uuid));
+        REQUIRE(referenceUuidStorage(inspector, revision, network.uuid, point.uuid, pipe.uuid));
         REQUIRE(hasReference(inspector, revision, point.uuid, pipe.uuid));
         inspector.close();
     }
@@ -139,6 +168,7 @@ int main(int argc, char **argv)
         REQUIRE(inspector.open());
         REQUIRE(referenceCount(inspector, revision, junction.uuid) == 0);
         REQUIRE(referenceCount(inspector, revision, alternative.uuid) == 2);
+        REQUIRE(referenceUuidStorage(inspector, revision, network.uuid, pipe.uuid, alternative.uuid));
         inspector.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("references-edited"));
@@ -149,6 +179,7 @@ int main(int argc, char **argv)
         inspector.setDatabaseName(file);
         REQUIRE(inspector.open());
         REQUIRE(referenceCount(inspector, revision, junction.uuid) == 2);
+        REQUIRE(referenceUuidStorage(inspector, revision, network.uuid, pipe.uuid, junction.uuid));
         inspector.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("references-undo"));
@@ -161,42 +192,7 @@ int main(int argc, char **argv)
     REQUIRE(sealed.has_value());
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
     db.close();
-    {
-        QSqlDatabase inspector = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("references-old-v6"));
-        inspector.setDatabaseName(file);
-        REQUIRE(inspector.open());
-        QSqlQuery query(inspector);
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE security_audit_events")));
-        // Confirm the fixture has removed the V9 journal before migrating.
-        REQUIRE(query.exec(QStringLiteral(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
-            "AND name='security_audit_events'")));
-        REQUIRE(query.next() && query.value(0).toInt() == 0);
-        query.finish();
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE user_sessions")));
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE hydraulic_network_references")));
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=6")));
-        query.finish();
-        inspector.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("references-old-v6"));
     REQUIRE(db.openSqlite(file, &error));
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
-    {
-        QSqlDatabase inspector = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("references-migrated"));
-        inspector.setDatabaseName(file);
-        REQUIRE(inspector.open());
-        REQUIRE(referenceCount(inspector, revision, alternative.uuid) == 2);
-        REQUIRE(referenceCount(inspector, sealed->new_working_revision_uuid, alternative.uuid) == 2);
-        QSqlQuery query(inspector);
-        REQUIRE(query.prepare(QStringLiteral(
-            "DELETE FROM hydraulic_network_references WHERE revision_uuid=?")));
-        query.addBindValue(revision.toRfc4122());
-        REQUIRE(!query.exec()); // finalized reference index cannot be rewritten
-        query.finish();
-        inspector.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("references-migrated"));
     return 0;
 }

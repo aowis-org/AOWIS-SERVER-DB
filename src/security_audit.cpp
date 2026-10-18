@@ -1,4 +1,5 @@
 #include <aowis/db/database.h>
+#include "storage_backend.h"
 #include <aowis/model/uuid.h>
 
 #include "builtin_identity_ids.h"
@@ -48,13 +49,13 @@ QByteArray eventHash(const SecurityAuditEvent &event)
     return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
 }
 
-SecurityAuditEvent readEvent(const QSqlQuery &query)
+SecurityAuditEvent readEvent(const QSqlQuery &query, const StorageBackend &backend)
 {
     SecurityAuditEvent event;
     event.sequence = query.value(0).toLongLong();
-    event.uuid = QUuid::fromRfc4122(query.value(1).toByteArray());
-    event.actor_uuid = QUuid::fromRfc4122(query.value(2).toByteArray());
-    event.subject_uuid = QUuid::fromRfc4122(query.value(3).toByteArray());
+    event.uuid = backend.readUuid(query.value(1));
+    event.actor_uuid = backend.readUuid(query.value(2));
+    event.subject_uuid = backend.readUuid(query.value(3));
     event.action = query.value(4).toString();
     event.occurred_at_ms = query.value(5).toLongLong();
     event.previous_sha256 = query.value(6).toByteArray();
@@ -68,122 +69,6 @@ QString eventSelect()
                           "previous_sha256,chain_sha256 FROM security_audit_events");
 }
 } // namespace
-
-bool Database::migrateSecurityAuditV9(QString *error)
-{
-    if (!beginWrite(error))
-        return false;
-    const char *const statements[] = {
-        R"SQL(CREATE TABLE security_audit_events (
-            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-            uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16),
-            actor_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-            subject_uuid BLOB NOT NULL CHECK(length(subject_uuid)=16),
-            action TEXT NOT NULL CHECK(length(action)>0),
-            occurred_at_ms INTEGER NOT NULL,
-            previous_sha256 BLOB NOT NULL CHECK(length(previous_sha256)=32),
-            chain_sha256 BLOB NOT NULL CHECK(length(chain_sha256)=32)
-        ))SQL",
-        R"SQL(CREATE INDEX security_audit_by_actor ON security_audit_events(actor_uuid,sequence))SQL",
-        R"SQL(CREATE TRIGGER security_audit_readonly_update
-            BEFORE UPDATE ON security_audit_events
-            BEGIN SELECT RAISE(ABORT,'security audit events are immutable'); END)SQL",
-        R"SQL(CREATE TRIGGER security_audit_readonly_delete
-            BEFORE DELETE ON security_audit_events
-            BEGIN SELECT RAISE(ABORT,'security audit events cannot be deleted'); END)SQL"
-    };
-    for (const char *statement : statements)
-    {
-        if (!exec(QString::fromUtf8(statement), error))
-        {
-            rollback();
-            return false;
-        }
-    }
-    // V8 installations already have their V2 permissions catalog. The new
-    // security.audit.read permission was not present when they were created,
-    // so migrating just the audit table would lock administrators out.
-    // Reuse the pinned built-in UUID, and preserve existing role assignments.
-    const QUuid audit_permission_uuid(QStringLiteral("{%1}").arg(
-        QString::fromLatin1(internal::security_audit_read_permission_uuid)));
-    QSqlQuery permission(this->database_);
-    if (!permission.prepare(QStringLiteral(
-            "INSERT INTO permissions(uuid,key,builtin) VALUES (?,'security.audit.read',1) "
-            "ON CONFLICT(key) DO NOTHING")))
-    {
-        setError(error, permission.lastError().text());
-        rollback();
-        return false;
-    }
-    permission.addBindValue(uuidBytes(audit_permission_uuid));
-    if (!permission.exec())
-    {
-        setError(error, permission.lastError().text());
-        rollback();
-        return false;
-    }
-    permission.finish();
-
-    // The permission UUID and built-in flag must be correct even when a
-    // database already contains a row with that permission key.
-    QSqlQuery canonical(this->database_);
-    if (!canonical.prepare(QStringLiteral(
-            "SELECT uuid,builtin FROM permissions WHERE key='security.audit.read'")) ||
-        !canonical.exec() || !canonical.next() ||
-        canonical.value(0).toByteArray() != uuidBytes(audit_permission_uuid) ||
-        canonical.value(1).toInt() != 1)
-    {
-        setError(error, QStringLiteral("Conflicting built-in security.audit.read permission"));
-        rollback();
-        return false;
-    }
-    canonical.finish();
-
-    // Ensure the system administrator role can actually read the journal.
-    // Existing grants are not duplicated, and other roles are not modified.
-    QSqlQuery assignment(this->database_);
-    if (!assignment.prepare(QStringLiteral(R"SQL(
-        INSERT INTO role_permissions(uuid,role_uuid,permission_uuid)
-        SELECT ?,r.uuid,p.uuid FROM roles r CROSS JOIN permissions p
-        WHERE r.key='system.administrator' AND p.key='security.audit.read'
-          AND NOT EXISTS (SELECT 1 FROM role_permissions rp
-                          WHERE rp.role_uuid=r.uuid AND rp.permission_uuid=p.uuid)
-    )SQL")))
-    {
-        setError(error, assignment.lastError().text());
-        rollback();
-        return false;
-    }
-    assignment.addBindValue(uuidBytes(createUuidV7()));
-    if (!assignment.exec())
-    {
-        setError(error, assignment.lastError().text());
-        rollback();
-        return false;
-    }
-    assignment.finish();
-
-    QSqlQuery grant_check(this->database_);
-    if (!grant_check.exec(QStringLiteral(R"SQL(
-        SELECT 1 FROM role_permissions rp
-        JOIN roles r ON r.uuid=rp.role_uuid
-        JOIN permissions p ON p.uuid=rp.permission_uuid
-        WHERE r.key='system.administrator' AND p.key='security.audit.read'
-    )SQL")) || !grant_check.next())
-    {
-        setError(error, QStringLiteral("Missing system administrator audit-read grant"));
-        rollback();
-        return false;
-    }
-    grant_check.finish();
-
-    if (!setSchemaVersion(9, error) || !commit(error))
-    {
-        rollback();
-        return false;
-    }
-    return true;
-}
 
 bool Database::writeSecurityAuditEvent(const QUuid &actor_uuid, const QString &action,
                                         const QUuid &subject_uuid, QString *error)
@@ -225,9 +110,9 @@ bool Database::writeSecurityAuditEvent(const QUuid &actor_uuid, const QString &a
         return false;
     }
     insert.addBindValue(event.sequence);
-    insert.addBindValue(uuidBytes(event.uuid));
-    insert.addBindValue(uuidBytes(event.actor_uuid));
-    insert.addBindValue(uuidBytes(event.subject_uuid));
+    insert.addBindValue(this->backend_->bindUuid(event.uuid));
+    insert.addBindValue(this->backend_->bindUuid(event.actor_uuid));
+    insert.addBindValue(this->backend_->bindUuid(event.subject_uuid));
     insert.addBindValue(event.action);
     insert.addBindValue(event.occurred_at_ms);
     insert.addBindValue(event.previous_sha256);
@@ -313,7 +198,7 @@ QVector<SecurityAuditEvent> Database::securityAudit(const OperationContext &acto
         return result;
     }
     while (query.next())
-        result.append(readEvent(query));
+        result.append(readEvent(query, *this->backend_));
     return result;
 }
 
@@ -332,7 +217,7 @@ SecurityAuditReport Database::verifySecurityAudit(const OperationContext &actor)
     qint64 expected_sequence = 1;
     while (query.next())
     {
-        const SecurityAuditEvent event = readEvent(query);
+        const SecurityAuditEvent event = readEvent(query, *this->backend_);
         report.failed_sequence = event.sequence;
         if (event.sequence != expected_sequence || event.uuid.isNull() ||
             event.actor_uuid.isNull() || event.subject_uuid.isNull() ||

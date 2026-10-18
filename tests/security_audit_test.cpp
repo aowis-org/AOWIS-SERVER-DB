@@ -83,9 +83,18 @@ int main(int argc, char **argv)
             REQUIRE(entries[i].previous_sha256 == entries[i - 1].chain_sha256);
     }
     REQUIRE(entries.last().action == QStringLiteral("user.disable"));
+    REQUIRE(entries[1].action == QStringLiteral("user.create"));
+    REQUIRE(entries[1].actor_uuid == administrator->uuid);
+    REQUIRE(entries[1].subject_uuid == guest->uuid);
+    REQUIRE(entries[2].action == QStringLiteral("group.create"));
+    REQUIRE(entries[2].subject_uuid == group->uuid);
+    REQUIRE(entries[8].action == QStringLiteral("session.issue"));
+    REQUIRE(entries[8].subject_uuid == session->uuid);
     const QVector<aowis::db::SecurityAuditEvent> page = db.securityAudit(root, 4, 3, &error);
     REQUIRE(page.size() == 3);
     REQUIRE(page.first().sequence == 5 && page.last().sequence == 7);
+    REQUIRE(page.first().uuid == entries[4].uuid);
+    REQUIRE(page.last().actor_uuid == root.actor_uuid);
     REQUIRE(db.securityAudit(root, 0, 1001, &error).isEmpty());
     REQUIRE(db.verifySecurityAudit(root).valid);
     REQUIRE(db.verifySecurityAudit(root).checked_events == entries.size());
@@ -93,7 +102,12 @@ int main(int argc, char **argv)
     db.close();
     REQUIRE(db.openSqlite(file, &error));
     REQUIRE(db.verifySecurityAudit(root).valid);
-    REQUIRE(db.securityAudit(root, 0, 100, &error).size() == entries.size());
+    const QVector<aowis::db::SecurityAuditEvent> reopened = db.securityAudit(root, 0, 100, &error);
+    REQUIRE(reopened.size() == entries.size());
+    REQUIRE(reopened[1].uuid == entries[1].uuid);
+    REQUIRE(reopened[1].actor_uuid == root.actor_uuid);
+    REQUIRE(reopened[1].subject_uuid == guest->uuid);
+    REQUIRE(reopened[1].chain_sha256 == entries[1].chain_sha256);
 
     // Audit failure must roll the corresponding security mutation back.
     // A deliberately failing audit INSERT trigger simulates storage failure.
@@ -136,6 +150,19 @@ int main(int argc, char **argv)
         REQUIRE(inspector.open());
         QSqlQuery query(inspector);
         REQUIRE(query.exec(QStringLiteral("PRAGMA foreign_keys=ON")));
+        // The backend's SQL UUID representation stays as 16-byte SQLite BLOBs.
+        // Hashing, however, is based on RFC-4122 bytes independently of SQL.
+        REQUIRE(query.exec(QStringLiteral(
+            "SELECT uuid,actor_uuid,subject_uuid,typeof(uuid),typeof(actor_uuid),"
+            "typeof(subject_uuid) FROM security_audit_events WHERE sequence=2")));
+        REQUIRE(query.next());
+        REQUIRE(query.value(0).toByteArray() == entries[1].uuid.toRfc4122());
+        REQUIRE(query.value(1).toByteArray() == administrator->uuid.toRfc4122());
+        REQUIRE(query.value(2).toByteArray() == guest->uuid.toRfc4122());
+        REQUIRE(query.value(3).toString() == QStringLiteral("blob"));
+        REQUIRE(query.value(4).toString() == QStringLiteral("blob"));
+        REQUIRE(query.value(5).toString() == QStringLiteral("blob"));
+        query.finish();
         REQUIRE(query.prepare(QStringLiteral("UPDATE security_audit_events SET action='forged' WHERE sequence=2")));
         REQUIRE(!query.exec());
         REQUIRE(query.exec(QStringLiteral("DELETE FROM security_audit_events WHERE sequence=2")) == false);
@@ -153,73 +180,5 @@ int main(int argc, char **argv)
     REQUIRE(error.contains(QStringLiteral("immutability triggers")));
     error.clear();
 
-    // Historical V8 databases upgrade without inventing audit history for
-    // old operations. New events begin at sequence 1 after the migration.
-    const QString legacy_file = directory.filePath(QStringLiteral("upgrade-v8.sqlite"));
-    Database old;
-    REQUIRE(old.openSqlite(legacy_file, &error));
-    const std::optional<aowis::db::UserInfo> old_admin = old.bootstrapAdministrator(
-        QStringLiteral("legacy"), &error);
-    REQUIRE(old_admin.has_value());
-    const OperationContext old_root{old_admin->uuid};
-    const std::optional<aowis::db::UserInfo> old_user = old.createUser(old_root,
-        QStringLiteral("legacy-user"), &error);
-    REQUIRE(old_user.has_value());
-    old.close();
-    {
-        QSqlDatabase inspect = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
-                                                           QStringLiteral("audit-legacy"));
-        inspect.setDatabaseName(legacy_file);
-        REQUIRE(inspect.open());
-        QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE security_audit_events")));
-        // An actual V8 installation has neither the new permission nor its
-        // system-administrator grant. Emulate that, not only the table version.
-        // This deliberately simulates an older schema; remove the newer V10
-        // append-only trigger before deleting the V9-only permission grant.
-        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER role_permission_no_delete")));
-        REQUIRE(query.exec(QStringLiteral(
-            "DELETE FROM role_permissions WHERE permission_uuid IN "
-            "(SELECT uuid FROM permissions WHERE key='security.audit.read')")));
-        REQUIRE(query.exec(QStringLiteral(
-            "DELETE FROM permissions WHERE key='security.audit.read'")));
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=8")));
-        query.finish();
-        inspect.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("audit-legacy"));
-    REQUIRE(old.openSqlite(legacy_file, &error));
-    REQUIRE(old.hasPermission(old_root, QStringLiteral("security.audit.read"),
-        aowis::db::AccessScope::system(), &error));
-    REQUIRE(old.securityAudit(old_root, 0, 100, &error).isEmpty());
-    REQUIRE(old.verifySecurityAudit(old_root).valid);
-    REQUIRE(old.createGroup(old_root, QStringLiteral("new-group"), &error).has_value());
-    const QVector<aowis::db::SecurityAuditEvent> new_history = old.securityAudit(old_root, 0, 100, &error);
-    REQUIRE(new_history.size() == 1 && new_history.first().sequence == 1);
-    REQUIRE(old.verifySecurityAudit(old_root).valid);
-    old.close();
-
-    // A database advertising schema V9 must not be silently accepted after
-    // losing the V9 audit table. Existing audit history must never be
-    // recreated or silently discarded when the migration version is already 9.
-    {
-        QSqlDatabase inspect = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
-                                                            QStringLiteral("audit-incomplete-v9"));
-        inspect.setDatabaseName(legacy_file);
-        REQUIRE(inspect.open());
-        QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 13);
-        query.finish();
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE security_audit_events")));
-        query.finish();
-        inspect.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("audit-incomplete-v9"));
-    error.clear();
-    REQUIRE(!old.openSqlite(legacy_file, &error));
-    REQUIRE(error.contains(QStringLiteral("security_audit_events")) ||
-            error.contains(QStringLiteral("audit schema")));
     return 0;
 }

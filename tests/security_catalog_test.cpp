@@ -33,6 +33,11 @@ int main(int argc, char **argv)
     const std::optional<aowis::db::PermissionInfo> custom = db.createPermission(root, QStringLiteral("test.custom"), &error);
     const std::optional<aowis::db::PermissionInfo> builtin = db.permission(root, QStringLiteral("project.model.write"), &error);
     REQUIRE(alice && bob && team && editor && custom && builtin);
+    const std::optional<aowis::db::RoleInfo> owner_role =
+        db.role(root, QStringLiteral("project.owner"), &error);
+    const std::optional<aowis::db::RoleInfo> administrator_role =
+        db.role(root, QStringLiteral("system.administrator"), &error);
+    REQUIRE(owner_role && administrator_role);
     const std::optional<aowis::db::ProjectCreation> project = db.createProject(root, QStringLiteral("Site"), &error);
     REQUIRE(project);
 
@@ -68,6 +73,47 @@ int main(int argc, char **argv)
     REQUIRE(assignments.size() == 1 && assignments[0].uuid == *assigned);
     REQUIRE(assignments[0].scope.kind == aowis::db::AccessScopeKind::Project);
     REQUIRE(assignments[0].scope.resource_uuid == project->project_uuid);
+    // Bootstrap grants system.admin; project creation additionally grants
+    // project.owner to the creator. Verify both scopes, regardless of order.
+    const QVector<aowis::db::RoleAssignmentInfo> admin_assignments =
+        db.securityRoleAssignments(root, PrincipalKind::User, admin->uuid, {}, &error);
+    REQUIRE(admin_assignments.size() == 2);
+    bool found_system = false;
+    bool found_project = false;
+    for (const aowis::db::RoleAssignmentInfo &assignment : admin_assignments)
+    {
+        REQUIRE(assignment.principal_uuid == admin->uuid);
+        if (assignment.scope.kind == aowis::db::AccessScopeKind::System)
+        {
+            REQUIRE(assignment.role_uuid == administrator_role->uuid);
+            REQUIRE(assignment.scope.resource_uuid.isNull());
+            REQUIRE(!found_system);
+            found_system = true;
+        }
+        else if (assignment.scope.kind == aowis::db::AccessScopeKind::Project)
+        {
+            REQUIRE(assignment.role_uuid == owner_role->uuid);
+            REQUIRE(assignment.scope.resource_uuid == project->project_uuid);
+            REQUIRE(!found_project);
+            found_project = true;
+        }
+        else
+        {
+            REQUIRE(false);
+        }
+    }
+    REQUIRE(found_system && found_project);
+    const QVector<aowis::db::GroupMembershipInfo> member_records =
+        db.securityGroupMembers(root, team->uuid, {}, &error);
+    REQUIRE(member_records.size() == 1 && member_records[0].uuid == *member);
+    REQUIRE(member_records[0].group_uuid == team->uuid);
+    REQUIRE(member_records[0].user_uuid == alice->uuid);
+    REQUIRE(member_records[0].created_by_uuid == admin->uuid);
+    const QVector<aowis::db::RolePermissionGrantInfo> grant_records =
+        db.securityRolePermissions(root, editor->uuid, {}, &error);
+    REQUIRE(grant_records.size() == 1 && grant_records[0].uuid == *grant);
+    REQUIRE(grant_records[0].role_uuid == editor->uuid);
+    REQUIRE(grant_records[0].permission_uuid == builtin->uuid);
     REQUIRE(db.securityRoleAssignments(root, PrincipalKind::User, alice->uuid, {}, &error).isEmpty());
     REQUIRE(db.verifySecurityAudit(root).checked_events == audit_before);
 

@@ -4,6 +4,7 @@
 #include <aowis/db/identity.h>
 #include <aowis/model/hydraulic/network_hydraulic.h>
 
+#include <memory>
 #include <optional>
 #include <functional>
 
@@ -18,6 +19,7 @@
 
 namespace aowis::db
 {
+class StorageBackend;
 
 // Bearer token is returned exactly once and never stored in plaintext.
 struct IssuedSession
@@ -82,7 +84,7 @@ struct ProjectInfo
 {
     QUuid uuid;
     QString name;
-    QUuid created_by_uuid; // Null for imported schema-v1 records.
+    QUuid created_by_uuid; // Creator identity.
 };
 
 struct ProjectCreation
@@ -98,7 +100,7 @@ struct BranchInfo
     QUuid project_uuid;
     QString name;
     QUuid head_revision_uuid;
-    QUuid created_by_uuid; // Null for imported schema-v1 records.
+    QUuid created_by_uuid; // Creator identity.
 };
 
 struct RevisionInfo
@@ -291,6 +293,11 @@ public:
     Database &operator=(Database &&) = delete;
 
     bool openSqlite(const QString &file_path, QString *error = nullptr);
+    // Open a PostgreSQL database using QPSQL/libpq credentials. schema_name
+    // must name an existing schema; the default deployment schema is "public".
+    // The same domain operations and permission rules are used as for SQLite.
+    bool openPostgres(const QString &database_name, const QString &schema_name,
+                      QString *error = nullptr);
     void close();
     bool isOpen() const;
 
@@ -534,20 +541,8 @@ private:
     bool beginWrite(QString *error = nullptr) const;
     bool commit(QString *error = nullptr) const;
     void rollback() const;
-    bool migrate(QString *error);
-    bool setSchemaVersion(int version, QString *error);
-    bool migrateSecurityV2(QString *error);
-    bool migrateHistoryV3(QString *error);
-    bool migrateObjectsV4(QString *error);
-    bool migrateObjectGroupsV5(QString *error);
-    bool migrateHydraulicMembershipV6(QString *error);
-    bool migrateHydraulicReferencesV7(QString *error);
-    bool migrateSessionsV8(QString *error);
-    bool migrateSessionRedactionV13(QString *error);
-    bool migrateSecurityAuditV9(QString *error);
-    bool migrateSecurityAdminV10(QString *error);
-    bool migratePasswordCredentialsV11(QString *error);
-    bool migratePasswordRecoveryV12(QString *error);
+    bool initializeSchema(QString *error);
+    bool seedBuiltinSecurity(QString *error);
     bool writeSecurityAuditEvent(const QUuid &actor_uuid, const QString &action,
                                  const QUuid &subject_uuid, QString *error);
     bool auditedSecurityMutation(const QUuid &actor_uuid, const QString &action,
@@ -619,8 +614,12 @@ private:
                                                  const QString &message, QString *error);
     IntegrityReport verifyProjectUnchecked(const QUuid &project_uuid) const;
 
+    bool openWithBackend(std::unique_ptr<StorageBackend> backend,
+                         const QString &location, QString *error);
+
     QString connection_name_;
     QSqlDatabase database_;
+    std::unique_ptr<StorageBackend> backend_;
 };
 
 } // namespace aowis::db

@@ -59,7 +59,7 @@ system grant applies to all resources. Group rights require active group
 membership. Role assignment references and scopes are validated with SQLite
 triggers; uniqueness and foreign keys prevent duplicate and dangling grants.
 
-## Immutable provenance and hash migration
+## Immutable provenance and hash encodings
 
 New project, branch, and revision rows record their creating actor UUID.
 Finalization stores the finalizing actor's UUID. New finalized revisions use

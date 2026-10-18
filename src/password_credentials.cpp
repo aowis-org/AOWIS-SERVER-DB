@@ -1,6 +1,7 @@
 #include <aowis/db/database.h>
 #include <aowis/model/uuid.h>
 #include "session_token_internal.h"
+#include "storage_backend.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -61,34 +62,7 @@ void dummyPasswordCheck(const QByteArray &password)
     (void)derivePassword(password, dummy_salt, password_iterations);
 }
 
-QByteArray uuidBytes(const QUuid &uuid)
-{
-    return uuid.toRfc4122();
-}
-
 } // namespace
-
-bool Database::migratePasswordCredentialsV11(QString *error)
-{
-    if (!beginWrite(error))
-        return false;
-    if (!exec(QStringLiteral(R"SQL(CREATE TABLE IF NOT EXISTS user_password_credentials (
-        user_uuid BLOB PRIMARY KEY NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-        salt BLOB NOT NULL CHECK(length(salt)=16),
-        verifier BLOB NOT NULL CHECK(length(verifier)=32),
-        iterations INTEGER NOT NULL CHECK(iterations>=100000 AND iterations<=2000000),
-        changed_at_ms INTEGER NOT NULL,
-        changed_by_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-        failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK(failed_attempts>=0 AND failed_attempts<=5),
-        locked_until_ms INTEGER NOT NULL DEFAULT 0
-    ))SQL"), error) ||
-        !setSchemaVersion(11, error) || !commit(error))
-    {
-        rollback();
-        return false;
-    }
-    return true;
-}
 
 bool Database::setUserPassword(const OperationContext &admin, const QUuid &user_uuid,
                                const QByteArray &password, QString *error)
@@ -125,8 +99,8 @@ bool Database::setUserPassword(const OperationContext &admin, const QUuid &user_
         query.addBindValue(password_iterations);
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
         query.addBindValue(now);
-        query.addBindValue(uuidBytes(admin.actor_uuid));
-        query.addBindValue(uuidBytes(user_uuid));
+        query.addBindValue(this->backend_->bindUuid(admin.actor_uuid));
+        query.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!query.exec() || query.numRowsAffected() != 1)
         {
             setError(error, QStringLiteral("User not found or disabled"));
@@ -142,7 +116,7 @@ bool Database::setUserPassword(const OperationContext &admin, const QUuid &user_
             return false;
         }
         query.addBindValue(now);
-        query.addBindValue(uuidBytes(user_uuid));
+        query.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!query.exec())
         {
             setError(error, query.lastError().text());
@@ -157,7 +131,7 @@ bool Database::setUserPassword(const OperationContext &admin, const QUuid &user_
             return false;
         }
         query.addBindValue(now);
-        query.addBindValue(uuidBytes(user_uuid));
+        query.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!query.exec())
         {
             setError(error, query.lastError().text());
@@ -199,7 +173,7 @@ bool Database::changeOwnPassword(const QByteArray &bearer_token,
         setError(error, lookup.lastError().text());
         return false;
     }
-    lookup.addBindValue(uuidBytes(session->user_uuid));
+    lookup.addBindValue(this->backend_->bindUuid(session->user_uuid));
     if (!lookup.exec())
     {
         setError(error, lookup.lastError().text());
@@ -253,7 +227,7 @@ bool Database::changeOwnPassword(const QByteArray &bearer_token,
         rollback();
         return false;
     }
-    check.addBindValue(uuidBytes(session->user_uuid));
+    check.addBindValue(this->backend_->bindUuid(session->user_uuid));
     if (!check.exec())
     {
         setError(error, check.lastError().text());
@@ -285,7 +259,7 @@ bool Database::changeOwnPassword(const QByteArray &bearer_token,
             const int attempts = locked_until > 0 ? 1 : qMin(password_failure_limit, failures + 1);
             count.addBindValue(attempts);
             count.addBindValue(attempts == password_failure_limit ? now + password_lockout_ms : 0);
-            count.addBindValue(uuidBytes(session->user_uuid));
+            count.addBindValue(this->backend_->bindUuid(session->user_uuid));
             if (!count.exec() || count.numRowsAffected() != 1)
             {
                 setError(error, count.lastError().text());
@@ -318,8 +292,8 @@ bool Database::changeOwnPassword(const QByteArray &bearer_token,
     update.addBindValue(new_verifier);
     update.addBindValue(password_iterations);
     update.addBindValue(now);
-    update.addBindValue(uuidBytes(session->user_uuid));
-    update.addBindValue(uuidBytes(session->user_uuid));
+    update.addBindValue(this->backend_->bindUuid(session->user_uuid));
+    update.addBindValue(this->backend_->bindUuid(session->user_uuid));
     if (!update.exec() || update.numRowsAffected() != 1)
     {
         setError(error, update.lastError().text());
@@ -336,7 +310,7 @@ bool Database::changeOwnPassword(const QByteArray &bearer_token,
         return false;
     }
     sessions.addBindValue(now);
-    sessions.addBindValue(uuidBytes(session->user_uuid));
+    sessions.addBindValue(this->backend_->bindUuid(session->user_uuid));
     if (!sessions.exec())
     {
         setError(error, sessions.lastError().text());
@@ -354,7 +328,7 @@ bool Database::changeOwnPassword(const QByteArray &bearer_token,
         return false;
     }
     recovery.addBindValue(now);
-    recovery.addBindValue(uuidBytes(session->user_uuid));
+    recovery.addBindValue(this->backend_->bindUuid(session->user_uuid));
     if (!recovery.exec())
     {
         setError(error, recovery.lastError().text());
@@ -403,7 +377,7 @@ std::optional<IssuedSession> Database::loginWithPassword(const QString &username
         setError(error, failure);
         return std::nullopt;
     }
-    const QUuid user_uuid = QUuid::fromRfc4122(lookup.value(0).toByteArray());
+    const QUuid user_uuid = this->backend_->readUuid(lookup.value(0));
     const QByteArray salt = lookup.value(1).toByteArray();
     const QByteArray verifier = lookup.value(2).toByteArray();
     const int iterations = lookup.value(3).toInt();
@@ -433,7 +407,7 @@ std::optional<IssuedSession> Database::loginWithPassword(const QString &username
         rollback();
         return std::nullopt;
     }
-    check.addBindValue(uuidBytes(user_uuid));
+    check.addBindValue(this->backend_->bindUuid(user_uuid));
     if (!check.exec())
     {
         setError(error, check.lastError().text());
@@ -462,7 +436,7 @@ std::optional<IssuedSession> Database::loginWithPassword(const QString &username
             const int count = lock_expiry > 0 ? 1 : qMin(password_failure_limit, failures + 1);
             update.addBindValue(count);
             update.addBindValue(count == password_failure_limit ? now + password_lockout_ms : 0);
-            update.addBindValue(uuidBytes(user_uuid));
+            update.addBindValue(this->backend_->bindUuid(user_uuid));
             if (!update.exec() || !commit(error))
             {
                 rollback();
@@ -477,7 +451,7 @@ std::optional<IssuedSession> Database::loginWithPassword(const QString &username
     // Enforce the same per-user quota as administrator-issued sessions. This
     // check occurs under BEGIN IMMEDIATE, after password verification, so
     // concurrent logins cannot exceed the limit.
-    if (!hasSessionCapacity(this->database_, user_uuid, now, error))
+    if (!hasSessionCapacity(this->database_, *this->backend_, user_uuid, now, error))
     {
         // Do not disclose the account's session usage through a login reply.
         setError(error, failure);
@@ -501,10 +475,10 @@ std::optional<IssuedSession> Database::loginWithPassword(const QString &username
         rollback();
         return std::nullopt;
     }
-    insert.addBindValue(uuidBytes(session.uuid));
-    insert.addBindValue(uuidBytes(user_uuid));
+    insert.addBindValue(this->backend_->bindUuid(session.uuid));
+    insert.addBindValue(this->backend_->bindUuid(user_uuid));
     insert.addBindValue(sessionTokenDigest(QByteArray::fromHex(random)));
-    insert.addBindValue(uuidBytes(user_uuid));
+    insert.addBindValue(this->backend_->bindUuid(user_uuid));
     insert.addBindValue(now);
     insert.addBindValue(session.expires_at_ms);
     if (!insert.exec())
@@ -522,7 +496,7 @@ std::optional<IssuedSession> Database::loginWithPassword(const QString &username
         rollback();
         return std::nullopt;
     }
-    reset_failures.addBindValue(uuidBytes(user_uuid));
+    reset_failures.addBindValue(this->backend_->bindUuid(user_uuid));
     if (!reset_failures.exec())
     {
         setError(error, reset_failures.lastError().text());
@@ -559,51 +533,6 @@ QByteArray recoveryDigest(const QByteArray &token)
 }
 } // namespace
 
-bool Database::migratePasswordRecoveryV12(QString *error)
-{
-    if (!beginWrite(error))
-        return false;
-    const char *const statements[] = {
-        R"SQL(CREATE TABLE password_recovery_tokens (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            user_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-            token_sha256 BLOB NOT NULL UNIQUE CHECK(length(token_sha256)=32),
-            issued_by_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-            issued_at_ms INTEGER NOT NULL,
-            expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>issued_at_ms),
-            used_at_ms INTEGER,
-            invalidated_at_ms INTEGER,
-            CHECK(used_at_ms IS NULL OR used_at_ms>=issued_at_ms),
-            CHECK(invalidated_at_ms IS NULL OR invalidated_at_ms>=issued_at_ms),
-            CHECK(used_at_ms IS NULL OR invalidated_at_ms IS NULL)
-        ))SQL",
-        R"SQL(CREATE INDEX recovery_tokens_by_user ON password_recovery_tokens(user_uuid))SQL",
-        R"SQL(CREATE TRIGGER recovery_tokens_no_delete BEFORE DELETE ON password_recovery_tokens
-            BEGIN SELECT RAISE(ABORT,'recovery tokens cannot be deleted'); END)SQL",
-        R"SQL(CREATE TRIGGER recovery_tokens_close_only BEFORE UPDATE ON password_recovery_tokens
-            WHEN NEW.uuid!=OLD.uuid OR NEW.user_uuid!=OLD.user_uuid
-               OR NEW.token_sha256!=OLD.token_sha256 OR NEW.issued_by_uuid!=OLD.issued_by_uuid
-               OR NEW.issued_at_ms!=OLD.issued_at_ms OR NEW.expires_at_ms!=OLD.expires_at_ms
-               OR OLD.used_at_ms IS NOT NEW.used_at_ms AND OLD.used_at_ms IS NOT NULL
-               OR OLD.invalidated_at_ms IS NOT NEW.invalidated_at_ms AND OLD.invalidated_at_ms IS NOT NULL
-            BEGIN SELECT RAISE(ABORT,'recovery identity and closure are immutable'); END)SQL"
-    };
-    for (const char *statement : statements)
-    {
-        if (!exec(QString::fromUtf8(statement), error))
-        {
-            rollback();
-            return false;
-        }
-    }
-    if (!setSchemaVersion(12, error) || !commit(error))
-    {
-        rollback();
-        return false;
-    }
-    return true;
-}
-
 std::optional<IssuedRecoveryToken> Database::issuePasswordRecovery(
     const OperationContext &admin, const QUuid &user_uuid, qint64 lifetime_seconds, QString *error)
 {
@@ -637,7 +566,7 @@ std::optional<IssuedRecoveryToken> Database::issuePasswordRecovery(
             setError(error, exists.lastError().text());
             return false;
         }
-        exists.addBindValue(uuidBytes(user_uuid));
+        exists.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!exists.exec() || !exists.next())
         {
             setError(error, QStringLiteral("User not found or disabled"));
@@ -655,7 +584,7 @@ std::optional<IssuedRecoveryToken> Database::issuePasswordRecovery(
             return false;
         }
         invalidate.addBindValue(now);
-        invalidate.addBindValue(uuidBytes(user_uuid));
+        invalidate.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!invalidate.exec())
         {
             setError(error, invalidate.lastError().text());
@@ -670,10 +599,10 @@ std::optional<IssuedRecoveryToken> Database::issuePasswordRecovery(
             setError(error, insert.lastError().text());
             return false;
         }
-        insert.addBindValue(uuidBytes(result.uuid));
-        insert.addBindValue(uuidBytes(user_uuid));
+        insert.addBindValue(this->backend_->bindUuid(result.uuid));
+        insert.addBindValue(this->backend_->bindUuid(user_uuid));
         insert.addBindValue(digest);
-        insert.addBindValue(uuidBytes(admin.actor_uuid));
+        insert.addBindValue(this->backend_->bindUuid(admin.actor_uuid));
         insert.addBindValue(now);
         insert.addBindValue(result.expires_at_ms);
         if (!insert.exec())
@@ -766,8 +695,8 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
         rollback();
         return false;
     }
-    const QUuid recovery_uuid = QUuid::fromRfc4122(lookup.value(0).toByteArray());
-    const QUuid user_uuid = QUuid::fromRfc4122(lookup.value(1).toByteArray());
+    const QUuid recovery_uuid = this->backend_->readUuid(lookup.value(0));
+    const QUuid user_uuid = this->backend_->readUuid(lookup.value(1));
     lookup.finish();
     QSqlQuery close_token(this->database_);
     if (!close_token.prepare(QStringLiteral(
@@ -779,7 +708,7 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
         return false;
     }
     close_token.addBindValue(now);
-    close_token.addBindValue(uuidBytes(recovery_uuid));
+    close_token.addBindValue(this->backend_->bindUuid(recovery_uuid));
     close_token.addBindValue(now);
     if (!close_token.exec() || close_token.numRowsAffected() != 1)
     {
@@ -799,7 +728,7 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
         rollback();
         return false;
     }
-    update.addBindValue(uuidBytes(user_uuid));
+    update.addBindValue(this->backend_->bindUuid(user_uuid));
     update.addBindValue(salt);
     update.addBindValue(verifier);
     update.addBindValue(password_iterations);
@@ -808,7 +737,7 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
     // not participation by the administrator who originally issued it.
     // Attribution is to the affected account; the issuer remains recorded
     // separately in password_recovery_tokens.issued_by_uuid.
-    update.addBindValue(uuidBytes(user_uuid));
+    update.addBindValue(this->backend_->bindUuid(user_uuid));
     if (!update.exec())
     {
         setError(error, update.lastError().text());
@@ -825,7 +754,7 @@ bool Database::redeemPasswordRecovery(const QByteArray &token, const QByteArray 
         return false;
     }
     sessions.addBindValue(now);
-    sessions.addBindValue(uuidBytes(user_uuid));
+    sessions.addBindValue(this->backend_->bindUuid(user_uuid));
     if (!sessions.exec())
     {
         setError(error, sessions.lastError().text());

@@ -2,6 +2,7 @@
 #include <aowis/model/uuid.h>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QTemporaryDir>
@@ -46,6 +47,7 @@ int main(int argc, char **argv)
     REQUIRE(!db.putObject(unauthorized, branch, pipe, QStringLiteral("hydraulic.pipe"), first, -1, &error));
     REQUIRE(!db.putObject(root, branch, pipe, QStringLiteral("INVALID KIND"), first, -1, &error));
     REQUIRE(db.putObject(root, branch, pipe, QStringLiteral("hydraulic.pipe"), first, -1, &error));
+    REQUIRE(db.object(root, rev1, pipe, &error)->uuid == pipe);
     REQUIRE(db.object(root, rev1, pipe, &error)->version == 1);
     REQUIRE(db.object(root, rev1, pipe, &error)->content == first);
     REQUIRE(!db.object(unauthorized, rev1, pipe, &error).has_value());
@@ -62,17 +64,31 @@ int main(int argc, char **argv)
     REQUIRE(db.putObject(root, branch, pipe, QStringLiteral("hydraulic.pipe"), first, 3, &error));
     REQUIRE(db.object(root, rev1, pipe, &error)->version == 4);
     REQUIRE(db.objects(root, rev1, &error).size() == 2);
-    REQUIRE(db.objectHistoryForRevision(root, rev1, &error).size() == 5);
+    const QVector<aowis::db::ObjectChange> changes = db.objectHistoryForRevision(root, rev1, &error);
+    REQUIRE(changes.size() == 5);
+    REQUIRE(changes[0].object_uuid == pipe);
+    REQUIRE(changes[1].object_uuid == junction);
+    for (const aowis::db::ObjectChange &change : changes)
+    {
+        REQUIRE(!change.uuid.isNull());
+        REQUIRE(change.revision_uuid == rev1);
+        REQUIRE(change.actor_uuid == root.actor_uuid);
+        REQUIRE(change.object_uuid == pipe || change.object_uuid == junction);
+    }
     REQUIRE(db.objectHistoryForRevision(unauthorized, rev1, &error).isEmpty());
     REQUIRE(db.historyForRevision(root, rev1, &error).isEmpty());
     REQUIRE(!db.undoLastChange(root, branch, 5, &error));
     REQUIRE(!db.replaceWorkingSnapshot(root, branch, 5, QByteArray("legacy"), &error));
     const std::optional<QByteArray> working_manifest = db.snapshot(root, rev1, &error);
     REQUIRE(working_manifest.has_value() && working_manifest->startsWith("AOWIS-OBJECT-MANIFEST-V1"));
+    REQUIRE(working_manifest->contains(pipe.toRfc4122()));
+    REQUIRE(working_manifest->contains(junction.toRfc4122()));
 
     const std::optional<aowis::db::Finalization> finalized = db.finalize(
         root, branch, 5, QStringLiteral("Design"), QStringLiteral("object history"), &error);
     REQUIRE(finalized.has_value());
+    REQUIRE(finalized->snapshot_sha256 == QCryptographicHash::hash(
+        *working_manifest, QCryptographicHash::Sha256));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
     REQUIRE(db.snapshot(root, rev1, &error) == working_manifest);
     REQUIRE(db.objectHistoryForRevision(root, rev1, &error).size() == 5);
@@ -99,6 +115,24 @@ int main(int argc, char **argv)
         inspector.setDatabaseName(path);
         REQUIRE(inspector.open());
         QSqlQuery query(inspector);
+        // The portable SQL boundary must not change the existing SQLite
+        // 16-byte UUID representation used by persisted object history.
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT object_uuid FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")));
+        query.addBindValue(rev1.toRfc4122());
+        query.addBindValue(pipe.toRfc4122());
+        REQUIRE(query.exec() && query.next());
+        REQUIRE(query.value(0).toByteArray() == pipe.toRfc4122());
+        query.finish();
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT uuid,actor_uuid,object_uuid FROM object_events "
+            "WHERE revision_uuid=? ORDER BY sequence LIMIT 1")));
+        query.addBindValue(rev1.toRfc4122());
+        REQUIRE(query.exec() && query.next());
+        REQUIRE(query.value(0).toByteArray() == changes[0].uuid.toRfc4122());
+        REQUIRE(query.value(1).toByteArray() == root.actor_uuid.toRfc4122());
+        REQUIRE(query.value(2).toByteArray() == pipe.toRfc4122());
+        query.finish();
         REQUIRE(query.prepare(QStringLiteral(
             "UPDATE revision_objects SET content=? WHERE revision_uuid=? AND object_uuid=?")));
         query.addBindValue(QByteArray("tamper"));

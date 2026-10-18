@@ -1,6 +1,8 @@
 #include <aowis/db/database.h>
 #include <aowis/model/uuid.h>
 
+#include "storage_backend.h"
+
 #include "builtin_identity_ids.h"
 
 #include <QDateTime>
@@ -12,11 +14,6 @@ namespace aowis::db
 {
 namespace
 {
-QByteArray uuidBytes(const QUuid &uuid)
-{
-    return uuid.toRfc4122();
-}
-
 void setError(QString *error, const QString &message)
 {
     if (error != nullptr)
@@ -97,111 +94,16 @@ const QUuid project_owner_role(QStringLiteral("{01a14202-2800-7b7a-92fc-435bca39
 
 } // namespace
 
-bool Database::migrateSecurityV2(QString *error)
+bool Database::seedBuiltinSecurity(QString *error)
 {
-    if (!beginWrite(error))
-        return false;
-
-    // All v1 hashes remain in their original format. Existing rows have an
-    // unknown actor (NULL); never invent authorship for historical records.
-    const char *const statements[] = {
-        R"SQL(CREATE TABLE users (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            username TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(username)>0),
-            created_at_ms INTEGER NOT NULL,
-            disabled_at_ms INTEGER
-        ))SQL",
-        R"SQL(CREATE TABLE groups (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            name TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(name)>0),
-            created_at_ms INTEGER NOT NULL,
-            disabled_at_ms INTEGER
-        ))SQL",
-        R"SQL(CREATE TABLE roles (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            key TEXT NOT NULL UNIQUE,
-            builtin INTEGER NOT NULL DEFAULT 0 CHECK(builtin IN (0,1))
-        ))SQL",
-        R"SQL(CREATE TABLE permissions (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            key TEXT NOT NULL UNIQUE,
-            builtin INTEGER NOT NULL DEFAULT 0 CHECK(builtin IN (0,1))
-        ))SQL",
-        R"SQL(CREATE TABLE group_memberships (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            group_uuid BLOB NOT NULL REFERENCES groups(uuid) ON DELETE RESTRICT,
-            user_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-            created_by_uuid BLOB NOT NULL REFERENCES users(uuid),
-            created_at_ms INTEGER NOT NULL,
-            UNIQUE(group_uuid,user_uuid)
-        ))SQL",
-        R"SQL(CREATE TABLE role_permissions (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            role_uuid BLOB NOT NULL REFERENCES roles(uuid) ON DELETE RESTRICT,
-            permission_uuid BLOB NOT NULL REFERENCES permissions(uuid) ON DELETE RESTRICT,
-            UNIQUE(role_uuid,permission_uuid)
-        ))SQL",
-        R"SQL(CREATE TABLE role_assignments (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            principal_kind TEXT NOT NULL CHECK(principal_kind IN ('user','group')),
-            principal_uuid BLOB NOT NULL CHECK(length(principal_uuid)=16),
-            role_uuid BLOB NOT NULL REFERENCES roles(uuid) ON DELETE RESTRICT,
-            scope_kind TEXT NOT NULL CHECK(scope_kind IN ('system','project','branch')),
-            scope_uuid BLOB CHECK(scope_uuid IS NULL OR length(scope_uuid)=16),
-            created_by_uuid BLOB NOT NULL REFERENCES users(uuid),
-            created_at_ms INTEGER NOT NULL,
-            CHECK((scope_kind='system' AND scope_uuid IS NULL) OR
-                  (scope_kind IN ('project','branch') AND scope_uuid IS NOT NULL))
-        ))SQL",
-        R"SQL(CREATE UNIQUE INDEX role_assignment_unique ON role_assignments (
-            principal_kind,principal_uuid,role_uuid,scope_kind,COALESCE(hex(scope_uuid),'')))SQL",
-        R"SQL(CREATE TRIGGER role_assignment_valid BEFORE INSERT ON role_assignments
-            WHEN NOT (
-                (NEW.principal_kind='user' AND EXISTS(SELECT 1 FROM users WHERE uuid=NEW.principal_uuid)) OR
-                (NEW.principal_kind='group' AND EXISTS(SELECT 1 FROM groups WHERE uuid=NEW.principal_uuid)))
-              OR NOT (
-                NEW.scope_kind='system' OR
-                (NEW.scope_kind='project' AND EXISTS(SELECT 1 FROM projects WHERE uuid=NEW.scope_uuid)) OR
-                (NEW.scope_kind='branch' AND EXISTS(SELECT 1 FROM branches WHERE uuid=NEW.scope_uuid)))
-            BEGIN SELECT RAISE(ABORT,'invalid principal or scope'); END)SQL",
-        R"SQL(CREATE TRIGGER role_assignment_no_update BEFORE UPDATE ON role_assignments
-            BEGIN SELECT RAISE(ABORT,'role assignment is immutable; revoke then reassign'); END)SQL",
-        R"SQL(ALTER TABLE projects ADD COLUMN created_by_uuid BLOB REFERENCES users(uuid))SQL",
-        R"SQL(ALTER TABLE branches ADD COLUMN created_by_uuid BLOB REFERENCES users(uuid))SQL",
-        R"SQL(ALTER TABLE revisions ADD COLUMN created_by_uuid BLOB REFERENCES users(uuid))SQL",
-        R"SQL(ALTER TABLE revisions ADD COLUMN finalized_by_uuid BLOB REFERENCES users(uuid))SQL",
-        R"SQL(ALTER TABLE revisions ADD COLUMN hash_format_version INTEGER NOT NULL DEFAULT 1
-            CHECK(hash_format_version IN (1,2)))SQL",
-        R"SQL(CREATE TRIGGER project_creator_required BEFORE INSERT ON projects
-            WHEN NEW.created_by_uuid IS NULL OR length(NEW.created_by_uuid)!=16
-            BEGIN SELECT RAISE(ABORT,'project creator required'); END)SQL",
-        R"SQL(CREATE TRIGGER branch_creator_required BEFORE INSERT ON branches
-            WHEN NEW.created_by_uuid IS NULL OR length(NEW.created_by_uuid)!=16
-            BEGIN SELECT RAISE(ABORT,'branch creator required'); END)SQL",
-        R"SQL(CREATE TRIGGER revision_creator_required BEFORE INSERT ON revisions
-            WHEN NEW.created_by_uuid IS NULL OR length(NEW.created_by_uuid)!=16
-            BEGIN SELECT RAISE(ABORT,'revision creator required'); END)SQL",
-        R"SQL(CREATE TRIGGER finalize_actor_required BEFORE UPDATE OF state ON revisions
-            WHEN NEW.state='finalized' AND (NEW.hash_format_version!=2 OR
-                NEW.finalized_by_uuid IS NULL OR length(NEW.finalized_by_uuid)!=16)
-            BEGIN SELECT RAISE(ABORT,'V2 finalization actor required'); END)SQL"
-    };
-
-    for (const char *statement : statements)
-    {
-        if (!exec(QString::fromUtf8(statement), error))
-        {
-            rollback();
-            return false;
-        }
-    }
-
+    // Called only while the newly-created schema is still in its transaction.
+    // All built-in permissions and grants exist from the very first open.
     QSqlQuery query(this->database_);
     bool ok = prepare(query, QStringLiteral(
         "INSERT INTO roles(uuid,key,builtin) VALUES (?,'system.administrator',1)"), error);
     if (ok)
     {
-        query.addBindValue(uuidBytes(system_admin_role));
+        query.addBindValue(this->backend_->bindUuid(system_admin_role));
         ok = run(query, error);
     }
     if (ok)
@@ -210,7 +112,7 @@ bool Database::migrateSecurityV2(QString *error)
             "INSERT INTO roles(uuid,key,builtin) VALUES (?,'project.owner',1)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(project_owner_role));
+            query.addBindValue(this->backend_->bindUuid(project_owner_role));
             ok = run(query, error);
         }
     }
@@ -222,7 +124,7 @@ bool Database::migrateSecurityV2(QString *error)
         if (ok)
         {
             const QUuid permission_uuid(pinnedUuid(permission.id));
-            query.addBindValue(uuidBytes(permission_uuid));
+            query.addBindValue(this->backend_->bindUuid(permission_uuid));
             query.addBindValue(QString::fromLatin1(permission.key));
             ok = run(query, error);
         }
@@ -232,9 +134,9 @@ bool Database::migrateSecurityV2(QString *error)
                 "INSERT INTO role_permissions(uuid,role_uuid,permission_uuid) VALUES (?,?,?)"), error);
             if (ok)
             {
-                query.addBindValue(uuidBytes(createUuidV7()));
-                query.addBindValue(uuidBytes(system_admin_role));
-                query.addBindValue(uuidBytes(pinnedUuid(permission.id)));
+                query.addBindValue(this->backend_->bindUuid(createUuidV7()));
+                query.addBindValue(this->backend_->bindUuid(system_admin_role));
+                query.addBindValue(this->backend_->bindUuid(pinnedUuid(permission.id)));
                 ok = run(query, error);
             }
         }
@@ -247,17 +149,13 @@ bool Database::migrateSecurityV2(QString *error)
                 "INSERT INTO role_permissions(uuid,role_uuid,permission_uuid) VALUES (?,?,?)"), error);
             if (ok)
             {
-                query.addBindValue(uuidBytes(createUuidV7()));
-                query.addBindValue(uuidBytes(project_owner_role));
-                query.addBindValue(uuidBytes(pinnedUuid(permission.id)));
+                query.addBindValue(this->backend_->bindUuid(createUuidV7()));
+                query.addBindValue(this->backend_->bindUuid(project_owner_role));
+                query.addBindValue(this->backend_->bindUuid(pinnedUuid(permission.id)));
                 ok = run(query, error);
             }
         }
     }
-    if (ok)
-        ok = setSchemaVersion(2, error) && commit(error);
-    if (!ok)
-        rollback();
     return ok;
 }
 
@@ -284,7 +182,7 @@ std::optional<UserInfo> Database::bootstrapAdministrator(const QString &username
         "INSERT INTO users(uuid,username,created_at_ms) VALUES(?,?,?)"), error);
     if (ok)
     {
-        query.addBindValue(uuidBytes(user.uuid));
+        query.addBindValue(this->backend_->bindUuid(user.uuid));
         query.addBindValue(user.username);
         query.addBindValue(QDateTime::currentMSecsSinceEpoch());
         ok = run(query, error);
@@ -296,10 +194,10 @@ std::optional<UserInfo> Database::bootstrapAdministrator(const QString &username
             "scope_uuid,created_by_uuid,created_at_ms) VALUES (?,'user',?,?,'system',NULL,?,?)"), error);
         if (ok)
         {
-            query.addBindValue(uuidBytes(createUuidV7()));
-            query.addBindValue(uuidBytes(user.uuid));
-            query.addBindValue(uuidBytes(system_admin_role));
-            query.addBindValue(uuidBytes(user.uuid));
+            query.addBindValue(this->backend_->bindUuid(createUuidV7()));
+            query.addBindValue(this->backend_->bindUuid(user.uuid));
+            query.addBindValue(this->backend_->bindUuid(system_admin_role));
+            query.addBindValue(this->backend_->bindUuid(user.uuid));
             query.addBindValue(QDateTime::currentMSecsSinceEpoch());
             ok = run(query, error);
         }
@@ -356,10 +254,13 @@ bool Database::hasPermission(const OperationContext &actor, const QString &permi
             (a.scope_kind='branch' AND a.scope_uuid=?)) LIMIT 1
     )SQL"), error))
         return false;
-    query.addBindValue(uuidBytes(actor.actor_uuid));
+    query.addBindValue(this->backend_->bindUuid(actor.actor_uuid));
     query.addBindValue(permission_key);
-    query.addBindValue(scope.kind == AccessScopeKind::System ? QByteArray() : uuidBytes(project_uuid));
-    query.addBindValue(scope.kind == AccessScopeKind::Branch ? uuidBytes(scope.resource_uuid) : QByteArray());
+    // Missing scope UUIDs are SQL NULL, never an empty SQLite BLOB.
+    query.addBindValue(scope.kind == AccessScopeKind::System
+                           ? QVariant() : this->backend_->bindUuid(project_uuid));
+    query.addBindValue(scope.kind == AccessScopeKind::Branch
+                           ? this->backend_->bindUuid(scope.resource_uuid) : QVariant());
     if (!run(query, error))
         return false;
     return query.next();
@@ -387,7 +288,7 @@ std::optional<UserInfo> Database::createUser(const OperationContext &actor, cons
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("INSERT INTO users(uuid,username,created_at_ms) VALUES(?,?,?)"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(result.uuid));
+    query.addBindValue(this->backend_->bindUuid(result.uuid));
     query.addBindValue(result.username);
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
     const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("user.create"),
@@ -408,7 +309,7 @@ std::optional<GroupInfo> Database::createGroup(const OperationContext &actor, co
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("INSERT INTO groups(uuid,name,created_at_ms) VALUES(?,?,?)"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(result.uuid));
+    query.addBindValue(this->backend_->bindUuid(result.uuid));
     query.addBindValue(result.name);
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
     const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("group.create"),
@@ -429,7 +330,7 @@ std::optional<RoleInfo> Database::createRole(const OperationContext &actor, cons
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("INSERT INTO roles(uuid,key) VALUES(?,?)"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(result.uuid));
+    query.addBindValue(this->backend_->bindUuid(result.uuid));
     query.addBindValue(result.key);
     const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("role.create"),
         result.uuid, [&]() { return run(query, error); }, error);
@@ -449,7 +350,7 @@ std::optional<PermissionInfo> Database::createPermission(const OperationContext 
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("INSERT INTO permissions(uuid,key) VALUES(?,?)"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(result.uuid));
+    query.addBindValue(this->backend_->bindUuid(result.uuid));
     query.addBindValue(result.key);
     const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("permission.create"),
         result.uuid, [&]() { return run(query, error); }, error);
@@ -466,7 +367,7 @@ std::optional<RoleInfo> Database::role(const OperationContext &actor, const QStr
     query.addBindValue(key);
     if (!run(query, error) || !query.next())
         return std::nullopt;
-    return RoleInfo{QUuid::fromRfc4122(query.value(0).toByteArray()), query.value(1).toString()};
+    return RoleInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString()};
 }
 
 std::optional<PermissionInfo> Database::permission(const OperationContext &actor, const QString &key, QString *error) const
@@ -479,7 +380,7 @@ std::optional<PermissionInfo> Database::permission(const OperationContext &actor
     query.addBindValue(key);
     if (!run(query, error) || !query.next())
         return std::nullopt;
-    return PermissionInfo{QUuid::fromRfc4122(query.value(0).toByteArray()), query.value(1).toString()};
+    return PermissionInfo{this->backend_->readUuid(query.value(0)), query.value(1).toString()};
 }
 
 std::optional<QUuid> Database::addGroupMember(const OperationContext &actor, const QUuid &group_uuid,
@@ -493,10 +394,10 @@ std::optional<QUuid> Database::addGroupMember(const OperationContext &actor, con
         "INSERT INTO group_memberships(uuid,group_uuid,user_uuid,created_by_uuid,created_at_ms)"
         "VALUES(?,?,?,?,?)"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(uuid));
-    query.addBindValue(uuidBytes(group_uuid));
-    query.addBindValue(uuidBytes(user_uuid));
-    query.addBindValue(uuidBytes(actor.actor_uuid));
+    query.addBindValue(this->backend_->bindUuid(uuid));
+    query.addBindValue(this->backend_->bindUuid(group_uuid));
+    query.addBindValue(this->backend_->bindUuid(user_uuid));
+    query.addBindValue(this->backend_->bindUuid(actor.actor_uuid));
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
     const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("group.member.add"),
         uuid, [&]() { return run(query, error); }, error);
@@ -514,9 +415,9 @@ std::optional<QUuid> Database::grantRolePermission(const OperationContext &actor
     if (!prepare(query, QStringLiteral(
         "INSERT INTO role_permissions(uuid,role_uuid,permission_uuid) VALUES(?,?,?)"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(uuid));
-    query.addBindValue(uuidBytes(role_uuid));
-    query.addBindValue(uuidBytes(permission_uuid));
+    query.addBindValue(this->backend_->bindUuid(uuid));
+    query.addBindValue(this->backend_->bindUuid(role_uuid));
+    query.addBindValue(this->backend_->bindUuid(permission_uuid));
     const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("role.permission.grant"),
         uuid, [&]() { return run(query, error); }, error);
     return saved ? std::optional<QUuid>(uuid) : std::nullopt;
@@ -540,13 +441,13 @@ std::optional<QUuid> Database::assignRole(const OperationContext &actor, Princip
         "INSERT INTO role_assignments(uuid,principal_kind,principal_uuid,role_uuid,scope_kind,"
         "scope_uuid,created_by_uuid,created_at_ms) VALUES(?,?,?,?,?,?,?,?)"), error))
         return std::nullopt;
-    query.addBindValue(uuidBytes(uuid));
+    query.addBindValue(this->backend_->bindUuid(uuid));
     query.addBindValue(kind == PrincipalKind::User ? QStringLiteral("user") : QStringLiteral("group"));
-    query.addBindValue(uuidBytes(principal_uuid));
-    query.addBindValue(uuidBytes(role_uuid));
+    query.addBindValue(this->backend_->bindUuid(principal_uuid));
+    query.addBindValue(this->backend_->bindUuid(role_uuid));
     query.addBindValue(scopeKey(scope.kind));
-    query.addBindValue(scope.kind == AccessScopeKind::System ? QVariant() : QVariant(uuidBytes(scope.resource_uuid)));
-    query.addBindValue(uuidBytes(actor.actor_uuid));
+    query.addBindValue(scope.kind == AccessScopeKind::System ? QVariant() : this->backend_->bindUuid(scope.resource_uuid));
+    query.addBindValue(this->backend_->bindUuid(actor.actor_uuid));
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
     const bool saved = auditedSecurityMutation(actor.actor_uuid, QStringLiteral("role.assign"),
         uuid, [&]() { return run(query, error); }, error);

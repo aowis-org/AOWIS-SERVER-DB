@@ -1,4 +1,5 @@
 #include <aowis/db/database.h>
+#include "storage_backend.h"
 #include <aowis/model/uuid.h>
 #include "session_token_internal.h"
 
@@ -19,11 +20,6 @@ void setError(QString *error, const QString &value)
 {
     if (error)
         *error = value;
-}
-
-QByteArray uuidBytes(const QUuid &id)
-{
-    return id.toRfc4122();
 }
 
 QByteArray sessionDigest(const QByteArray &random_bytes)
@@ -69,8 +65,8 @@ QByteArray sessionTokenDigest(const QByteArray &random_bytes)
     return sessionDigest(random_bytes);
 }
 
-bool hasSessionCapacity(const QSqlDatabase &connection, const QUuid &user_uuid,
-                        qint64 at_ms, QString *error)
+bool hasSessionCapacity(const QSqlDatabase &connection, const StorageBackend &backend,
+                        const QUuid &user_uuid, qint64 at_ms, QString *error)
 {
     QSqlQuery query(connection);
     if (!query.prepare(QStringLiteral(
@@ -80,7 +76,7 @@ bool hasSessionCapacity(const QSqlDatabase &connection, const QUuid &user_uuid,
         setError(error, query.lastError().text());
         return false;
     }
-    query.addBindValue(uuidBytes(user_uuid));
+    query.addBindValue(backend.bindUuid(user_uuid));
     query.addBindValue(at_ms);
     if (!query.exec() || !query.next())
     {
@@ -96,82 +92,11 @@ bool hasSessionCapacity(const QSqlDatabase &connection, const QUuid &user_uuid,
     return true;
 }
 
-bool Database::migrateSessionsV8(QString *error)
-{
-    if (!beginWrite(error))
-        return false;
-    const char *const statements[] = {
-        R"SQL(CREATE TABLE user_sessions (
-            uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
-            user_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-            token_sha256 BLOB NOT NULL UNIQUE CHECK(length(token_sha256)=32),
-            created_by_uuid BLOB NOT NULL REFERENCES users(uuid) ON DELETE RESTRICT,
-            created_at_ms INTEGER NOT NULL,
-            expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>created_at_ms),
-            revoked_at_ms INTEGER,
-            CHECK(revoked_at_ms IS NULL OR revoked_at_ms>=created_at_ms)
-        ))SQL",
-        R"SQL(CREATE INDEX user_sessions_by_user ON user_sessions(user_uuid))SQL",
-        R"SQL(CREATE TRIGGER user_sessions_immutable_delete BEFORE DELETE ON user_sessions
-            BEGIN SELECT RAISE(ABORT,'sessions are append-only'); END)SQL",
-        R"SQL(CREATE TRIGGER user_sessions_immutable_identity BEFORE UPDATE ON user_sessions
-            WHEN NEW.uuid!=OLD.uuid OR NEW.user_uuid!=OLD.user_uuid
-                OR NEW.token_sha256!=OLD.token_sha256 OR NEW.created_by_uuid!=OLD.created_by_uuid
-                OR NEW.created_at_ms!=OLD.created_at_ms OR NEW.expires_at_ms!=OLD.expires_at_ms
-                OR OLD.revoked_at_ms IS NOT NULL OR NEW.revoked_at_ms IS NULL
-            BEGIN SELECT RAISE(ABORT,'session identity is immutable; revoke only once'); END)SQL"
-    };
-    for (const char *statement : statements)
-    {
-        QSqlQuery query(this->database_);
-        if (!query.exec(QString::fromUtf8(statement)))
-        {
-            setError(error, query.lastError().text());
-            rollback();
-            return false;
-        }
-    }
-    if (!setSchemaVersion(8, error) || !commit(error))
-    {
-        rollback();
-        return false;
-    }
-    return true;
-}
-
 // A spent session's digest is overwritten with an unmistakably non-secret
 // marker, unique to that session UUID. The 16-byte prefix is ASCII
 // "AOWIS-REDACT-V1!" followed by the session's 16-byte RFC 4122 UUID.
 // SQLite enforces that a digest may be changed only to precisely this marker.
 // No token hash or bearer token is kept in the security audit record.
-bool Database::migrateSessionRedactionV13(QString *error)
-{
-    if (!beginWrite(error))
-        return false;
-    if (!exec(QStringLiteral("DROP TRIGGER IF EXISTS user_sessions_immutable_identity"), error) ||
-        !exec(QStringLiteral("DROP TRIGGER IF EXISTS user_sessions_immutable_identity_v13"), error) ||
-        !exec(QStringLiteral(R"SQL(
-            CREATE TRIGGER user_sessions_immutable_identity_v13 BEFORE UPDATE ON user_sessions
-            WHEN NEW.uuid!=OLD.uuid OR NEW.user_uuid!=OLD.user_uuid
-                OR NEW.created_by_uuid!=OLD.created_by_uuid
-                OR NEW.created_at_ms!=OLD.created_at_ms OR NEW.expires_at_ms!=OLD.expires_at_ms
-                OR (OLD.revoked_at_ms IS NOT NULL AND NEW.revoked_at_ms IS NOT OLD.revoked_at_ms)
-                OR (OLD.revoked_at_ms IS NULL AND NEW.revoked_at_ms IS NOT NULL
-                    AND NEW.revoked_at_ms<OLD.created_at_ms)
-                OR (NEW.token_sha256!=OLD.token_sha256 AND NOT (
-                    NEW.token_sha256=CAST(x'414f5749532d5245444143542d563121' || OLD.uuid AS BLOB)
-                    AND (OLD.revoked_at_ms IS NOT NULL OR OLD.expires_at_ms<=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))
-                ))
-            BEGIN SELECT RAISE(ABORT,'session identity is immutable; spent credentials may only be redacted'); END
-        )SQL"), error) ||
-        !setSchemaVersion(13, error) || !commit(error))
-    {
-        rollback();
-        return false;
-    }
-    return true;
-}
-
 std::optional<int> Database::redactSpentSessionTokens(const OperationContext &admin,
                                                        qint64 cutoff_ms, int max_count,
                                                        QString *error)
@@ -217,7 +142,7 @@ std::optional<int> Database::redactSpentSessionTokens(const OperationContext &ad
     }
     QVector<QUuid> session_ids;
     while (select.next())
-        session_ids.append(QUuid::fromRfc4122(select.value(0).toByteArray()));
+        session_ids.append(this->backend_->readUuid(select.value(0)));
     select.finish();
 
     QSqlQuery update(this->database_);
@@ -233,7 +158,7 @@ std::optional<int> Database::redactSpentSessionTokens(const OperationContext &ad
     }
     for (const QUuid &id : session_ids)
     {
-        update.bindValue(0, uuidBytes(id));
+        update.bindValue(0, this->backend_->bindUuid(id));
         if (!update.exec() || update.numRowsAffected() != 1)
         {
             setError(error, QStringLiteral("Unable to redact spent session credential: %1")
@@ -280,7 +205,7 @@ std::optional<IssuedSession> Database::issueSession(const OperationContext &admi
     // stores the session UUID, never the bearer token or its hash.
     const bool saved = auditedSecurityMutation(admin.actor_uuid, QStringLiteral("session.issue"),
         result.uuid, [&]() -> bool {
-        if (!hasSessionCapacity(this->database_, user_uuid, now, error))
+        if (!hasSessionCapacity(this->database_, *this->backend_, user_uuid, now, error))
             return false;
         QSqlQuery query(this->database_);
         if (!query.prepare(QStringLiteral(
@@ -290,12 +215,12 @@ std::optional<IssuedSession> Database::issueSession(const OperationContext &admi
             setError(error, query.lastError().text());
             return false;
         }
-        query.addBindValue(uuidBytes(result.uuid));
+        query.addBindValue(this->backend_->bindUuid(result.uuid));
         query.addBindValue(sessionDigest(QByteArray::fromHex(result.bearer_token)));
-        query.addBindValue(uuidBytes(admin.actor_uuid));
+        query.addBindValue(this->backend_->bindUuid(admin.actor_uuid));
         query.addBindValue(now);
         query.addBindValue(result.expires_at_ms);
-        query.addBindValue(uuidBytes(user_uuid));
+        query.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!query.exec() || query.numRowsAffected() != 1)
         {
             setError(error, QStringLiteral("Target user is unknown or disabled: %1").arg(query.lastError().text()));
@@ -338,7 +263,7 @@ std::optional<OperationContext> Database::authenticateSession(const QByteArray &
         setError(error, QStringLiteral("Invalid or expired session"));
         return std::nullopt;
     }
-    return OperationContext{QUuid::fromRfc4122(query.value(0).toByteArray())};
+    return OperationContext{this->backend_->readUuid(query.value(0))};
 }
 
 std::optional<ActiveSession> Database::activeSession(const QByteArray &bearer_token,
@@ -372,8 +297,8 @@ std::optional<ActiveSession> Database::activeSession(const QByteArray &bearer_to
         setError(error, QStringLiteral("Invalid or expired session"));
         return std::nullopt;
     }
-    return ActiveSession{QUuid::fromRfc4122(query.value(0).toByteArray()),
-                         QUuid::fromRfc4122(query.value(1).toByteArray()),
+    return ActiveSession{this->backend_->readUuid(query.value(0)),
+                         this->backend_->readUuid(query.value(1)),
                          query.value(2).toLongLong()};
 }
 
@@ -400,11 +325,11 @@ bool Database::logoutSession(const QByteArray &bearer_token, QString *error)
     }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     query.addBindValue(now);
-    query.addBindValue(uuidBytes(session->uuid));
-    query.addBindValue(uuidBytes(session->user_uuid));
+    query.addBindValue(this->backend_->bindUuid(session->uuid));
+    query.addBindValue(this->backend_->bindUuid(session->user_uuid));
     query.addBindValue(sessionDigest(*raw));
     query.addBindValue(now);
-    query.addBindValue(uuidBytes(session->user_uuid));
+    query.addBindValue(this->backend_->bindUuid(session->user_uuid));
     if (!query.exec() || query.numRowsAffected() != 1)
     {
         setError(error, QStringLiteral("Invalid or expired session"));
@@ -444,10 +369,10 @@ QVector<OwnSessionInfo> Database::ownSessions(const QByteArray &bearer_token,
         setError(error, query.lastError().text());
         return result;
     }
-    query.addBindValue(uuidBytes(current->user_uuid));
+    query.addBindValue(this->backend_->bindUuid(current->user_uuid));
     query.addBindValue(QDateTime::currentMSecsSinceEpoch());
     query.addBindValue(after_uuid.isNull() ? 1 : 0);
-    query.addBindValue(uuidBytes(after_uuid));
+    query.addBindValue(this->backend_->bindUuid(after_uuid));
     query.addBindValue(limit);
     if (!query.exec())
     {
@@ -456,7 +381,7 @@ QVector<OwnSessionInfo> Database::ownSessions(const QByteArray &bearer_token,
     }
     while (query.next())
     {
-        const QUuid id = QUuid::fromRfc4122(query.value(0).toByteArray());
+        const QUuid id = this->backend_->readUuid(query.value(0));
         result.append(OwnSessionInfo{id, query.value(1).toLongLong(),
                                      query.value(2).toLongLong(), id == current->uuid});
     }
@@ -495,10 +420,10 @@ bool Database::revokeOwnSession(const QByteArray &bearer_token, const QUuid &ses
     }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     query.addBindValue(now);
-    query.addBindValue(uuidBytes(session_uuid));
-    query.addBindValue(uuidBytes(current->user_uuid));
+    query.addBindValue(this->backend_->bindUuid(session_uuid));
+    query.addBindValue(this->backend_->bindUuid(current->user_uuid));
     query.addBindValue(now);
-    query.addBindValue(uuidBytes(current->user_uuid));
+    query.addBindValue(this->backend_->bindUuid(current->user_uuid));
     if (!query.exec())
     {
         setError(error, query.lastError().text());
@@ -554,8 +479,8 @@ std::optional<qint64> Database::revokeOtherSessions(const QByteArray &bearer_tok
         return std::nullopt;
     }
     query.addBindValue(now);
-    query.addBindValue(uuidBytes(current->user_uuid));
-    query.addBindValue(uuidBytes(current->uuid));
+    query.addBindValue(this->backend_->bindUuid(current->user_uuid));
+    query.addBindValue(this->backend_->bindUuid(current->uuid));
     query.addBindValue(now);
     if (!query.exec())
     {
@@ -589,7 +514,7 @@ bool Database::revokeSession(const OperationContext &admin, const QUuid &session
             return false;
         }
         query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-        query.addBindValue(uuidBytes(session_uuid));
+        query.addBindValue(this->backend_->bindUuid(session_uuid));
         if (!query.exec() || query.numRowsAffected() != 1)
         {
             setError(error, QStringLiteral("Session not found or already revoked"));
@@ -614,7 +539,7 @@ bool Database::disableUser(const OperationContext &admin, const QUuid &user_uuid
             return false;
         }
         query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-        query.addBindValue(uuidBytes(user_uuid));
+        query.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!query.exec() || query.numRowsAffected() != 1)
         {
             setError(error, QStringLiteral("User not found or already disabled"));
@@ -630,7 +555,7 @@ bool Database::disableUser(const OperationContext &admin, const QUuid &user_uuid
             return false;
         }
         query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-        query.addBindValue(uuidBytes(user_uuid));
+        query.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!query.exec())
         {
             setError(error, query.lastError().text());
@@ -645,7 +570,7 @@ bool Database::disableUser(const OperationContext &admin, const QUuid &user_uuid
             return false;
         }
         query.addBindValue(QDateTime::currentMSecsSinceEpoch());
-        query.addBindValue(uuidBytes(user_uuid));
+        query.addBindValue(this->backend_->bindUuid(user_uuid));
         if (!query.exec())
         {
             setError(error, query.lastError().text());

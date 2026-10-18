@@ -59,7 +59,7 @@ network index atomically. `loadHydraulicEntity<T>` fetches a single entity.
 The V4 manifest includes every stored entity's exact bytes, version, tombstone
 and object-history journal digest. Finalized V2 chain hashes therefore cover
 V5 serialized model values **without altering any pre-existing revision hash**.
-There is no new SQLite schema migration: V5 uses existing V4 tables.
+The SQLite development database is created directly with the current object-storage tables. No schema migrations are supported.
 
 Model references are serialized without graph-level semantic validation.
 For example, it remains possible to store a pipe referencing a non-existent

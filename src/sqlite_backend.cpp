@@ -3,7 +3,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 
-namespace aowis::db::sqlite_backend
+namespace aowis::db
 {
 namespace
 {
@@ -23,8 +23,24 @@ bool exec(const QSqlDatabase &database, const QString &statement, QString *error
 }
 }
 
-bool open(QSqlDatabase &database, const QString &connection_name,
-          const QString &file_path, QString *error)
+QVariant SqliteBackend::bindUuid(const QUuid &uuid) const
+{
+    // This is a BLOB, not the textual UUID and not SQL NULL even for
+    // QUuid(). Both SQLite storage and historical integrity checks rely on
+    // exactly these bytes.
+    return QVariant(uuid.toRfc4122());
+}
+
+QUuid SqliteBackend::readUuid(const QVariant &value) const
+{
+    if (value.isNull())
+        return QUuid();
+    const QByteArray bytes = value.toByteArray();
+    return bytes.size() == 16 ? QUuid::fromRfc4122(bytes) : QUuid();
+}
+
+bool SqliteBackend::open(QSqlDatabase &database, const QString &connection_name,
+                         const QString &file_path, QString *error) const
 {
     database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection_name);
     database.setDatabaseName(file_path);
@@ -34,18 +50,51 @@ bool open(QSqlDatabase &database, const QString &connection_name,
     return false;
 }
 
-bool configure(const QSqlDatabase &database, QString *error)
+bool SqliteBackend::configure(const QSqlDatabase &database, QString *error) const
 {
-    return exec(database, QStringLiteral("PRAGMA foreign_keys = ON"), error) &&
-           exec(database, QStringLiteral("PRAGMA busy_timeout = 5000"), error) &&
-           exec(database, QStringLiteral("PRAGMA journal_mode = WAL"), error);
+    if (!exec(database, QStringLiteral("PRAGMA foreign_keys = ON"), error) ||
+        !exec(database, QStringLiteral("PRAGMA busy_timeout = 5000"), error) ||
+        !exec(database, QStringLiteral("PRAGMA journal_mode = WAL"), error))
+        return false;
+
+    // PRAGMA foreign_keys=ON can succeed without taking effect if called
+    // within a transaction. Never operate on a database with FK checks off.
+    QSqlQuery pragma(database);
+    if (!pragma.exec(QStringLiteral("PRAGMA foreign_keys")) || !pragma.next() ||
+        pragma.value(0).toInt() != 1)
+    {
+        setError(error, QStringLiteral("SQLite foreign-key enforcement is disabled"));
+        return false;
+    }
+    pragma.finish();
+    if (!pragma.exec(QStringLiteral("PRAGMA busy_timeout")) || !pragma.next() ||
+        pragma.value(0).toInt() < 5000)
+    {
+        setError(error, QStringLiteral("SQLite busy timeout could not be configured"));
+        return false;
+    }
+    pragma.finish();
+    // In-memory databases use 'memory', not WAL, by SQLite design.
+    if (!pragma.exec(QStringLiteral("PRAGMA journal_mode")) || !pragma.next())
+    {
+        setError(error, QStringLiteral("Cannot read SQLite journal mode"));
+        return false;
+    }
+    const QString mode = pragma.value(0).toString();
+    pragma.finish();
+    const QString expected = database.databaseName() == QStringLiteral(":memory:")
+        ? QStringLiteral("memory") : QStringLiteral("wal");
+    if (mode.compare(expected, Qt::CaseInsensitive) != 0)
+    {
+        setError(error, QStringLiteral("Unexpected SQLite journal mode: %1").arg(mode));
+        return false;
+    }
+    return true;
 }
 
-bool verifySchema(const QSqlDatabase &database, QString *error)
+bool SqliteBackend::verifySchema(const QSqlDatabase &database, QString *error) const
 {
-    // A schema version can be set even when a database has been damaged or
-    // incompletely upgraded. Do not silently accept a V9 database without its
-    // security audit table and immutability triggers.
+    // Never accept a damaged database with missing security guards or tables.
     QString audit_schema_error;
     {
         QSqlQuery audit_schema(database);
@@ -53,7 +102,7 @@ bool verifySchema(const QSqlDatabase &database, QString *error)
                 "SELECT sequence,uuid,actor_uuid,subject_uuid,action,occurred_at_ms,"
                 "previous_sha256,chain_sha256 FROM security_audit_events LIMIT 0")))
         {
-            audit_schema_error = QStringLiteral("SQLite V9 audit schema is missing or incomplete: %1")
+            audit_schema_error = QStringLiteral("SQLite audit schema is missing or incomplete: %1")
                                      .arg(audit_schema.lastError().text());
         }
         else
@@ -65,7 +114,7 @@ bool verifySchema(const QSqlDatabase &database, QString *error)
                 !audit_schema.next() || audit_schema.value(0).toInt() != 2)
             {
                 audit_schema_error = QStringLiteral(
-                    "SQLite V9 security audit immutability triggers are missing");
+                    "SQLite security audit immutability triggers are missing");
             }
         }
     }
@@ -74,7 +123,7 @@ bool verifySchema(const QSqlDatabase &database, QString *error)
         setError(error, audit_schema_error);
         return false;
     }
-    // Without these V10 authorization columns and guards, a damaged database
+    // Without these authorization columns and guards, a damaged database
     // could restore previously revoked access.
     QSqlQuery grant_schema(database);
     const bool valid_columns = grant_schema.exec(QStringLiteral(
@@ -90,17 +139,17 @@ bool verifySchema(const QSqlDatabase &database, QString *error)
         grant_schema.next() && grant_schema.value(0).toInt() == 7;
     if (!valid_columns || !valid_guards)
     {
-        setError(error, QStringLiteral("SQLite V10 security grant schema is incomplete"));
+        setError(error, QStringLiteral("SQLite security grant schema is incomplete"));
         return false;
     }
-    // Fail closed when a database claims V11 but credentials were omitted.
+    // Fail closed when credential tables are missing.
     // Keep this query finished before later schema DDL on this connection.
     QSqlQuery credentials_schema(database);
     if (!credentials_schema.exec(QStringLiteral(
             "SELECT user_uuid,salt,verifier,iterations,changed_by_uuid,failed_attempts,locked_until_ms "
             "FROM user_password_credentials LIMIT 0")))
     {
-        setError(error, QStringLiteral("SQLite V11 password credential schema is incomplete"));
+        setError(error, QStringLiteral("SQLite password credential schema is incomplete"));
         return false;
     }
     credentials_schema.finish();
@@ -109,7 +158,7 @@ bool verifySchema(const QSqlDatabase &database, QString *error)
             "SELECT uuid,user_uuid,token_sha256,issued_by_uuid,expires_at_ms,used_at_ms,invalidated_at_ms "
             "FROM password_recovery_tokens LIMIT 0")))
     {
-        setError(error, QStringLiteral("SQLite V12 password recovery schema is incomplete"));
+        setError(error, QStringLiteral("SQLite password recovery schema is incomplete"));
         return false;
     }
     recovery_schema.finish();
@@ -119,65 +168,92 @@ bool verifySchema(const QSqlDatabase &database, QString *error)
             "'recovery_tokens_no_delete','recovery_tokens_close_only')")) ||
         !recovery_guards.next() || recovery_guards.value(0).toInt() != 2)
     {
-        setError(error, QStringLiteral("SQLite V12 recovery token immutability guards are missing"));
+        setError(error, QStringLiteral("SQLite recovery token immutability guards are missing"));
         return false;
     }
     recovery_guards.finish();
-    // Avoid silently accepting an incomplete V13 database: redaction must be
-    // one-way and protected by its migrated trigger.
+    // Session redaction is one-way and protected by its trigger.
     QSqlQuery redaction_guard(database);
     if (!redaction_guard.exec(QStringLiteral(
             "SELECT 1 FROM sqlite_master WHERE type='trigger' "
-            "AND name='user_sessions_immutable_identity_v13' LIMIT 1")) ||
+            "AND name='user_sessions_immutable_identity' LIMIT 1")) ||
         !redaction_guard.next())
     {
-        setError(error, QStringLiteral("SQLite V13 session-redaction guard is missing"));
+        setError(error, QStringLiteral("SQLite session-redaction guard is missing"));
         return false;
     }
     redaction_guard.finish();
     return true;
 }
 
-std::optional<int> schemaVersion(const QSqlDatabase &database, QString *error)
+std::optional<bool> SqliteBackend::hasSchema(const QSqlDatabase &database, QString *error) const
 {
     QSqlQuery query(database);
-    if (!query.exec(QStringLiteral("PRAGMA user_version")) || !query.next())
+    if (!query.exec(QStringLiteral(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%')")) || !query.next())
     {
         setError(error, query.lastError().text());
         return std::nullopt;
     }
-    const int version = query.value(0).toInt();
-    // Finish the cursor before migration DDL; open PRAGMA cursors can block
-    // table replacement and trigger SQLITE_LOCKED.
-    query.finish();
-    return version;
+    return query.value(0).toBool();
 }
 
-bool setSchemaVersion(const QSqlDatabase &database, int version, QString *error)
-{
-    if (version < 1 || version > current_schema_version)
-    {
-        setError(error, QStringLiteral("Invalid SQLite schema version"));
-        return false;
-    }
-    // SQLite PRAGMAs cannot use query parameters; the integer is bounded.
-    return exec(database, QStringLiteral("PRAGMA user_version = %1").arg(version), error);
-}
-
-bool beginWrite(const QSqlDatabase &database, QString *error)
+bool SqliteBackend::beginWrite(const QSqlDatabase &database, QString *error) const
 {
     // BEGIN IMMEDIATE reserves the single SQLite writer before any edits.
     return exec(database, QStringLiteral("BEGIN IMMEDIATE"), error);
 }
 
-bool commit(const QSqlDatabase &database, QString *error)
+bool SqliteBackend::commit(const QSqlDatabase &database, QString *error) const
 {
     return exec(database, QStringLiteral("COMMIT"), error);
 }
 
-void rollback(const QSqlDatabase &database)
+void SqliteBackend::rollback(const QSqlDatabase &database) const
 {
     exec(database, QStringLiteral("ROLLBACK"), nullptr);
 }
 
-} // namespace aowis::db::sqlite_backend
+std::optional<bool> SqliteBackend::hasColumn(const QSqlDatabase &database,
+                                              const QString &table, const QString &column,
+                                              QString *error) const
+{
+    // Interpolated SQLite PRAGMA identifiers must not contain user SQL.
+    const auto validIdentifier = [](const QString &name) {
+        if (name.isEmpty())
+            return false;
+        for (const QChar ch : name)
+        {
+            const ushort c = ch.unicode();
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_'))
+                return false;
+        }
+        return true;
+    };
+    if (!validIdentifier(table) || !validIdentifier(column))
+    {
+        setError(error, QStringLiteral("Invalid schema identifier"));
+        return std::nullopt;
+    }
+    QSqlQuery query(database);
+    if (!query.exec(QStringLiteral("PRAGMA table_info(\"%1\")").arg(table)))
+    {
+        setError(error, query.lastError().text());
+        return std::nullopt;
+    }
+    while (query.next())
+    {
+        if (query.value(1).toString() == column)
+            return true;
+    }
+    if (query.lastError().isValid())
+    {
+        setError(error, query.lastError().text());
+        return std::nullopt;
+    }
+    return false;
+}
+
+} // namespace aowis::db

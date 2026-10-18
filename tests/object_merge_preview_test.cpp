@@ -2,7 +2,10 @@
 #include <aowis/model/uuid.h>
 
 #include <QCoreApplication>
+#include <QByteArrayView>
+#include <QCryptographicHash>
 #include <QSqlDatabase>
+#include <QSqlError>
 #include <QSqlQuery>
 #include <QTemporaryDir>
 
@@ -110,6 +113,45 @@ int main(int argc, char **argv)
     REQUIRE(preview->right_generation == right_generation);
     REQUIRE(preview->conflict_count == 3);
     REQUIRE(preview->changes.size() == 11);
+    // Backend UUID conversion must not change the original SQLite physical
+    // digest. Independently rebuild it from the stored BLOB values (including
+    // tombstones and version counters), as the pre-portability code did.
+    REQUIRE(preview->left_physical_sha256.size() == 32);
+    {
+        QSqlDatabase raw = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("merge-preview-raw-digest"));
+        raw.setDatabaseName(path);
+        REQUIRE(raw.open());
+        QSqlQuery rows(raw);
+        REQUIRE(rows.prepare(QStringLiteral(
+            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
+            "WHERE revision_uuid=? ORDER BY object_uuid")));
+        rows.addBindValue(left_uuid.toRfc4122());
+        REQUIRE(rows.exec());
+        QCryptographicHash old_format(QCryptographicHash::Sha256);
+        const auto addField = [&old_format](const QByteArray &value) {
+            old_format.addData(QByteArray::number(value.size()));
+            old_format.addData(QByteArrayView(":", 1));
+            old_format.addData(value);
+        };
+        qsizetype rows_seen = 0;
+        while (rows.next())
+        {
+            REQUIRE(rows.value(0).toByteArray().size() == 16);
+            addField(rows.value(0).toByteArray());
+            addField(rows.value(1).toString().toUtf8());
+            addField(rows.value(2).toByteArray());
+            addField(QByteArray::number(rows.value(3).toLongLong()));
+            addField(QByteArray::number(rows.value(4).toInt()));
+            ++rows_seen;
+        }
+        REQUIRE(!rows.lastError().isValid());
+        REQUIRE(rows_seen > 0);
+        REQUIRE(old_format.result() == preview->left_physical_sha256);
+        rows.finish();
+        raw.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("merge-preview-raw-digest"));
     // Bounded HTTP-style previews must report the same classifications and
     // physical digest, but abort on excessive changed rows or retained bytes.
     const std::optional<ObjectMergePreview> bounded = db.previewObjectMergeBounded(

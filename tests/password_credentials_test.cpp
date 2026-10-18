@@ -41,8 +41,6 @@ int main(int argc, char **argv)
         inspect.setDatabaseName(path);
         REQUIRE(inspect.open());
         QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version")));
-        REQUIRE(query.next() && query.value(0).toInt() == 13);
         query.finish();
         REQUIRE(query.exec(QStringLiteral("SELECT salt,verifier,iterations FROM user_password_credentials")));
         REQUIRE(query.next());
@@ -50,6 +48,12 @@ int main(int argc, char **argv)
         REQUIRE(query.value(1).toByteArray().size() == 32);
         REQUIRE(query.value(1).toByteArray() != original);
         REQUIRE(query.value(2).toInt() >= 600000);
+        query.finish();
+        REQUIRE(query.exec(QStringLiteral(
+            "SELECT user_uuid,changed_by_uuid FROM user_password_credentials")));
+        REQUIRE(query.next());
+        REQUIRE(query.value(0).toByteArray() == user->uuid.toRfc4122());
+        REQUIRE(query.value(1).toByteArray() == admin->uuid.toRfc4122());
         query.finish();
         inspect.close();
     }
@@ -60,6 +64,10 @@ int main(int argc, char **argv)
     const auto first = db.loginWithPassword(QStringLiteral("ENGINEER"), original, 3600, &error);
     REQUIRE(first.has_value());
     REQUIRE(first->user_uuid == user->uuid);
+    const std::optional<aowis::db::ActiveSession> active =
+        db.activeSession(first->bearer_token, &error);
+    REQUIRE(active.has_value());
+    REQUIRE(active->uuid == first->uuid && active->user_uuid == user->uuid);
     REQUIRE(db.authenticateSession(first->bearer_token, &error).has_value());
     REQUIRE(!db.loginWithPassword(QStringLiteral("engineer"), original, 0, &error));
     REQUIRE(db.setUserPassword(root, user->uuid, replacement, &error));
@@ -117,28 +125,5 @@ int main(int argc, char **argv)
     REQUIRE(!db.loginWithPassword(QStringLiteral("engineer"), original, 3600, &error));
     REQUIRE(db.verifySecurityAudit(root).valid);
 
-    // Simulate an authentic V10 database, then verify migration to V11.
-    const QString old_path = temp.filePath(QStringLiteral("upgrade-v10.sqlite"));
-    Database legacy;
-    REQUIRE(legacy.openSqlite(old_path, &error));
-    const auto old_admin = legacy.bootstrapAdministrator(QStringLiteral("old-admin"), &error);
-    REQUIRE(old_admin.has_value());
-    legacy.close();
-    {
-        QSqlDatabase inspect = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("credential-upgrade"));
-        inspect.setDatabaseName(old_path);
-        REQUIRE(inspect.open());
-        QSqlQuery query(inspect);
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE user_password_credentials")));
-        REQUIRE(query.exec(QStringLiteral("DROP TABLE password_recovery_tokens")));
-        REQUIRE(query.exec(QStringLiteral("PRAGMA user_version=10")));
-        query.finish();
-        inspect.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("credential-upgrade"));
-    REQUIRE(legacy.openSqlite(old_path, &error));
-    REQUIRE(legacy.setUserPassword({old_admin->uuid}, old_admin->uuid, original, &error));
-    REQUIRE(legacy.loginWithPassword(QStringLiteral("old-admin"), original, 3600, &error));
-    REQUIRE(legacy.verifySecurityAudit({old_admin->uuid}).valid);
     return 0;
 }
