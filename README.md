@@ -247,6 +247,13 @@ redirecting to a file), never include credentials in command-line arguments,
 and never commit tokens to the repository. Passwords for `set-password` are
 read from stdin, not from the process argument list.
 
+## Performance measurements
+
+An optional [SQLite network benchmark](docs/performance.md) measures storage,
+network load, single-entity edits, finalization and branch creation at selected
+network sizes. It runs separately from CTest, so large workloads never slow the
+normal regression suite.
+
 ## Tests: SQLite and real PostgreSQL
 
 The Linux test runner builds the registered CTest executables and runs the
@@ -261,9 +268,13 @@ The **required** setting is recommended for CI and for checking PostgreSQL
 parity. The runner uses `tests/postgres/docker-compose.yaml` to start a
 **disposable PostgreSQL 17** instance, waits for its health check, publishes
 it only on an automatically chosen localhost port, and removes it after the
-run. No application database or persistent test volume is used. The live
-PostgreSQL checks run inside the backend-contract CTest executable; they do
-not add a separate CTest test number.
+run. No application database or persistent test volume is used.
+
+The live PostgreSQL checks run in the backend-contract and CLI integration
+CTest executables. The server CLI test starts the actual `aowis-server-db`
+process with PostgreSQL configured, checks authenticated HTTP project creation,
+and verifies the created project persists after the server stops. These checks run
+inside existing CTest entries; they do not add separate test numbers.
 
 Test-runner switches:
 

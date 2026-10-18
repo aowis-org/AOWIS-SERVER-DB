@@ -138,6 +138,11 @@ if(AOWIS_DB_BUILD_HTTP)
 endif()
 
 if(BUILD_TESTING)
+    # Explicit opt-in performance executable. Deliberately not registered with
+    # CTest or the aowis-db-tests aggregate target: its cost scales with N.
+    add_executable(aowis-db-network-benchmark benchmarks/network_persistence.cpp)
+    target_link_libraries(aowis-db-network-benchmark PRIVATE aowis-db-core)
+
     # Register each DB test in one place: the aggregate build target automatically
     # includes new tests, so CTest never finds an executable the script omitted.
     function(aowis_add_db_test target test_name source_file)
@@ -192,7 +197,7 @@ if(BUILD_TESTING)
         # Exercise INI default and optional SQLite command-line override in
         # the actual HTTP server executable, not only the configuration parser.
         add_executable(aowis-server-db-cli-tests tests/server_cli_test.cpp)
-        target_link_libraries(aowis-server-db-cli-tests PRIVATE Qt6::Core Qt6::Network)
+        target_link_libraries(aowis-server-db-cli-tests PRIVATE aowis-db-core Qt6::Network)
         add_dependencies(aowis-server-db-cli-tests aowis-server-db)
         add_test(NAME aowis-server-db-cli COMMAND aowis-server-db-cli-tests $<TARGET_FILE:aowis-server-db>)
         set_tests_properties(aowis-server-db-cli PROPERTIES LABELS "aowis;database")

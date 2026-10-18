@@ -21,9 +21,12 @@ from Ninja is expected when source timestamps and contents have not changed.
 The test runner uses `tests/postgres/docker-compose.yaml` to launch a disposable
 PostgreSQL instance, wait for readiness, expose it only on a random localhost
 port, execute the normal test suite and remove the container/volumes. The
-backend-contract test detects `AOWIS_DB_TEST_PG_DB` and runs the PostgreSQL
-integration scenarios. A skipped PostgreSQL scenario is not evidence of
-PostgreSQL compatibility.
+backend-contract, operator CLI, and HTTP server CLI tests detect
+`AOWIS_DB_TEST_PG_DB` and run their PostgreSQL integration scenarios in
+independent temporary schemas. The server test launches the real
+`aowis-server-db` executable, checks unauthenticated and authenticated REST
+requests, creates a project over HTTP and verifies it persists in PostgreSQL.
+A skipped PostgreSQL scenario is not evidence of PostgreSQL compatibility.
 
 | Environment | Behavior |
 | --- | --- |
