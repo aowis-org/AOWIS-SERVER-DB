@@ -18,8 +18,8 @@ reviewing Model changes.
 
 The binary encoding uses fixed Qt `QDataStream` settings, deterministic field
 ordering, exact numeric values and stable object identifiers. The on-disk codec
-has its own format identification; changing that format is a data compatibility
-decision, not a reason to rename documentation files.
+has its own format identifier and must preserve deterministic bytes across
+SQLite and PostgreSQL for storage integrity and eventual replica exchange.
 
 ## Objects and references
 

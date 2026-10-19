@@ -43,7 +43,7 @@ A skipped PostgreSQL scenario is not evidence of PostgreSQL compatibility.
 The external PostgreSQL database must be disposable and permit test schema
 creation and deletion. Never point the tests at a production database.
 
-## Source patch workflow
+## Maintainer source-update workflow
 
 From the repository root:
 
@@ -56,5 +56,5 @@ AOWIS_DB_TEST_POSTGRES=required ./compile_linux_tests.sh
 `apply_patch.sh` refreshes the modification timestamps of extracted files and
 directories to ensure Ninja rebuilds them. `zip_db.sh` creates `../db.zip`
 with the current source tree and Model submodule; it excludes Git metadata and
-ignored build files. Keep source archives and test logs together when asking
-for subsequent changes.
+ignored build files. This workflow is for maintainers testing source updates;
+it does not describe database revision history or software release versions.

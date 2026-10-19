@@ -60,5 +60,6 @@ throttling are present, but the executable remains a loopback-only development
 and trusted-deployment server. Production use needs separately verified TLS
 termination, resource limits, request isolation, monitoring and backup/recovery.
 
-The `/api/v1/` prefix is a real HTTP protocol namespace; it is not a development
-patch identifier and must not be renamed casually.
+The `/api/v1/` prefix is the API's HTTP protocol namespace. It is unrelated
+to the product's distributed revision model; this service currently offers
+centralized REST access, not clone/fetch/push/pull.

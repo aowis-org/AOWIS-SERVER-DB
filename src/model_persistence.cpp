@@ -69,6 +69,27 @@ QByteArray uuidBytes(const QUuid &uuid)
     return uuid.toRfc4122();
 }
 
+// PostgreSQL accepts a UUID array as one typed, bound parameter. For large
+// networks this avoids hundreds of small IN-list queries, for which the
+// planner may choose repeated table scans on newly materialized revisions.
+// The array is constructed exclusively from QUuid values, never SQL text.
+QString postgresUuidArray(const QSet<QUuid> &ids)
+{
+    QString result;
+    result.reserve(ids.size() * 37 + 2);
+    result.append(QLatin1Char('{'));
+    bool first = true;
+    for (const QUuid &uuid : ids)
+    {
+        if (!first)
+            result.append(QLatin1Char(','));
+        first = false;
+        result.append(uuid.toString(QUuid::WithoutBraces));
+    }
+    result.append(QLatin1Char('}'));
+    return result;
+}
+
 // Read only objects relevant to one incoming network rather than scanning
 // all objects in the revision. The composite revision/object primary key is
 // used for each bounded IN batch (well below older SQLite variable limits).
@@ -79,6 +100,42 @@ bool fetchObjectsForNetworkSave(const StorageBackend &backend, const QSqlDatabas
                                 QHash<QUuid, ModelObject> &result,
                                 QString *error)
 {
+    // A single PostgreSQL query can scan/join the revision only once instead
+    // of repeatedly planning a 300-ID query against the same large table.
+    // Keep the existing bounded statement path for SQLite and small edits.
+    if (database.driverName() == QStringLiteral("QPSQL") && wanted.size() >= 512)
+    {
+        QSqlQuery query(database);
+        if (!query.prepare(QStringLiteral(
+                "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
+                "WHERE revision_uuid=CAST(? AS UUID) "
+                "AND object_uuid=ANY(CAST(? AS UUID[]))")))
+        {
+            assignError(error, query.lastError().text());
+            return false;
+        }
+        query.addBindValue(backend.bindUuid(revision_uuid));
+        query.addBindValue(postgresUuidArray(wanted));
+        if (!query.exec())
+        {
+            assignError(error, query.lastError().text());
+            return false;
+        }
+        while (query.next())
+        {
+            const ModelObject item{backend.readUuid(query.value(0)),
+                                   query.value(1).toString(), query.value(2).toByteArray(),
+                                   query.value(3).toLongLong(), query.value(4).toBool()};
+            result.insert(item.uuid, item);
+        }
+        if (query.lastError().isValid())
+        {
+            assignError(error, query.lastError().text());
+            return false;
+        }
+        return true;
+    }
+
     constexpr qsizetype batch_size = 300;
     const QList<QUuid> ids = wanted.values();
     for (qsizetype offset = 0; offset < ids.size(); offset += batch_size)
@@ -1047,6 +1104,14 @@ bool Database::rebuildWorkingHydraulicIndexes(
     const QString uuid_placeholder = this->database_.driverName() == QStringLiteral("QPSQL")
         ? QStringLiteral("CAST(? AS UUID)") : QStringLiteral("?");
     constexpr qsizetype batch_size = 256;
+    const bool profile = qEnvironmentVariableIsSet("AOWIS_DB_PROFILE_PHASES");
+    QElapsedTimer phase_clock;
+    if (profile)
+        phase_clock.start();
+    qint64 load_ms = 0;
+    qint64 membership_ms = 0;
+    qint64 references_ms = 0;
+    qsizetype total_members = 0;
     for (const QPair<QUuid, QByteArray> &root : networks)
     {
         const std::optional<NetworkIndex> index = decodeIndex(root.second, error);
@@ -1065,24 +1130,21 @@ bool Database::rebuildWorkingHydraulicIndexes(
         if (!network)
             return false;
 
+        if (profile)
+            load_ms += phase_clock.restart();
         const QSet<QUuid> ids = referencedIds(*index);
-        const QList<QUuid> members = ids.values();
-        for (qsizetype offset = 0; offset < members.size(); offset += batch_size)
+        total_members += ids.size();
+        // The validated root provides the exact member UUID set. One typed
+        // array predicate lets PostgreSQL insert from the materialized rows
+        // without repeatedly rescanning the same newly populated revision.
+        if (this->database_.driverName() == QStringLiteral("QPSQL") && ids.size() >= 512)
         {
-            const qsizetype count = qMin(batch_size, members.size() - offset);
-            QString placeholders;
-            for (qsizetype item = 0; item < count; ++item)
-            {
-                if (item != 0)
-                    placeholders += QLatin1Char(',');
-                placeholders += uuid_placeholder;
-            }
             QSqlQuery insert(this->database_);
             if (!insert.prepare(QStringLiteral(
                     "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
-                    "SELECT %1,%1,object_uuid FROM revision_objects "
-                    "WHERE revision_uuid=%1 AND deleted=0 AND object_uuid IN (%2)")
-                    .arg(uuid_placeholder, placeholders)))
+                    "SELECT CAST(? AS UUID),CAST(? AS UUID),object_uuid "
+                    "FROM revision_objects WHERE revision_uuid=CAST(? AS UUID) "
+                    "AND object_uuid=ANY(CAST(? AS UUID[])) AND deleted=0")))
             {
                 assignError(error, insert.lastError().text());
                 return false;
@@ -1090,9 +1152,8 @@ bool Database::rebuildWorkingHydraulicIndexes(
             insert.addBindValue(this->backend_->bindUuid(working_revision));
             insert.addBindValue(this->backend_->bindUuid(root.first));
             insert.addBindValue(this->backend_->bindUuid(working_revision));
-            for (qsizetype item = 0; item < count; ++item)
-                insert.addBindValue(this->backend_->bindUuid(members.at(offset + item)));
-            if (!insert.exec() || insert.numRowsAffected() != count)
+            insert.addBindValue(postgresUuidArray(ids));
+            if (!insert.exec() || insert.numRowsAffected() != ids.size())
             {
                 assignError(error, insert.lastError().text().isEmpty()
                     ? QStringLiteral("Merkle branch membership count mismatch")
@@ -1100,9 +1161,60 @@ bool Database::rebuildWorkingHydraulicIndexes(
                 return false;
             }
         }
+        else
+        {
+            const QList<QUuid> members = ids.values();
+            for (qsizetype offset = 0; offset < members.size(); offset += batch_size)
+            {
+                const qsizetype count = qMin(batch_size, members.size() - offset);
+                QString placeholders;
+                for (qsizetype item = 0; item < count; ++item)
+                {
+                    if (item != 0)
+                        placeholders += QLatin1Char(',');
+                    placeholders += uuid_placeholder;
+                }
+                QSqlQuery insert(this->database_);
+                if (!insert.prepare(QStringLiteral(
+                        "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
+                        "SELECT %1,%1,object_uuid FROM revision_objects "
+                        "WHERE revision_uuid=%1 AND deleted=0 AND object_uuid IN (%2)")
+                        .arg(uuid_placeholder, placeholders)))
+                {
+                    assignError(error, insert.lastError().text());
+                    return false;
+                }
+                insert.addBindValue(this->backend_->bindUuid(working_revision));
+                insert.addBindValue(this->backend_->bindUuid(root.first));
+                insert.addBindValue(this->backend_->bindUuid(working_revision));
+                for (qsizetype item = 0; item < count; ++item)
+                    insert.addBindValue(this->backend_->bindUuid(members.at(offset + item)));
+                if (!insert.exec() || insert.numRowsAffected() != count)
+                {
+                    assignError(error, insert.lastError().text().isEmpty()
+                        ? QStringLiteral("Merkle branch membership count mismatch")
+                        : insert.lastError().text());
+                    return false;
+                }
+            }
+        }
+        if (profile)
+            membership_ms += phase_clock.restart();
         if (!insertFreshHydraulicReferences(*this->backend_, this->database_,
                                              working_revision, *network, error))
             return false;
+        if (profile)
+            references_ms += phase_clock.restart();
+    }
+    if (profile)
+    {
+        qInfo().noquote().nospace()
+            << "aowis_db_profile op=rebuild_hydraulic_indexes"
+            << " networks=" << networks.size()
+            << " members=" << total_members
+            << " load_ms=" << load_ms
+            << " membership_ms=" << membership_ms
+            << " references_ms=" << references_ms;
     }
     return true;
 }

@@ -961,6 +961,62 @@ int main(int argc, char **argv)
                 REQUIRE(ddl.value(2).toLongLong() == 522);
                 REQUIRE(ddl.value(3).toLongLong() == 522);
                 ddl.finish();
+                // The PostgreSQL transition-table guard must enforce the
+                // same cross-revision/actor/range rules as the former row
+                // trigger. An event from another working revision is a valid
+                // FK target and has not yet been linked to any group, so only
+                // the semantic guard can reject this forged group link.
+                const std::optional<aowis::db::ProjectCreation> foreign_event_project =
+                    reopened.createProject(actor, QStringLiteral("PostgreSQL foreign group event"), &error);
+                REQUIRE(foreign_event_project.has_value());
+                REQUIRE(reopened.putObject(actor, foreign_event_project->main_branch_uuid,
+                    createUuidV7(), QStringLiteral("hydraulic.pipe"),
+                    QByteArrayLiteral("unlinked foreign edit"), -1, &error));
+                QUuid foreign_event_uuid;
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT uuid FROM object_events WHERE revision_uuid=? AND sequence=1")));
+                ddl.addBindValue(postgres_contract.bindUuid(foreign_event_project->working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                foreign_event_uuid = postgres_contract.readUuid(ddl.value(0));
+                REQUIRE(!foreign_event_uuid.isNull());
+                ddl.finish();
+                const QVector<aowis::db::ObjectGroup> imported_groups =
+                    reopened.objectGroupsForRevision(actor, batch_project->working_revision_uuid, &error);
+                REQUIRE(imported_groups.size() == 1);
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("BEGIN")));
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "INSERT INTO object_group_events(group_uuid,position,object_event_uuid) "
+                    "VALUES (?,?,?)")));
+                ddl.addBindValue(postgres_contract.bindUuid(imported_groups.first().uuid));
+                ddl.addBindValue(522);
+                ddl.addBindValue(postgres_contract.bindUuid(foreign_event_uuid));
+                REQUIRE_SQL(ddl, !ddl.exec());
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK")));
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM object_group_events WHERE group_uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(imported_groups.first().uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() == 522);
+                ddl.finish();
+                // The set-based object INSERT and ordered event INSERT must
+                // describe precisely the same immutable state, even across
+                // all full and partial PostgreSQL import batches.
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM object_events e "
+                    "JOIN revision_objects o ON o.revision_uuid=e.revision_uuid "
+                    "AND o.object_uuid=e.object_uuid "
+                    "WHERE e.revision_uuid=? AND e.action='put' "
+                    "AND e.before_version=-1 AND e.after_version=1 "
+                    "AND e.kind=o.kind AND e.after_content=o.content "
+                    "AND o.version=1 AND o.deleted=0")));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_project->working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() == 522);
+                ddl.finish();
                 // Fork the 522-object model while its working membership index
                 // is initially empty. The reconstruction must use batched
                 // SQL reads and produce complete derived indexes on PostgreSQL.

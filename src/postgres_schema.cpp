@@ -582,6 +582,7 @@ DECLARE
     first_generation BIGINT;
     current_generation BIGINT;
     inserted_count BIGINT := 0;
+    event_position BIGINT := 0;
     batch_count BIGINT;
 BEGIN
     IF jsonb_typeof(p_rows) IS DISTINCT FROM 'array' THEN
@@ -607,21 +608,37 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'working revision generation conflict' USING ERRCODE = '23514';
     END IF;
+    -- Object-row insertion is independent of journal event ordering. One
+    -- bounded set-based INSERT avoids invoking the SQL executor separately
+    -- for every model entity while retaining all row-level constraints,
+    -- identity guards and foreign-key checks.
+    INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted)
+    SELECT p_revision_uuid,(incoming.value->>'object_uuid')::UUID,
+           incoming.value->>'kind',
+           decode(incoming.value->>'content_b64', 'base64'),1,0
+    FROM jsonb_array_elements(p_rows) AS incoming(value);
+    GET DIAGNOSTICS inserted_count = ROW_COUNT;
+    IF inserted_count <> batch_count THEN
+        RAISE EXCEPTION 'fresh-network object batch count mismatch' USING ERRCODE = '23514';
+    END IF;
+
+    -- The immutable journal is intentionally still appended in JSON order,
+    -- one event at a time. Its existing per-row trigger must observe a
+    -- strictly contiguous sequence and verify each entry against the
+    -- pre-advanced generation. Optimizing object insertion must not weaken
+    -- that invariant or change the historical event ordering.
     FOR item IN
         SELECT value FROM jsonb_array_elements(p_rows) WITH ORDINALITY AS incoming(value, ordinal)
         ORDER BY ordinal
     LOOP
+        event_position := event_position+1;
         content_bytes := decode(item.value->>'content_b64', 'base64');
-        INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted)
-        VALUES (p_revision_uuid,(item.value->>'object_uuid')::UUID,
-                item.value->>'kind',content_bytes,1,0);
-        inserted_count := inserted_count+1;
         INSERT INTO object_events(uuid,revision_uuid,object_uuid,actor_uuid,
             sequence,occurred_at_ms,kind,action,before_version,after_version,
             before_content,after_content,before_deleted)
         VALUES ((item.value->>'event_uuid')::UUID,p_revision_uuid,
                 (item.value->>'object_uuid')::UUID,p_actor_uuid,
-                first_generation+inserted_count,
+                first_generation+event_position,
                 (item.value->>'occurred_at_ms')::BIGINT,item.value->>'kind',
                 'put',-1,1,NULL,content_bytes,1);
     END LOOP;
@@ -673,20 +690,31 @@ BEGIN
 END
 $aowis$)SQL",
     R"SQL(CREATE TRIGGER object_group_member_delete_guard BEFORE DELETE ON object_group_events FOR EACH ROW EXECUTE FUNCTION aowis_guard_object_group_member_delete_guard())SQL",
+    // Large fresh-network edits link every event into one immutable object
+    // group using INSERT ... SELECT. PostgreSQL transition tables let one
+    // AFTER STATEMENT guard validate that *entire* inserted set without
+    // 200,000 separate PL/pgSQL invocations and three indexed probes per row.
+    // This runs before the INSERT statement completes, so failure still
+    // aborts the whole write transaction (including the object journal).
     R"SQL(CREATE FUNCTION aowis_guard_object_group_member_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF NOT EXISTS(
-                SELECT 1 FROM object_groups g JOIN object_events e ON e.uuid=NEW.object_event_uuid
-                JOIN revisions r ON r.uuid=g.revision_uuid
-                WHERE g.uuid=NEW.group_uuid AND e.revision_uuid=g.revision_uuid
-                  AND e.actor_uuid=g.actor_uuid AND r.state='working'
-                  AND e.sequence BETWEEN g.first_sequence AND g.last_sequence) THEN
+    IF EXISTS (
+        SELECT 1 FROM inserted_group_events added
+        LEFT JOIN object_groups g ON g.uuid=added.group_uuid
+        LEFT JOIN object_events e ON e.uuid=added.object_event_uuid
+        LEFT JOIN revisions r ON r.uuid=g.revision_uuid
+        WHERE g.uuid IS NULL OR e.uuid IS NULL OR r.uuid IS NULL
+           OR e.revision_uuid IS DISTINCT FROM g.revision_uuid
+           OR e.actor_uuid IS DISTINCT FROM g.actor_uuid
+           OR r.state IS DISTINCT FROM 'working'
+           OR e.sequence NOT BETWEEN g.first_sequence AND g.last_sequence
+    ) THEN
         RAISE EXCEPTION 'object event/group mismatch' USING ERRCODE = '23514';
     END IF;
-    RETURN NEW;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER object_group_member_insert_guard BEFORE INSERT ON object_group_events FOR EACH ROW EXECUTE FUNCTION aowis_guard_object_group_member_insert_guard())SQL",
+    R"SQL(CREATE TRIGGER object_group_member_insert_guard AFTER INSERT ON object_group_events REFERENCING NEW TABLE AS inserted_group_events FOR EACH STATEMENT EXECUTE FUNCTION aowis_guard_object_group_member_insert_guard())SQL",
     R"SQL(CREATE FUNCTION aowis_guard_object_group_member_update_guard() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
         RAISE EXCEPTION 'object group members are immutable' USING ERRCODE = '23514';

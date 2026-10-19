@@ -1,159 +1,134 @@
-# AOWIS-SERVER-DB
+# AOWIS-SERVER-DB — Distributed Versioned Model Database
 
-C++ database library and optional local HTTP/REST server for AOWIS. The same
-core works with **SQLite** (the default for standalone applications) and
-**PostgreSQL** (for server deployments). The HTTP transport is optional:
-applications can link the database library directly without starting a server.
+**AOWIS-SERVER-DB (DVMD)** is the database foundation for AOWIS engineering
+models.
 
-This is an actively developed project. Both backends run through the shared
-project, revision, authorization, and history logic, but deployment and
-large-project performance still need hardening. **Do not expose the included
-HTTP executable directly to the public internet.**
+AOWIS-SERVER-DB provides a C++ database library and an optional HTTP/REST
+server. It supports embedded **SQLite** repositories and **PostgreSQL** server
+repositories through the same model, history and authorization APIs.
 
-## Git-inspired, structurally shared revision storage
+**Product direction:** An AOWIS project should be usable independently on a
+local computer, including offline, and synchronized with other repositories
+when a connection is available. **Distributed repository synchronization is a
+first-class architectural goal, not an implemented feature yet.** Today's
+SQLite and PostgreSQL backends provide local or centralized access; they do
+not currently offer clone/fetch/push/pull or offline replication.
 
-**AOWIS uses Git-inspired immutable, structurally shared snapshots:**
-every finalized project revision is a complete logical model, but unchanged
-objects and Merkle subtrees are reused across revisions and branches. This is
-a foundational feature for large, long-lived water infrastructure networks,
-not merely a compression option.
+This is pre-release software. The HTTP executable binds to loopback and is not
+qualified for direct public-internet exposure. Storage formats and SQL schemas
+are still subject to change before the first stable release.
 
-The storage architecture combines:
+## How model versioning works
 
-- **Canonical bulk construction.** Building an initial snapshot uses a
-  single in-memory radix-tree construction and bounded immutable-content
-  batches. PostgreSQL does not perform a network round trip for every
-  intermediate Merkle node. The builder computes each immutable node hash
-  once, using that same identity for its parent link and for batched insertion;
-  reused database content remains independently verified. Incremental
-  revisions still update only changed UUID paths, preserving identical roots.
-- **Content-addressed immutable objects.** Serialized model-object bytes have
-  SHA-256 identities. Identical bytes stored under the same kind are written
-  once and can be referenced by many revisions or branches.
-- **Persistent Merkle snapshot trees (finalized roots now integrated).**
-  Finalized object-mode revisions carry an immutable root mapping model UUIDs
-  to content identities. Editing one
-  object creates a new object and copies only the small tree path needed to
-  reach it. Everything else stays shared.
-- **Efficient historical lookup.** Finalized single-object `object()` reads
-  now use their immutable Merkle roots, without replaying revision diffs or
-  consulting SQL revision-object rows. Tree depth depends on UUID length,
-  **not revision count**. Finalized bulk object listings use breadth-first,
-  batched Merkle-tree traversal and verified content reads instead of
-  revision-object SQL rows. Finalized hydraulic-network model loads also
-  resolve their root and referenced entities from sealed Merkle data.
-- **Cryptographically linked revisions.** Finalized revision hashes now
-  commit to the Merkle root (for object-mode revisions), edit-history digest,
-  authorship, and parent
-  revision hashes. Historical branches and merges remain immutable.
-- **Normal editing and undo/redo.** A working branch retains its own state;
-  model validation, permissions, edit groups, and durable undo/redo continue
-  to operate on the same transactional core.
-- **Both storage engines.** SQLite and PostgreSQL implement the same content
-  hashing and tree-node semantics; neither backend defines the hash format.
+The core model is **Project → Branch → Revision**:
 
-### Implementation status
+- A **project** contains an engineering model and independent branches.
+- A **branch** has one editable working revision. Engineers can branch from an
+  immutable revision and develop alternatives without overwriting history.
+- **Finalizing** a revision preserves a complete, immutable model state,
+  records its edit history and parent relationships, and advances the branch
+  to a new editable revision.
+- **Comparing and merging** branches uses shared ancestry, structured model
+  differences and explicit conflict handling. Model validation still applies.
+- **Undo and redo** use persistent, grouped edit history; finalized revisions
+  are never rewritten to undo an engineering decision.
 
-**Stage 1 — complete:** The immutable `content_objects` table and cross-backend
-SHA-256 content-store API provide deduplicated blobs and integrity-checked
-write-once storage, independent of the transport or persistence backend.
+Although a finalized revision represents a complete logical model, it does
+**not** contain a second physical copy of every unchanged pipe, junction or
+other object. The database stores unchanged content once and reuses it across
+snapshots. This makes long-lived network histories practical without making
+engineers manage file copies or manually replay edits.
 
-**Stage 2 — complete (internal foundation):** A persistent, prefix-compressed
-16-way Merkle radix tree maps 128-bit object UUIDs to immutable blob hashes.
-The tree supports deterministic roots, lookup, insert/update/delete, batched
-changes, and full ordered enumeration. A change writes only its affected
-search path, preserving older roots exactly; no history replay is necessary.
-Its depth is bounded by the UUID's 32 hexadecimal digits, regardless of
-whether the project has 10 revisions or 10,000. Regression tests run against
-both SQLite and PostgreSQL.
+Under the hood, this uses immutable content-addressed objects and a shared
+Merkle index. Those are **implementation details**, not concepts users need to
+understand in order to work with projects, branches or revisions. The
+[versioned storage reference](docs/versioned-storage.md) documents the exact
+formats, integrity rules and performance characteristics.
 
-**Stage 3 — physical storage cutover implemented:** Finalized object-mode revisions seal
-and persist a Merkle root covering every model object, its version, and its
-delete state. Consecutive revisions reuse their parent's root and update the
-UUID paths changed in the operation journal. Historical single-object reads
-now come from the sealed tree with strict decoding and hash checks. Finalized
-snapshot manifests use immutable stored bytes; object-mode successors do not
-copy the full manifest into another working-revision row. Batched
-Merkle-tree traversal and blob loading now power finalized `objects()` reads,
-including PostgreSQL. Historical `loadHydraulicNetwork()` also reconstructs
-models from the sealed Merkle objects, independently of copied hydraulic
-membership and SQL object rows. Three-way merge previews now read finalized
-base/source states from ordered, batch-decoded Merkle snapshots; working
-heads remain SQL-backed. Creating a branch now rebuilds its editable object
-rows from the immutable finalized Merkle root, including exact versions and
-tombstones; PostgreSQL uses bounded bulk inserts rather than a network round
-trip per object. **New branches also rebuild hydraulic ownership and reference
-indexes from their finalized Merkle model**, not historical SQL index copies.
-Finalization now seals the Merkle root and **hands its already-validated working
-SQL model and hydraulic indexes to the new editable revision with three
-set-based SQL transfers**, then removes all old-revision materialized rows
-within the same transaction. It does not repeatedly decode the complete
-Merkle tree to reconstruct an identical working head. Finalized revisions
-contain **no duplicated `revision_objects`, membership, or reference rows**.
-Full verification checks every reachable immutable tree and blob and rebuilds
-the independently recorded edit/group-history manifest. Merge safety continues
-to check transient working-head rows against their parent's immutable root.
+## What works today
 
-**Measured storage savings:** On the October 19, 2026 benchmark, SQLite
-with 1,000 pipes and 50 revisions occupied **6.4 MB**, compared with
-**126.9 MB** under full revision copying (about **95% less**). SQLite with
-10,000 pipes and 10 revisions occupied **60.9 MB** versus **302 MB** before
-(about **80% less**). Finalized object-mode revisions retain **no duplicated
-SQL object rows**. These measurements are workload-dependent, not guaranteed
-ratios for all projects.
+| Capability | Status |
+| --- | --- |
+| Project, branch and revision lifecycle | Implemented |
+| Finalized snapshots with shared unchanged content | Implemented |
+| Revision ancestry, comparison and supported three-way merges | Implemented |
+| Transactional working models, optimistic edits and grouped undo/redo | Implemented |
+| Typed hydraulic networks and structural/reference validation | Implemented |
+| Users, groups, roles, permissions, password login, sessions and audit | Implemented; deployment hardening remains |
+| SQLite embedded and PostgreSQL server storage | Implemented |
+| C++ library, optional HTTP server and administration CLI | Implemented |
+| Clone, fetch, push, pull and synchronization between repositories | **Planned, not implemented** |
+| Reusable network snippets and snippet libraries | **Planned, not implemented** |
+| Composable planning scenarios using snippet variants | **Longer-term design, not implemented** |
 
-**Performance tradeoff and active optimization:** Working heads still
-materialize objects and derived hydraulic indexes for transactional edits.
-Reconstructing those temporary rows from Merkle blobs after every finalization
-caused significant latency. The finalization path now transfers the already-
-validated SQL head transactionally, without a Merkle round trip per entity or
-rebuilding hydraulic indexes. Branch creation still constructs an independent
-working head from its finalized base Merkle root, because branches cannot
-borrow another branch's mutable SQL state. Branch creation now builds
-those derived indexes from the already-verified new working object rows,
-without traversing the same finalized Merkle tree a second time. Missing
-membership rows are fetched in bounded SQL batches, including during the
-initial branch-index build. SQLite bulk writes and verification-local hash
-caching remain in place. Branch creation and initial sealing are still
-O(network size); further optimization should follow benchmarks, not guesses.
+## Distributed repositories — required future capability
 
-**Performance profiling:** The benchmark supports `--profile` to identify
-first-seal bottlenecks separately from branch materialization and normal
-incremental finalization. It reports opt-in, microsecond phase timings for
-Merkle-tree construction, content hashing, database inserts and transaction
-commits; this instrumentation is disabled during normal operation. See
-[docs/performance.md](docs/performance.md#profile-first-seal-and-branch-phases-opt-in).
+A local AOWIS repository should ultimately be a **full participant**, not
+merely an online cache of the server. For example, an engineer should be able
+to clone a project to a SQLite database, edit and finalize revisions offline,
+then exchange history with a PostgreSQL-backed server or another AOWIS
+repository. Divergent work must remain identifiable and mergeable.
 
-For forensic integrity audits, the library also exposes
-`Database::verifyProjectJournal(actor, project_uuid)`. Unlike normal
-`verifyProject()`, it independently replays the complete ordered object-event
-journal from each first-parent snapshot and checks its result against the
-sealed Merkle model. This is deliberately expensive and opt-in, not part of
-ordinary finalization or the HTTP API. It includes two-parent merges (their
-edits are relative to the first parent). See
-[docs/git-inspired-storage.md](docs/git-inspired-storage.md#deep-journal-to-merkle-consistency-verification).
+The distributed design must preserve revision and object identities across
+repositories, transfer only missing immutable data when possible, support
+remote-tracking branches and conditional branch updates, and validate incoming
+history and hydraulic model structure. Authorization, provenance and trust must
+be enforced at the receiving repository; content hashes alone do not establish
+permission to publish changes.
 
-The content store is an internal primitive, not a new public REST endpoint.
+**Not yet available:** repository IDs/remotes, clone/fetch/push/pull, sync
+protocols, remote branch tracking, offline exchange, partial clones and
+replication authorization. Opening the same server over REST is **not**
+distributed version control. Current code should retain compatibility with
+this target, but no application should assume synchronization already works.
 
-Technical contract, full migration roadmap, and tradeoffs:
-[docs/git-inspired-storage.md](docs/git-inspired-storage.md).
+See [Distributed repository design](docs/distributed-repositories.md) for
+invariants, proposed operations and unresolved decisions.
 
-## Features and layout
+## Network snippets — planned
 
-- **Projects → branches → revisions:** permanent UUIDv7 identities from
-  `AOWIS-SERVER-MODEL`; multiple independent projects and branches; one editable
-  working revision per branch. Finalized revisions are immutable, SHA-256-linked
-  to their parent revisions, and include author information in their integrity
-  metadata.
-- **Model and history:** typed hydraulic-network persistence, granular model
-  objects and indexes, optimistic concurrency, grouped edits, persistent
-  undo/redo, and branch comparison/merge with conflict handling.
-- **Security:** users, groups, roles, permissions, scoped grants, local password
-  credentials, revocable bearer sessions, password recovery, and security audit
-  records. Both REST and embedded applications use the database core's
-  authorization rules.
-- **Storage:** SQLite and PostgreSQL backends, selected by INI configuration.
-  No database migration system is maintained during pre-production development.
+A **snippet** is a reusable, self-contained selection of network entities
+and their internal relationships: for example, a pumping station with pipes,
+pumps, valves, curves, controls and connection points. Engineers should be
+able to save snippets in a library, duplicate and edit variants, and insert
+them into other networks, branches or projects.
+
+Ordinary insertion creates **new UUIDs** for inserted entities while keeping
+internal connections consistent. External references and connection ports
+must be bound explicitly to the destination, with compatible coordinates,
+elevations, units and dependencies validated before application. An insertion
+should be **one atomic, undoable operation**, with provenance showing which
+snippet definition/version was used.
+
+A future planning workflow could also apply a pinned snippet variant to
+**existing entities** or include/exclude it as part of a scenario based on an
+immutable revision. That requires stable target identities, preconditions,
+conflict checks and deterministic composition. **A scenario never changes its
+baseline finalized revision by toggling a snippet.** These are design goals,
+not shipped APIs or data formats.
+
+See [Snippet and scenario design](docs/snippets.md).
+
+## Persistence and integrity
+
+SQLite is suited to standalone applications; PostgreSQL serves shared
+installations. Both use the same canonical object encoding, immutable revision
+roots and history verification. An editable working head has relational
+objects and hydraulic indexes for efficient transactions; finalized model
+states retain immutable roots instead of historical SQL copies.
+
+Normal integrity verification checks stored objects, revision ancestry and
+history seals. An optional forensic verification additionally replays object
+journals to compare their effect against the finalized model. Neither
+mechanism protects against a privileged database owner rewriting *all* data
+and recomputing hashes. Reachability-based garbage collection and operational
+backup/recovery are still future work.
+
+The optional [network benchmark](docs/performance.md) measures storage,
+loads, edits, finalization, branch creation and history verification on both
+backends. Results depend on model size, revision patterns, backend and hardware.
+
+## Libraries and executables
 
 | Component | CMake target / executable | Purpose |
 | --- | --- | --- |
@@ -377,20 +352,12 @@ read from stdin, not from the process argument list.
 
 ## Performance measurements
 
-An optional [SQLite and PostgreSQL network benchmark](docs/performance.md)
-measures storage, network load, single-entity edits, finalization and branch
-creation at selected network sizes. PostgreSQL can be benchmarked using
-`./tools/benchmark_network_postgres.sh 10000`, which starts and removes an
-isolated Docker test instance. Both modes run separately from CTest, so large
-workloads never slow the normal regression suite. For 100,000-pipe stress runs,
-pass `--memory` to record Linux process RSS checkpoints and `--deep-verify` to
-replay the history journal against immutable Merkle snapshots; see
-[stress-testing instructions](docs/performance.md#large-network-stress-and-peak-memory-linux-opt-in).
-
-The bulk first-seal path uses insert-returned identities to avoid rereading
-fresh immutable content, while independently verifying reused content and
-retaining full SHA-256 checks on historical reads and integrity verification.
-See [performance measurements](docs/performance.md) for profiling details.
+The opt-in [SQLite and PostgreSQL network benchmark](docs/performance.md)
+measures model import and load, single-entity edits, finalization, independent
+branch creation, history verification and physical storage use. For 100,000-
+pipe stress cases, `--memory` reports benchmark-process RSS and
+`--deep-verify` enables forensic journal replay. These runs are intentionally
+separate from the routine CTest suite.
 
 ## Tests: SQLite and real PostgreSQL
 
@@ -454,34 +421,17 @@ asset. Some advanced branch merge cases, large-network performance,
 production-grade HTTP deployment, and operational recovery remain future
 work.
 
-## Working with ChatGPT patches
-
-From the repository root, apply a patch, capture the new source ZIP, and run
-all tests in that order:
-
-```bash
-./tools/apply_patch.sh ~/Downloads/PATCH_FILENAME.zip
-./tools/zip_db.sh
-AOWIS_DB_TEST_POSTGRES=required ./compile_linux_tests.sh
-```
-
-`apply_patch.sh` refreshes the modification timestamps of extracted files
-**and directories**, so Ninja rebuilds changed sources. `zip_db.sh` produces
-`../db.zip` containing the project source and checked-out Model submodule,
-while excluding Git metadata and ignored build files. Upload that ZIP with
-test output for the next development step.
-
 ## Further documentation
 
-- [Architecture and integrity](docs/architecture.md)
-- [Model persistence](docs/model-persistence.md)
+- [Architecture and system boundaries](docs/architecture.md)
+- [Versioned storage and integrity formats](docs/versioned-storage.md)
+- [Distributed repositories — future design](docs/distributed-repositories.md)
+- [Reusable snippets and scenario composition — future design](docs/snippets.md)
+- [Hydraulic model persistence](docs/model-persistence.md)
 - [Revision history, undo/redo and merges](docs/history-and-merges.md)
 - [Identity and access](docs/identity-and-access.md)
 - [Configuration and startup](docs/configuration.md)
 - [SQLite and PostgreSQL backends](docs/storage-backends.md)
 - [REST/HTTP API](docs/http-api.md)
+- [Performance and profiling](docs/performance.md)
 - [Building and testing](docs/testing.md)
-
-The documents describe current responsibilities and constraints, not the
-chronology of development patches. Exact codec, audit, and revision hash format
-identifiers are retained in code where required for stored-data compatibility.

@@ -1,5 +1,9 @@
 # SQLite and PostgreSQL storage
 
+AOWIS's **Distributed Versioned Model Database** currently runs over SQLite
+and PostgreSQL. Distribution means eventual independent repository replication;
+these backends do not yet exchange revisions or act as a distributed cluster.
+
 The database core owns project/revision semantics, Model persistence, access
 control, history and transactions. Storage adapters own driver connections,
 parameter conversion, backend-specific SQL and current-schema creation.
@@ -65,3 +69,12 @@ through Docker Compose. See [Testing](testing.md).
 Cross-backend functionality is exercised, but production operational recovery,
 large-network performance and publicly exposed HTTP deployments are not yet
 qualified.
+
+## Distributed operation (future)
+
+Both storage backends use the same canonical immutable object and revision
+formats, allowing a future clone/fetch/push/pull protocol to exchange model
+history without copying SQL files or tables. Each independently writable
+repository will need its own identity, remote tracking, safe branch updates,
+conflict resolution and trust checks. **No repository replication transport is
+implemented yet.** See [Distributed repositories](distributed-repositories.md).

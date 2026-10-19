@@ -28,9 +28,11 @@ The current pre-release chain input is SHA-256 of, in order:
 There is only one accepted revision-chain encoding; old pre-release encodings
 are deliberately unsupported. The operation-history digest is also
 recalculated independently during verification. For object-mode revisions,
-verification traverses the sealed Merkle root and compares every immutable
-content blob with the materialized SQL object rows. Changing a journal entry or
-its stored seal cannot go undetected without recomputing the chain hash.
+normal verification traverses the sealed model root and validates its immutable
+content; finalized revisions do **not** retain materialized SQL object rows. The journal and its stored seals are checked
+independently. A separate opt-in forensic verification replays journal events
+and compares their effect with the sealed model root. See
+[Versioned storage](versioned-storage.md).
 
 **Pre-release:** Schema and hash encoding changes may require recreating
 throwaway development databases. We do not support automatic migrations or
@@ -61,7 +63,9 @@ parents; failed/conflicting merges leave the working state unchanged.
 Known limitations include restricted merge-base handling and cases where two
 structurally related hydraulic edits conflict even when they touch distinct
 entities. A conflict preview is not a license to skip model validation.
-More elaborate recursive merges and offline synchronization are not complete.
+More elaborate recursive merges are not complete. Distributed clone, fetch,
+push, remote-tracking and offline synchronization are **planned, not currently
+implemented**; see [Distributed repositories](distributed-repositories.md).
 
 REST exposes read-only compare/preview and authenticated merge-commit routes;
 see [HTTP API](http-api.md). Security administration is recorded in a separate

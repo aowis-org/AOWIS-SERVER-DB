@@ -49,3 +49,13 @@ Do not expose the local HTTP listener directly to the public internet. The
 included server binds to loopback and does not terminate TLS. PostgreSQL
 credentials should come from libpq facilities such as `.pgpass` and service
 configuration, not a checked-in AOWIS INI file.
+
+## Distributed authorization (future)
+
+The current role and permission model applies to database operations and REST
+sessions in a single repository. It does not authenticate a second repository
+or authorize remote ref updates. Distributed exchange will need an authenticated
+import/publish boundary, per-project and per-branch authorization, clear
+revision provenance and safe acceptance of divergent histories. Hashes
+verify bytes, not privileges. See
+[Distributed repositories](distributed-repositories.md).
