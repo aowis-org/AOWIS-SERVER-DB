@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <algorithm>
 #include <limits>
 
 namespace aowis::db
@@ -232,7 +233,7 @@ std::optional<QByteArray> buildRevisionRoot(const QSqlDatabase &database,
         changes.append(merkle_tree::Change{keys.at(i), hashes->at(i)});
 
     const std::optional<QByteArray> result = base_root.isEmpty()
-        ? merkle_tree::build(database, changes, error)
+        ? merkle_tree::buildFromInsertedBlobs(database, changes, error)
         : merkle_tree::apply(database, base_root, changes, error);
     phases.mark("construct_merkle_tree", changes.size());
     return result;
@@ -320,28 +321,29 @@ std::optional<QVector<MerkleObjectRecord>> readRevisionObjectsSelected(
     if (requested.isEmpty())
         return result;
 
-    const std::optional<QVector<merkle_tree::Entry>> entries =
-        merkle_tree::entries(database, root, error);
-    if (!entries)
+    const std::optional<QHash<QUuid, QByteArray>> found =
+        merkle_tree::lookupMany(database, root, requested, error);
+    if (!found)
         return std::nullopt;
-
-    QVector<merkle_tree::Entry> selected;
-    QVector<QByteArray> hashes;
-    selected.reserve(requested.size());
-    hashes.reserve(requested.size());
-    for (const merkle_tree::Entry &entry : *entries)
-    {
-        if (requested.contains(entry.key))
-        {
-            selected.append(entry);
-            hashes.append(entry.blob_sha256);
-        }
-    }
-    if (selected.size() != requested.size())
+    if (found->size() != requested.size())
     {
         setError(error, QStringLiteral("Referenced model object missing from Merkle snapshot"));
         return std::nullopt;
     }
+
+    QVector<merkle_tree::Entry> selected;
+    selected.reserve(found->size());
+    for (QHash<QUuid, QByteArray>::const_iterator it = found->cbegin();
+         it != found->cend(); ++it)
+        selected.append(merkle_tree::Entry{it.key(), it.value()});
+    std::sort(selected.begin(), selected.end(),
+              [](const merkle_tree::Entry &left, const merkle_tree::Entry &right) {
+                  return left.key.toRfc4122() < right.key.toRfc4122();
+              });
+    QVector<QByteArray> hashes;
+    hashes.reserve(selected.size());
+    for (const merkle_tree::Entry &entry : selected)
+        hashes.append(entry.blob_sha256);
     const std::optional<QHash<QByteArray, QByteArray>> payloads =
         content_store::getMany(database, content_store::Kind::Blob, hashes, error);
     if (!payloads)

@@ -348,7 +348,8 @@ struct BuildEntry
 // lookups for its intermediate roots. Entries are sorted by their full UUID.
 std::optional<QByteArray> buildRange(const QVector<BuildEntry> &items,
                                      qsizetype start, qsizetype end, int depth,
-                                     QVector<QByteArray> &node_bytes, QString *error)
+                                     QVector<content_store::PreparedContent> &nodes,
+                                     QString *error)
 {
     if (start >= end)
         return std::nullopt;
@@ -381,7 +382,7 @@ std::optional<QByteArray> buildRange(const QVector<BuildEntry> &items,
                    static_cast<quint8>(items.at(next).key.at(fork_depth)) == edge)
                 ++next;
             const std::optional<QByteArray> child = buildRange(
-                items, cursor, next, fork_depth + 1, node_bytes, error);
+                items, cursor, next, fork_depth + 1, nodes, error);
             if (!child)
                 return std::nullopt;
             node.children[edge] = *child;
@@ -390,9 +391,9 @@ std::optional<QByteArray> buildRange(const QVector<BuildEntry> &items,
     }
     if (!validShape(node, depth, depth == 0, error))
         return std::nullopt;
-    const QByteArray bytes = encode(node);
-    const QByteArray hash = content_store::digest(content_store::Kind::Tree, bytes);
-    node_bytes.append(bytes);
+    content_store::PreparedContent prepared(content_store::Kind::Tree, encode(node));
+    const QByteArray hash = prepared.sha256();
+    nodes.append(std::move(prepared));
     return hash;
 }
 
@@ -508,6 +509,98 @@ std::optional<QByteArray> lookup(const QSqlDatabase &database, const QByteArray 
     }
 }
 
+std::optional<QHash<QUuid, QByteArray>> lookupMany(
+    const QSqlDatabase &database, const QByteArray &root,
+    const QSet<QUuid> &requested, QString *error)
+{
+    if (error != nullptr)
+        error->clear();
+    QHash<QUuid, QByteArray> result;
+    if (requested.isEmpty())
+        return result;
+
+    struct Key
+    {
+        QUuid uuid;
+        QByteArray nibbles;
+    };
+    QVector<Key> keys;
+    keys.reserve(requested.size());
+    for (const QUuid &uuid : requested)
+        keys.append(Key{uuid, unpackKey(uuid)});
+    std::sort(keys.begin(), keys.end(), [](const Key &left, const Key &right) {
+        return left.nibbles < right.nibbles;
+    });
+
+    // Each pending subtree owns a consecutive range of sorted requested UUIDs.
+    // A shared prefix is fetched and SHA-256-verified only once per level,
+    // rather than independently for each UUID. No unrelated subtree is read.
+    struct Pending
+    {
+        QByteArray digest;
+        qsizetype begin;
+        qsizetype end;
+        int depth;
+    };
+    QVector<Pending> pending{{root, 0, keys.size(), 0}};
+    while (!pending.isEmpty())
+    {
+        QVector<QByteArray> hashes;
+        hashes.reserve(pending.size());
+        for (const Pending &item : pending)
+            hashes.append(item.digest);
+        const std::optional<QHash<QByteArray, QByteArray>> payloads =
+            content_store::getMany(database, content_store::Kind::Tree, hashes, error);
+        if (!payloads)
+            return std::nullopt;
+
+        QVector<Pending> next;
+        for (const Pending &item : pending)
+        {
+            const std::optional<Node> node = decode(
+                payloads->value(item.digest), item.depth, item.depth == 0, error);
+            if (!node)
+                return std::nullopt;
+            const int after_prefix = item.depth + node->prefix.size();
+            if (node->value)
+            {
+                // A compressed leaf represents exactly one UUID. Other
+                // requested keys in the same parent range are simply absent.
+                for (qsizetype i = item.begin; i < item.end; ++i)
+                {
+                    if (commonPrefix(keys.at(i).nibbles, item.depth, node->prefix)
+                        == node->prefix.size())
+                        result.insert(keys.at(i).uuid, *node->value);
+                }
+                continue;
+            }
+            qsizetype cursor = item.begin;
+            while (cursor < item.end)
+            {
+                if (commonPrefix(keys.at(cursor).nibbles, item.depth, node->prefix)
+                    != node->prefix.size())
+                {
+                    ++cursor;
+                    continue;
+                }
+                const int edge = static_cast<quint8>(
+                    keys.at(cursor).nibbles.at(after_prefix));
+                qsizetype end = cursor + 1;
+                while (end < item.end &&
+                       commonPrefix(keys.at(end).nibbles, item.depth, node->prefix)
+                           == node->prefix.size() &&
+                       static_cast<quint8>(keys.at(end).nibbles.at(after_prefix)) == edge)
+                    ++end;
+                if (!node->children[edge].isEmpty())
+                    next.append(Pending{node->children[edge], cursor, end, after_prefix + 1});
+                cursor = end;
+            }
+        }
+        pending = std::move(next);
+    }
+    return result;
+}
+
 std::optional<QByteArray> update(const QSqlDatabase &database, const QByteArray &root,
                                  const Change &change, QString *error)
 {
@@ -565,8 +658,10 @@ std::optional<QByteArray> apply(const QSqlDatabase &database, const QByteArray &
     return current;
 }
 
-std::optional<QByteArray> build(const QSqlDatabase &database,
-                                const QVector<Change> &contents, QString *error)
+static std::optional<QByteArray> buildImpl(const QSqlDatabase &database,
+                                           const QVector<Change> &contents,
+                                           bool blobs_already_verified,
+                                           QString *error)
 {
     performance_profile::PhaseTimer phases("merkle_bulk_build");
     if (error != nullptr)
@@ -600,21 +695,37 @@ std::optional<QByteArray> build(const QSqlDatabase &database,
         }
     }
     phases.mark("sort_and_validate_keys", entries.size());
-    if (!content_store::getMany(database, content_store::Kind::Blob, leaf_hashes, error))
+    // The first-seal caller obtained these hashes from putMany() in this
+    // transaction. A general build() still independently validates input
+    // hashes because its caller may supply arbitrary references.
+    if (!blobs_already_verified &&
+        !content_store::getMany(database, content_store::Kind::Blob, leaf_hashes, error))
         return std::nullopt;
-    phases.mark("verify_blob_references", leaf_hashes.size());
+    phases.mark("verify_blob_references", blobs_already_verified ? 0 : leaf_hashes.size());
 
-    QVector<QByteArray> node_bytes;
-    node_bytes.reserve(entries.size() * 2);
+    QVector<content_store::PreparedContent> nodes;
+    nodes.reserve(entries.size() * 2);
     const std::optional<QByteArray> root = buildRange(
-        entries, 0, entries.size(), 0, node_bytes, error);
+        entries, 0, entries.size(), 0, nodes, error);
     if (!root)
         return std::nullopt;
-    phases.mark("construct_hash_nodes", node_bytes.size());
-    if (!content_store::putMany(database, content_store::Kind::Tree, node_bytes, error))
+    phases.mark("construct_hash_nodes", nodes.size());
+    if (!content_store::putManyPrepared(database, content_store::Kind::Tree, nodes, error))
         return std::nullopt;
-    phases.mark("insert_tree_nodes", node_bytes.size());
+    phases.mark("insert_tree_nodes", nodes.size());
     return root;
+}
+
+std::optional<QByteArray> build(const QSqlDatabase &database,
+                                const QVector<Change> &contents, QString *error)
+{
+    return buildImpl(database, contents, false, error);
+}
+
+std::optional<QByteArray> buildFromInsertedBlobs(
+    const QSqlDatabase &database, const QVector<Change> &contents, QString *error)
+{
+    return buildImpl(database, contents, true, error);
 }
 
 std::optional<QVector<Entry>> entries(const QSqlDatabase &database,

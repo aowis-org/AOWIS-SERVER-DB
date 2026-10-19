@@ -56,9 +56,11 @@ std::optional<QVector<MerkleObjectRecord>> readRevisionObjectEntries(
     const QSqlDatabase &database, const QVector<merkle_tree::Entry> &entries,
     QString *error = nullptr);
 
-// Fetch only selected UUIDs from the immutable snapshot. Tree nodes are scanned
-// in bounded SQL batches and only requested content blobs are loaded. Missing
-// objects are an error (including missing references in a network root).
+// Fetch selected UUIDs from an immutable snapshot by traversing only their
+// shared Merkle search paths in bounded SQL batches. No whole-tree traversal
+// is needed for sparse requests. Missing objects are an error (including
+// missing references in a network root). Full integrity checks use a separate
+// whole-tree traversal.
 std::optional<QVector<MerkleObjectRecord>> readRevisionObjectsSelected(
     const QSqlDatabase &database, const QByteArray &root,
     const QSet<QUuid> &requested, QString *error = nullptr);

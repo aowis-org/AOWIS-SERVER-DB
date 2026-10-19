@@ -80,6 +80,20 @@ bool exercise(const QSqlDatabase &database, QString &error)
     REQUIRE(tree::lookup(database, *root_abcd, b, &error) == x);
     REQUIRE(tree::lookup(database, *root_abcd, absent, &error) == std::nullopt);
     REQUIRE(error.isEmpty());
+    // Batched point lookups share prefixes and must not manufacture an entry
+    // for a UUID that falls in a compressed-path gap. Missing keys are omitted.
+    const std::optional<QHash<QUuid, QByteArray>> sparse = tree::lookupMany(
+        database, *root_abcd, QSet<QUuid>{a, b, d, absent}, &error);
+    REQUIRE(sparse && sparse->size() == 3 && sparse->value(a) == *x &&
+            sparse->value(b) == *x && sparse->value(d) == *y &&
+            !sparse->contains(absent));
+    const std::optional<QHash<QUuid, QByteArray>> no_matches = tree::lookupMany(
+        database, *empty, QSet<QUuid>{a, b, absent}, &error);
+    REQUIRE(no_matches && no_matches->isEmpty());
+    REQUIRE(tree::lookupMany(database, QByteArray(32, 'z'), {}, &error)->isEmpty());
+    REQUIRE(!tree::lookupMany(database, QByteArray(32, 'z'), QSet<QUuid>{a}, &error));
+    REQUIRE(!error.isEmpty());
+    error.clear();
     REQUIRE(tree::update(database, *root_abcd, tree::Change{a, *x}, &error) == root_abcd);
     REQUIRE(tree::update(database, *root_abcd, tree::Change{absent, std::nullopt}, &error) == root_abcd);
 
@@ -114,6 +128,10 @@ bool exercise(const QSqlDatabase &database, QString &error)
     REQUIRE(tree::apply(database, *empty, reverse_batch, &error) == root_abcd);
     REQUIRE(tree::build(database, first_batch, &error) == root_abcd);
     REQUIRE(tree::build(database, reverse_batch, &error) == root_abcd);
+    // The first-seal path receives hashes from content_store::putMany in the
+    // same transaction. Skipping the second blob lookup must not change the
+    // canonical root, including when all blobs already existed.
+    REQUIRE(tree::buildFromInsertedBlobs(database, first_batch, &error) == root_abcd);
     REQUIRE(tree::build(database, {}, &error) == empty);
     REQUIRE(tree::build(database, {{a, *x}}, &error) == root_a);
     REQUIRE(!tree::build(database, {{a, *x}, {a, *y}}, &error));
@@ -156,7 +174,7 @@ bool exercise(const QSqlDatabase &database, QString &error)
     // Multiple roots with deep common prefixes: no history replay, no
     // recursion proportional to revision count, and no omitted keys.
     QVector<tree::Change> many;
-    for (int i = 0; i < 256; ++i)
+    for (int i = 0; i < 320; ++i)
     {
         QByteArray bytes = a.toRfc4122();
         bytes[13] = static_cast<char>((i >> 8) & 0xff);
@@ -168,16 +186,29 @@ bool exercise(const QSqlDatabase &database, QString &error)
     REQUIRE(many_root && *many_root != *empty);
     const std::optional<QByteArray> built_root = tree::build(database, many, &error);
     REQUIRE(built_root && built_root == many_root);
+    REQUIRE(tree::buildFromInsertedBlobs(database, many, &error) == many_root);
     const std::optional<QVector<tree::Entry>> many_list = tree::entries(database, *many_root, &error);
     REQUIRE(many_list && many_list->size() == many.size());
     for (const tree::Change &change : many)
         REQUIRE(tree::lookup(database, *many_root, change.key, &error) == change.blob_sha256);
+    // More than one 256-hash read batch, including many keys with a shared
+    // prefix, must return exactly the same values as individual lookups.
+    QSet<QUuid> bulk_selection;
+    for (const tree::Change &change : many)
+        bulk_selection.insert(change.key);
+    bulk_selection.insert(absent);
+    const std::optional<QHash<QUuid, QByteArray>> bulk_found = tree::lookupMany(
+        database, *many_root, bulk_selection, &error);
+    REQUIRE(bulk_found && bulk_found->size() == many.size() &&
+            !bulk_found->contains(absent));
+    for (const tree::Change &change : many)
+        REQUIRE(bulk_found->value(change.key) == *change.blob_sha256);
     REQUIRE(tree::lookup(database, *root_abcd, a, &error) == x);
     const std::optional<QVector<tree::Entry>> still_empty = tree::entries(database, *empty, &error);
     REQUIRE(still_empty && still_empty->isEmpty());
 
     // A one-object modification must write only the affected search path,
-    // not 256 copied leaf records (or rows for every older revision).
+    // not hundreds of copied leaf records (or rows for every older revision).
     QSqlQuery count_query(database);
     REQUIRE(count_query.exec(QStringLiteral("SELECT COUNT(*) FROM content_objects WHERE kind='tree'")));
     REQUIRE(count_query.next());

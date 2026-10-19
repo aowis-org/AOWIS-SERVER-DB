@@ -23,8 +23,10 @@ The storage architecture combines:
 - **Canonical bulk construction.** Building an initial snapshot uses a
   single in-memory radix-tree construction and bounded immutable-content
   batches. PostgreSQL does not perform a network round trip for every
-  intermediate Merkle node. Incremental revisions still update only changed
-  UUID paths, preserving the same deterministic tree roots.
+  intermediate Merkle node. The builder computes each immutable node hash
+  once, using that same identity for its parent link and for batched insertion;
+  reused database content remains independently verified. Incremental
+  revisions still update only changed UUID paths, preserving identical roots.
 - **Content-addressed immutable objects.** Serialized model-object bytes have
   SHA-256 identities. Identical bytes stored under the same kind are written
   once and can be referenced by many revisions or branches.
@@ -372,6 +374,11 @@ creation at selected network sizes. PostgreSQL can be benchmarked using
 `./tools/benchmark_network_postgres.sh 10000`, which starts and removes an
 isolated Docker test instance. Both modes run separately from CTest, so large
 workloads never slow the normal regression suite.
+
+The bulk first-seal path uses insert-returned identities to avoid rereading
+fresh immutable content, while independently verifying reused content and
+retaining full SHA-256 checks on historical reads and integrity verification.
+See [performance measurements](docs/performance.md) for profiling details.
 
 ## Tests: SQLite and real PostgreSQL
 

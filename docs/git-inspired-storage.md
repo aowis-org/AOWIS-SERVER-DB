@@ -346,3 +346,14 @@ sealing a large full snapshot remain linear in network size; we benchmark them
 separately rather than claim constant-time branch creation.
 
 There is no migration or backward-compatibility layer for development DBs.
+
+### Sparse historical object lookups
+
+Historical model loads and merge helpers can request a subset of UUIDs from
+a finalized root without enumerating every Merkle leaf. `lookupMany()` sorts
+requested UUID paths, shares prefix traversal, and retrieves only the reachable
+immutable node payloads in bounded SQL batches. It still verifies the SHA-256
+of every fetched node and the selected model-record blobs, including tombstones.
+Missing requested UUIDs are errors at the model-record layer. Full snapshot
+reads and project integrity verification deliberately retain their separate
+whole-tree traversal to detect corruption outside the requested paths.

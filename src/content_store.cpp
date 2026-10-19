@@ -10,6 +10,10 @@
 #include <QSet>
 #include <QStringList>
 
+#include <openssl/evp.h>
+
+#include <array>
+
 namespace aowis::db::content_store
 {
 namespace
@@ -45,10 +49,38 @@ QByteArray digest(Kind kind, const QByteArray &bytes)
     QByteArray prefix("AOWIS-CONTENT-V1\0", 17);
     prefix.append(kind == Kind::Blob ? '\x01' : '\x02');
     appendU64(prefix, static_cast<quint64>(bytes.size()));
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    hash.addData(prefix);
-    hash.addData(bytes);
-    return hash.result();
+    // OpenSSL Crypto is already a required dependency of aowis-db-core.
+    // Its accelerated EVP implementation avoids the very expensive Qt SHA-256
+    // path for the tens of thousands of small model blobs and Merkle nodes in
+    // an initial seal. Keep the exact same domain-separated preimage and use
+    // Qt as a safe fallback if EVP cannot initialize or complete a digest.
+    std::array<unsigned char, EVP_MAX_MD_SIZE> result{};
+    unsigned int result_size = 0;
+    EVP_MD_CTX *context = EVP_MD_CTX_new();
+    if (context != nullptr)
+    {
+        const bool success =
+            EVP_DigestInit_ex(context, EVP_sha256(), nullptr) == 1 &&
+            EVP_DigestUpdate(context, prefix.constData(), static_cast<size_t>(prefix.size())) == 1 &&
+            (bytes.isEmpty() ||
+             EVP_DigestUpdate(context, bytes.constData(), static_cast<size_t>(bytes.size())) == 1) &&
+            EVP_DigestFinal_ex(context, result.data(), &result_size) == 1 &&
+            result_size == 32;
+        EVP_MD_CTX_free(context);
+        if (success)
+            return QByteArray(reinterpret_cast<const char *>(result.data()), 32);
+    }
+    QCryptographicHash fallback(QCryptographicHash::Sha256);
+    fallback.addData(prefix);
+    fallback.addData(bytes);
+    return fallback.result();
+}
+
+PreparedContent::PreparedContent(Kind kind, const QByteArray &payload)
+    : kind_(kind),
+      payload_(payload.isNull() ? QByteArray("") : payload),
+      sha256_(digest(kind, this->payload_))
+{
 }
 
 std::optional<QByteArray> get(const QSqlDatabase &database, Kind kind,
@@ -174,8 +206,8 @@ std::optional<QHash<QByteArray, QByteArray>> getMany(
     return result;
 }
 
-std::optional<QVector<QByteArray>> putMany(
-    const QSqlDatabase &database, Kind kind, const QVector<QByteArray> &payloads,
+std::optional<QVector<QByteArray>> putManyPrepared(
+    const QSqlDatabase &database, Kind kind, const QVector<PreparedContent> &contents,
     QString *error)
 {
     performance_profile::PhaseTimer phases(kind == Kind::Blob ? "content_blobs" : "content_nodes");
@@ -183,15 +215,20 @@ std::optional<QVector<QByteArray>> putMany(
         error->clear();
 
     QVector<QByteArray> results;
-    results.reserve(payloads.size());
+    results.reserve(contents.size());
     QHash<QByteArray, QByteArray> unique;
     QVector<QByteArray> ordered;
-    unique.reserve(payloads.size());
-    ordered.reserve(payloads.size());
-    for (const QByteArray &payload : payloads)
+    unique.reserve(contents.size());
+    ordered.reserve(contents.size());
+    for (const PreparedContent &content : contents)
     {
-        const QByteArray bytes = payload.isNull() ? QByteArray("") : payload;
-        const QByteArray hash = digest(kind, bytes);
+        if (content.kind() != kind)
+        {
+            setError(error, QStringLiteral("Prepared content kind mismatch"));
+            return std::nullopt;
+        }
+        const QByteArray &hash = content.sha256();
+        const QByteArray &bytes = content.payload();
         results.append(hash);
         if (unique.contains(hash))
         {
@@ -208,7 +245,12 @@ std::optional<QVector<QByteArray>> putMany(
         }
     }
 
-    phases.mark("hash_and_deduplicate", payloads.size());
+    phases.mark("deduplicate_prepared", contents.size());
+    // INSERT ... RETURNING identifies the records inserted by this operation.
+    // They were just hashed and written by this transaction. Only conflicts
+    // can reference pre-existing content that must be read and reverified.
+    QSet<QByteArray> inserted;
+    inserted.reserve(ordered.size());
     constexpr qsizetype batch_size = 256;
     if (database.driverName() == QStringLiteral("QPSQL"))
     {
@@ -220,7 +262,7 @@ std::optional<QVector<QByteArray>> putMany(
                 "SELECT decode(src.hash_hex,'hex'), ?, decode(src.payload_b64,'base64') "
                 "FROM jsonb_to_recordset(CAST(? AS jsonb)) "
                 "AS src(hash_hex text,payload_b64 text) "
-                "ON CONFLICT(sha256) DO NOTHING")))
+                "ON CONFLICT(sha256) DO NOTHING RETURNING sha256")))
         {
             setError(error, query.lastError().text());
             return std::nullopt;
@@ -245,6 +287,21 @@ std::optional<QVector<QByteArray>> putMany(
                 setError(error, query.lastError().text());
                 return std::nullopt;
             }
+            while (query.next())
+            {
+                const QByteArray hash = query.value(0).toByteArray();
+                if (!unique.contains(hash) || inserted.contains(hash))
+                {
+                    setError(error, QStringLiteral("Unexpected inserted content identity"));
+                    return std::nullopt;
+                }
+                inserted.insert(hash);
+            }
+            if (query.lastError().isValid())
+            {
+                setError(error, query.lastError().text());
+                return std::nullopt;
+            }
             query.finish();
         }
     }
@@ -264,7 +321,7 @@ std::optional<QVector<QByteArray>> putMany(
                                      : QStringLiteral(",(?,?,?)");
             if (!query.prepare(QStringLiteral(
                     "INSERT INTO content_objects(sha256,kind,payload) VALUES %1 "
-                    "ON CONFLICT(sha256) DO NOTHING").arg(values)))
+                    "ON CONFLICT(sha256) DO NOTHING RETURNING sha256").arg(values)))
             {
                 setError(error, query.lastError().text());
                 return std::nullopt;
@@ -282,16 +339,41 @@ std::optional<QVector<QByteArray>> putMany(
                 setError(error, query.lastError().text());
                 return std::nullopt;
             }
+            while (query.next())
+            {
+                const QByteArray hash = query.value(0).toByteArray();
+                if (!unique.contains(hash) || inserted.contains(hash))
+                {
+                    setError(error, QStringLiteral("Unexpected inserted content identity"));
+                    return std::nullopt;
+                }
+                inserted.insert(hash);
+            }
+            if (query.lastError().isValid())
+            {
+                setError(error, query.lastError().text());
+                return std::nullopt;
+            }
             query.finish();
         }
     }
 
     phases.mark("sql_insert", ordered.size());
+    QVector<QByteArray> reused;
+    reused.reserve(ordered.size() - inserted.size());
+    for (const QByteArray &hash : ordered)
+    {
+        if (!inserted.contains(hash))
+            reused.append(hash);
+    }
+    // A conflicting key might belong to corrupt or different existing data.
+    // Preserve complete SHA-256 verification and exact-byte collision checks
+    // on those rows. Newly inserted rows need no redundant SQL round-trip.
     const std::optional<QHash<QByteArray, QByteArray>> verified =
-        getMany(database, kind, ordered, error);
+        getMany(database, kind, reused, error);
     if (!verified)
         return std::nullopt;
-    for (const QByteArray &hash : ordered)
+    for (const QByteArray &hash : reused)
     {
         if (verified->value(hash) != unique.value(hash))
         {
@@ -299,8 +381,21 @@ std::optional<QVector<QByteArray>> putMany(
             return std::nullopt;
         }
     }
-    phases.mark("verify_stored_content", ordered.size());
+    phases.mark("verify_reused_content", reused.size());
     return results;
+}
+
+std::optional<QVector<QByteArray>> putMany(
+    const QSqlDatabase &database, Kind kind, const QVector<QByteArray> &payloads,
+    QString *error)
+{
+    performance_profile::PhaseTimer phases(kind == Kind::Blob ? "content_blobs" : "content_nodes");
+    QVector<PreparedContent> prepared;
+    prepared.reserve(payloads.size());
+    for (const QByteArray &payload : payloads)
+        prepared.append(PreparedContent(kind, payload));
+    phases.mark("prepare_hashes", payloads.size());
+    return putManyPrepared(database, kind, prepared, error);
 }
 
 std::optional<QByteArray> put(const QSqlDatabase &database, Kind kind,

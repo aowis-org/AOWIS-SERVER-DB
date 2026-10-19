@@ -161,8 +161,13 @@ Important phase groups:
   corresponding name is `merkle_incremental_seal` and only changed UUIDs
   are processed.
 - `content_blobs` / `content_nodes`: content SHA-256 hashing/deduplication,
-  SQL insertion, and integrity-checked readback. The count is the number of
-  input or unique records, depending on the phase.
+  SQL insertion, and integrity-checked readback of **reused** records only.
+  The count is the number of input, unique, or reused records, depending on
+  the phase.
+  Content hashing uses the already-required OpenSSL EVP SHA-256 implementation
+  when available, with Qt SHA-256 as a fallback. The domain-separated preimage
+  and canonical hashes are identical for both implementations; the test suite
+  pins independent binary test vectors. No hash or database format changed.
 - `merkle_bulk_build`: UUID sorting and validation, blob-hash verification,
   canonical Merkle node construction, and node persistence.
 - `create_branch` / `branch_materialization`: new branch metadata, Merkle
@@ -309,3 +314,46 @@ network members are retrieved with bounded SQL batches. This is an optimization
 of redundant I/O, **not** an O(1) branch-creation guarantee. Re-run the
 original disposable benchmarks and compare `create_branch_ms` directly.
 
+
+### First-seal insertion optimization
+
+During first-seal construction, immutable content is hashed and inserted in
+batches using `INSERT ... ON CONFLICT DO NOTHING RETURNING sha256`. Only
+conflicting **pre-existing** hashes are fetched again and checked for exact
+content and SHA-256 integrity. Newly inserted payloads already came from the
+current transaction's verified hash inputs; rereading them immediately added
+avoidable database traffic and rehashing. Normal reads and later history
+verification still check all content independently.
+
+The first-seal Merkle builder uses blob hashes returned directly by the
+successful blob insert in that same transaction, so it skips one redundant
+full-set blob-reference read. Standalone `merkle_tree::build()` still validates
+arbitrary blob references. The Merkle encoding, root hashes, and persistent
+schema are unchanged.
+
+When `--profile` is enabled, `content_blobs` and `content_nodes` report
+`verify_reused_content` (the number of pre-existing items verified) rather
+than verifying every newly inserted item again. A first seal on a fresh
+database should typically show zero reused items.
+
+### Avoid double-hashing immutable Merkle nodes
+
+The initial Merkle builder must calculate every node SHA-256 before its
+parent can be encoded. Passing raw node bytes to the general batch inserter
+previously hashed those same bytes **again**, even though the hash had just
+been calculated during bottom-up construction.
+
+`content_store::PreparedContent` now binds a payload to the digest computed
+at construction; callers cannot provide a separate hash. The bulk builder
+uses that digest both for parent links and for batched immutable insertion.
+Reused SQL rows still undergo exact-content and SHA-256 verification; fresh
+rows are protected by the existing transaction. Public `putMany()` continues
+to calculate the hashes of arbitrary caller payloads, while `putManyPrepared()`
+reuses prepared identities. The stored bytes, hash domain, Merkle roots, and
+schema are unchanged.
+
+With `--profile`, compare `merkle_bulk_build`'s `construct_hash_nodes` and
+`content_nodes`'s `deduplicate_prepared` against the former
+`content_nodes` `hash_and_deduplicate` phase. The latter no longer repeats
+SHA-256 work on all Merkle nodes. First-seal time can still vary with CPU,
+storage and concurrent build/test load.

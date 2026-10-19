@@ -6,6 +6,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QPair>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QString>
 #include <QUuid>
@@ -41,6 +42,14 @@ std::optional<QByteArray> emptyRoot(const QSqlDatabase &database, QString *error
 std::optional<QByteArray> lookup(const QSqlDatabase &database, const QByteArray &root,
                                   const QUuid &key, QString *error = nullptr);
 
+// Batch point lookups from an immutable Merkle root. Traverses only paths
+// leading to requested UUIDs and shares verified SQL reads across common
+// prefixes. Missing UUIDs are omitted (as with lookup()); corruption on a
+// visited path is an error. Full integrity verification uses entries().
+std::optional<QHash<QUuid, QByteArray>> lookupMany(
+    const QSqlDatabase &database, const QByteArray &root,
+    const QSet<QUuid> &requested, QString *error = nullptr);
+
 // Replaces or removes a single key, returning the new root. Identical writes
 // and missing-key deletions return the original root without new nodes.
 std::optional<QByteArray> update(const QSqlDatabase &database, const QByteArray &root,
@@ -57,6 +66,14 @@ std::optional<QByteArray> apply(const QSqlDatabase &database, const QByteArray &
 // and duplicate UUIDs are rejected. Roots match apply(emptyRoot(), changes).
 std::optional<QByteArray> build(const QSqlDatabase &database,
                                 const QVector<Change> &contents, QString *error = nullptr);
+
+// Internal first-seal path ONLY: blob digests have just been returned by a
+// successful content_store::putMany in the same SQL transaction. No need to
+// fetch all those same blobs a second time. Do not use for arbitrary hashes;
+// build() above still checks that every referenced blob exists and is valid.
+std::optional<QByteArray> buildFromInsertedBlobs(
+    const QSqlDatabase &database, const QVector<Change> &contents,
+    QString *error = nullptr);
 
 // Returns entries in UUID byte order, checking all reachable tree nodes.
 // Unlike a point lookup, this detects missing/corrupt nodes anywhere below

@@ -120,6 +120,18 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
         aowis::db::readRevisionObjectsSelected(database, *root1, QSet<QUuid>{pipe}, &error);
     REQUIRE(selected && selected->size() == 1 && selected->first().uuid == pipe &&
             selected->first().content == QByteArray("old pipe"));
+    const std::optional<QVector<aowis::db::MerkleObjectRecord>> selected_pair =
+        aowis::db::readRevisionObjectsSelected(database, *root1,
+                                               QSet<QUuid>{pipe, junction}, &error);
+    REQUIRE(selected_pair && selected_pair->size() == 2);
+    REQUIRE(selected_pair->at(0).uuid == historic_objects->at(0).uuid &&
+            selected_pair->at(0).content == historic_objects->at(0).content &&
+            selected_pair->at(1).uuid == historic_objects->at(1).uuid &&
+            selected_pair->at(1).content == historic_objects->at(1).content);
+    REQUIRE(!aowis::db::readRevisionObjectsSelected(database, *root1,
+        QSet<QUuid>{pipe, QUuid::createUuid()}, &error));
+    REQUIRE(error.contains(QStringLiteral("missing")));
+    error.clear();
     const std::optional<QVector<aowis::db::MerkleObjectRecord>> empty_selection =
         aowis::db::readRevisionObjectsSelected(database, *root1, {}, &error);
     REQUIRE(empty_selection && empty_selection->isEmpty());
@@ -203,6 +215,20 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
         aowis::db::readRevisionObject(database, *root3, pipe, &error);
     REQUIRE(tombstone && tombstone->deleted && tombstone->version == 3 &&
             tombstone->content.isEmpty());
+    const std::optional<QVector<aowis::db::MerkleObjectRecord>> selected_tombstone =
+        aowis::db::readRevisionObjectsSelected(database, *root3,
+                                               QSet<QUuid>{pipe, junction}, &error);
+    REQUIRE(selected_tombstone && selected_tombstone->size() == 2);
+    bool saw_deleted_pipe = false;
+    for (const aowis::db::MerkleObjectRecord &record : *selected_tombstone)
+    {
+        if (record.uuid == pipe)
+        {
+            REQUIRE(record.deleted && record.version == 3 && record.content.isEmpty());
+            saw_deleted_pipe = true;
+        }
+    }
+    REQUIRE(saw_deleted_pipe);
 
     // Missing and extra immutable entries both invalidate a revision root.
     REQUIRE(query.prepare(QStringLiteral(
