@@ -115,6 +115,13 @@ initial branch-index build. SQLite bulk writes and verification-local hash
 caching remain in place. Branch creation and initial sealing are still
 O(network size); further optimization should follow benchmarks, not guesses.
 
+**Performance profiling:** The benchmark supports `--profile` to identify
+first-seal bottlenecks separately from branch materialization and normal
+incremental finalization. It reports opt-in, microsecond phase timings for
+Merkle-tree construction, content hashing, database inserts and transaction
+commits; this instrumentation is disabled during normal operation. See
+[docs/performance.md](docs/performance.md#profile-first-seal-and-branch-phases-opt-in).
+
 The content store is an internal primitive, not a new public REST endpoint.
 
 Technical contract, full migration roadmap, and tradeoffs:

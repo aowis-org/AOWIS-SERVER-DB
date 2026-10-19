@@ -128,6 +128,59 @@ relation storage only, not cluster overhead or WAL. Benchmarking concurrent edit
 work. The optional `--revisions` workload measures history growth, but not
 peak RAM or simultaneous editing throughput.
 
+## Profile first-seal and branch phases (opt-in)
+
+For profiling **the expensive initial Merkle seal**, rebuild the benchmark
+explicitly, then run only one finalized revision:
+
+```bash
+cmake --build build-linux-tests --target aowis-db-network-benchmark
+./build-linux-tests/aowis-db-network-benchmark 10000 --revisions 1 --profile \
+    2> /tmp/aowis-merkle-sqlite-profile.txt
+```
+
+Use the same isolated PostgreSQL benchmark with an inherited environment flag:
+
+```bash
+AOWIS_DB_PROFILE_PHASES=1 ./tools/benchmark_network_postgres.sh 1000 --revisions 1 \
+    2> /tmp/aowis-merkle-postgres-profile.txt
+```
+
+The profile reports to **stderr** in machine-readable lines such as
+`aowis_db_profile op=merkle_first_seal phase=scan_and_encode_objects elapsed_us=... count=...`.
+It is disabled by default. Neither profiling nor these commands change the
+schema, hashing format, transaction semantics, or regular test suite.
+
+Important phase groups:
+
+- `finalize` / `finalize_transaction`: authorization and state lookup, Merkle
+  root sealing, snapshot/history hashing, creation of successor metadata,
+  set-based working-head transfer, removal of old working rows, and commit.
+- `merkle_first_seal`: object-row scan and deterministic record encoding;
+  immutable blob storage; Merkle-tree construction. On later revisions the
+  corresponding name is `merkle_incremental_seal` and only changed UUIDs
+  are processed.
+- `content_blobs` / `content_nodes`: content SHA-256 hashing/deduplication,
+  SQL insertion, and integrity-checked readback. The count is the number of
+  input or unique records, depending on the phase.
+- `merkle_bulk_build`: UUID sorting and validation, blob-hash verification,
+  canonical Merkle node construction, and node persistence.
+- `create_branch` / `branch_materialization`: new branch metadata, Merkle
+  traversal, verified blob decoding, new working-object SQL insertion,
+  hydraulic-index rebuild, and commit.
+
+Timings are **monotonic microseconds**, not CPU times. Nested operations are
+reported both as a parent span and as more detailed child spans; **do not add
+parent and child timings together**. The benchmark's usual `finalize_ms` and
+`create_branch_ms` remain the comparable end-to-end wall-clock figures.
+
+Use `--revisions 1` to study first-seal costs without the noise of many
+incremental finalizations, then repeat with `--revisions 10` to see the
+incremental path. The benchmark uses disposable databases and does not create
+production data. The profile itself can add a little overhead; compare
+unprofiled runs for performance conclusions. Send the `aowis_db_profile`
+lines and standard benchmark output together for diagnosis.
+
 ## Profile a network save
 
 Set `AOWIS_DB_PROFILE_SAVE=1` to print a single phase summary per successful

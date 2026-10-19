@@ -1,6 +1,7 @@
 #include "merkle_tree.h"
 
 #include "content_store.h"
+#include "performance_profile.h"
 
 #include <algorithm>
 #include <array>
@@ -567,6 +568,7 @@ std::optional<QByteArray> apply(const QSqlDatabase &database, const QByteArray &
 std::optional<QByteArray> build(const QSqlDatabase &database,
                                 const QVector<Change> &contents, QString *error)
 {
+    performance_profile::PhaseTimer phases("merkle_bulk_build");
     if (error != nullptr)
         error->clear();
     if (contents.isEmpty())
@@ -597,8 +599,10 @@ std::optional<QByteArray> build(const QSqlDatabase &database,
             return std::nullopt;
         }
     }
+    phases.mark("sort_and_validate_keys", entries.size());
     if (!content_store::getMany(database, content_store::Kind::Blob, leaf_hashes, error))
         return std::nullopt;
+    phases.mark("verify_blob_references", leaf_hashes.size());
 
     QVector<QByteArray> node_bytes;
     node_bytes.reserve(entries.size() * 2);
@@ -606,8 +610,10 @@ std::optional<QByteArray> build(const QSqlDatabase &database,
         entries, 0, entries.size(), 0, node_bytes, error);
     if (!root)
         return std::nullopt;
+    phases.mark("construct_hash_nodes", node_bytes.size());
     if (!content_store::putMany(database, content_store::Kind::Tree, node_bytes, error))
         return std::nullopt;
+    phases.mark("insert_tree_nodes", node_bytes.size());
     return root;
 }
 

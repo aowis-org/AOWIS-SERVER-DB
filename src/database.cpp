@@ -4,6 +4,7 @@
 #include "sqlite_backend.h"
 #include "postgres_backend.h"
 #include "revision_root.h"
+#include "performance_profile.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -456,6 +457,7 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
                                                  const QUuid &base_finalized_revision_uuid,
                                                  QString *error)
 {
+    performance_profile::PhaseTimer phases("create_branch");
     if (!isValidName(name))
     {
         setError(error, QStringLiteral("Branch name must contain 1..256 characters"));
@@ -542,6 +544,7 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
+    phases.mark("authorize_and_create_branch_records");
     if (ok && *base_mode == 1)
     {
         // The immutable Merkle snapshot is authoritative for object contents.
@@ -558,8 +561,10 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
                 this->database_, *this->backend_, result.head_revision_uuid,
                 base->object_root_sha256, error);
         }
+        phases.mark("materialize_working_objects");
         if (ok)
             ok = rebuildWorkingHydraulicIndexes(result.head_revision_uuid, error);
+        phases.mark("rebuild_hydraulic_indexes");
     }
     if (ok)
     {
@@ -583,8 +588,10 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             ok = run(query, error);
         }
     }
+    phases.mark("publish_branch_head");
     if (ok)
         ok = commit(error);
+    phases.mark("commit_transaction");
     if (!ok)
     {
         rollback();
@@ -667,15 +674,18 @@ std::optional<Finalization> Database::finalizeUnchecked(const QUuid &actor_uuid,
                                                const QString &message,
                                                QString *error)
 {
+    performance_profile::PhaseTimer phases("finalize_transaction");
     if (!beginWrite(error))
         return std::nullopt;
     const std::optional<Finalization> result = finalizeInWriteTransaction(
         actor_uuid, branch_uuid, expected_generation, title, message, error);
+    phases.mark("finalize_body");
     if (!result || !commit(error))
     {
         rollback();
         return std::nullopt;
     }
+    phases.mark("commit_transaction");
     return result;
 }
 
@@ -685,6 +695,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
                                                const QString &message,
                                                QString *error)
 {
+    performance_profile::PhaseTimer phases("finalize");
     if (!requirePermission(OperationContext{actor_uuid}, QStringLiteral("project.revision.finalize"),
                            AccessScope::branch(branch_uuid), error))
     {
@@ -700,6 +711,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
     const std::optional<int> mode = objectMode(r->uuid, error);
     if (!mode)
         return std::nullopt;
+    phases.mark("authorize_and_load_working_head");
     // Publish the Merkle root only at finalization, within one transaction.
     // Temporary working rows are removed after sealing; immutable trees
     // alone represent finalized model snapshots.
@@ -721,6 +733,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             return std::nullopt;
         object_root = *sealed;
     }
+    phases.mark("seal_merkle_root");
     const std::optional<QByteArray> body = snapshotUnchecked(r->uuid, error);
     if (!body)
     {
@@ -768,6 +781,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
                                      title, message, result.snapshot_sha256,
                                      r->created_by_uuid, actor_uuid, *operation_digest, object_root);
     result.new_working_revision_uuid = createUuidV7();
+    phases.mark("hash_snapshot_history_and_parents");
 
     // The immutable root now owns the finalized snapshot, but the *existing*
     // SQL working state is already validated. For object-mode revisions hand
@@ -838,6 +852,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             ok = run(query, error);
         }
     }
+    phases.mark("create_successor_metadata");
     // Object-mode rows are NOT retained as historical storage. They move from
     // one temporary editable SQL head to the next and are discarded from the
     // old revision before its immutable state is published. No root traversal,
@@ -874,6 +889,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
                 break;
             }
         }
+        phases.mark("copy_working_objects_and_indexes");
         if (ok)
         {
             for (const QString &table : {QStringLiteral("hydraulic_network_references"),
@@ -894,6 +910,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
                 }
             }
         }
+        phases.mark("remove_old_working_rows");
         if (ok)
             ok = sealOldRevision(QStringLiteral("sealing"));
     }
@@ -936,6 +953,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
+    phases.mark("seal_and_publish_revision");
     if (!ok)
     {
         return std::nullopt;

@@ -2,6 +2,7 @@
 
 #include "content_store.h"
 #include "merkle_tree.h"
+#include "performance_profile.h"
 #include "storage_backend.h"
 
 #include <QJsonArray>
@@ -164,6 +165,8 @@ std::optional<QByteArray> buildRevisionRoot(const QSqlDatabase &database,
                                              const QByteArray &base_root,
                                              QString *error)
 {
+    performance_profile::PhaseTimer phases(base_root.isEmpty()
+        ? "merkle_first_seal" : "merkle_incremental_seal");
     QSqlQuery objects(database);
     if (base_root.isEmpty())
     {
@@ -217,18 +220,22 @@ std::optional<QByteArray> buildRevisionRoot(const QSqlDatabase &database,
         return std::nullopt;
     }
     objects.finish();
+    phases.mark("scan_and_encode_objects", payloads.size());
 
     const std::optional<QVector<QByteArray>> hashes = content_store::putMany(
         database, content_store::Kind::Blob, payloads, error);
     if (!hashes)
         return std::nullopt;
+    phases.mark("store_model_blobs", payloads.size());
     changes.reserve(keys.size());
     for (qsizetype i = 0; i < keys.size(); ++i)
         changes.append(merkle_tree::Change{keys.at(i), hashes->at(i)});
 
-    if (!base_root.isEmpty())
-        return merkle_tree::apply(database, base_root, changes, error);
-    return merkle_tree::build(database, changes, error);
+    const std::optional<QByteArray> result = base_root.isEmpty()
+        ? merkle_tree::build(database, changes, error)
+        : merkle_tree::apply(database, base_root, changes, error);
+    phases.mark("construct_merkle_tree", changes.size());
+    return result;
 }
 
 std::optional<MerkleObjectRecord> readRevisionObject(const QSqlDatabase &database,
@@ -357,6 +364,7 @@ bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
                                        const QByteArray &finalized_root,
                                        QString *error)
 {
+    performance_profile::PhaseTimer phases("branch_materialization");
     if (working_revision_uuid.isNull() || finalized_root.size() != 32)
     {
         setError(error, QStringLiteral("Invalid working revision or finalized Merkle root"));
@@ -403,6 +411,7 @@ bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
         merkle_tree::entries(database, finalized_root, error);
     if (!entries)
         return false;
+    phases.mark("scan_merkle_tree", entries->size());
 
     const bool postgres = database.driverName() == QStringLiteral("QPSQL");
     QSqlQuery insert(database);
@@ -423,13 +432,23 @@ bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
     // execution per object and keep below SQLite's old 999-bind limit.
     constexpr qsizetype batch_size = 256;
     constexpr qsizetype sqlite_insert_batch = 64; // 64 * 6 = 384 bind parameters
+    const bool profile = qEnvironmentVariableIntValue("AOWIS_DB_PROFILE_PHASES") == 1;
+    QElapsedTimer batch_timer;
+    qint64 read_decode_us = 0;
+    qint64 insert_us = 0;
 
     for (qsizetype start = 0; start < entries->size(); start += batch_size)
     {
         const QVector<merkle_tree::Entry> portion =
             entries->mid(start, qMin(batch_size, entries->size() - start));
+        if (profile)
+            batch_timer.start();
         const std::optional<QVector<MerkleObjectRecord>> records =
             readRevisionObjectEntries(database, portion, error);
+        if (profile)
+            read_decode_us += batch_timer.nsecsElapsed() / 1000;
+        if (profile)
+            batch_timer.restart();
         if (!records)
             return false;
         if (postgres)
@@ -497,6 +516,17 @@ bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
                 insert.finish();
             }
         }
+        if (profile)
+            insert_us += batch_timer.nsecsElapsed() / 1000;
+    }
+    if (profile)
+    {
+        // Aggregate batch timings rather than emitting a line for every 256
+        // objects. `scan_merkle_tree` above already measures tree traversal.
+        std::fprintf(stderr, "aowis_db_profile op=branch_materialization phase=read_decode_blobs elapsed_us=%lld count=%lld\n",
+                     static_cast<long long>(read_decode_us), static_cast<long long>(entries->size()));
+        std::fprintf(stderr, "aowis_db_profile op=branch_materialization phase=insert_working_rows elapsed_us=%lld count=%lld\n",
+                     static_cast<long long>(insert_us), static_cast<long long>(entries->size()));
     }
     return true;
 }

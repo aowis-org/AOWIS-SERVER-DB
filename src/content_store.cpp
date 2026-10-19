@@ -1,4 +1,5 @@
 #include "content_store.h"
+#include "performance_profile.h"
 
 #include <QCryptographicHash>
 #include <QJsonArray>
@@ -177,6 +178,7 @@ std::optional<QVector<QByteArray>> putMany(
     const QSqlDatabase &database, Kind kind, const QVector<QByteArray> &payloads,
     QString *error)
 {
+    performance_profile::PhaseTimer phases(kind == Kind::Blob ? "content_blobs" : "content_nodes");
     if (error != nullptr)
         error->clear();
 
@@ -206,6 +208,7 @@ std::optional<QVector<QByteArray>> putMany(
         }
     }
 
+    phases.mark("hash_and_deduplicate", payloads.size());
     constexpr qsizetype batch_size = 256;
     if (database.driverName() == QStringLiteral("QPSQL"))
     {
@@ -283,6 +286,7 @@ std::optional<QVector<QByteArray>> putMany(
         }
     }
 
+    phases.mark("sql_insert", ordered.size());
     const std::optional<QHash<QByteArray, QByteArray>> verified =
         getMany(database, kind, ordered, error);
     if (!verified)
@@ -295,6 +299,7 @@ std::optional<QVector<QByteArray>> putMany(
             return std::nullopt;
         }
     }
+    phases.mark("verify_stored_content", ordered.size());
     return results;
 }
 

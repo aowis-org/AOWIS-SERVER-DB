@@ -11,6 +11,7 @@
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QStringList>
+#include <QtGlobal>
 
 #include <cstdio>
 #include <optional>
@@ -161,6 +162,7 @@ int main(int argc, char **argv)
     QTextStream errors(stderr);
     const QStringList arguments = app.arguments();
     bool postgres = false;
+    bool profile_phases = false;
     bool has_count = false;
     int count = 1000;
     int revision_count = 1;
@@ -170,14 +172,20 @@ int main(int argc, char **argv)
         const QString argument = arguments.at(index);
         if (argument == QStringLiteral("--help"))
         {
-            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres]\n"
+            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile]\n"
                       "Default PIPE_COUNT: 1000; allowed range: 1..100000.\n"
                       "Default revisions: 1; allowed range: 1..100 finalized revisions.\n"
                       "Each additional revision changes one junction and finalizes.\n"
                       "SQLite uses a temporary file. PostgreSQL requires a dedicated\n"
                       "AOWIS_DB_TEST_PG_DB and libpq PG* connection settings;\n"
-                      "a random temporary schema is created and deleted.\n";
+                      "a random temporary schema is created and deleted.\n"
+                      "--profile prints opt-in phase timings (microseconds) to stderr.\n";
             return 0;
+        }
+        if (argument == QStringLiteral("--profile") && !profile_phases)
+        {
+            profile_phases = true;
+            continue;
         }
         if (argument == QStringLiteral("--postgres") && !postgres)
         {
@@ -201,13 +209,19 @@ int main(int argc, char **argv)
         const int parsed_count = argument.toInt(&number_ok);
         if (has_count || !number_ok || parsed_count < 1 || parsed_count > 100000)
         {
-            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres]\n"
+            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile]\n"
                       "PIPE_COUNT must be an integer between 1 and 100000.\n";
             return 2;
         }
         has_count = true;
         count = parsed_count;
     }
+
+    // This benchmark is single-process and uses disposable databases. Enable
+    // the core's diagnostics before opening a database; normal test runs and
+    // server processes keep profiling disabled by default.
+    if (profile_phases)
+        qputenv("AOWIS_DB_PROFILE_PHASES", "1");
 
     QString error;
     const auto fail = [&errors, &error](const QString &step) {
