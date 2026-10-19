@@ -2,14 +2,15 @@
 
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QRegularExpression>
 
 namespace aowis::db
 {
-bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) const
+namespace
 {
-    // One current SQLite schema. This is a development database: no upgrades
-    // from earlier schemas, compatibility shims, or data backfills.
-    static const char *const statements[] = {
+// The authoritative current schema, shared by creation and verification.
+// During pre-production development we do not upgrade older SQL schemas.
+static const char *const statements[] = {
         R"SQL(CREATE TABLE branches (
             uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
             project_uuid BLOB NOT NULL REFERENCES projects(uuid) ON DELETE RESTRICT,
@@ -17,6 +18,11 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
             head_revision_uuid BLOB REFERENCES revisions(uuid) DEFERRABLE INITIALLY DEFERRED, created_by_uuid BLOB REFERENCES users(uuid),
             UNIQUE(project_uuid, name),
             UNIQUE(uuid, project_uuid)
+        ))SQL",
+        R"SQL(CREATE TABLE content_objects (
+            sha256 BLOB PRIMARY KEY NOT NULL CHECK(length(sha256)=32),
+            kind TEXT NOT NULL CHECK(kind IN ('blob','tree')),
+            payload BLOB NOT NULL
         ))SQL",
         R"SQL(CREATE TABLE group_memberships (
         uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
@@ -147,21 +153,22 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
             project_uuid BLOB NOT NULL,
             branch_uuid BLOB NOT NULL,
             number INTEGER NOT NULL CHECK(number>=1),
-            state TEXT NOT NULL CHECK(state IN ('working','finalized')),
+            state TEXT NOT NULL CHECK(state IN ('working','sealing','finalized')),
             generation INTEGER NOT NULL DEFAULT 0 CHECK(generation>=0),
             created_at_ms INTEGER NOT NULL,
             finalized_at_ms INTEGER,
             title TEXT NOT NULL DEFAULT '',
             message TEXT NOT NULL DEFAULT '',
             snapshot_sha256 BLOB CHECK(snapshot_sha256 IS NULL OR length(snapshot_sha256)=32),
-            chain_sha256 BLOB CHECK(chain_sha256 IS NULL OR length(chain_sha256)=32), created_by_uuid BLOB REFERENCES users(uuid), finalized_by_uuid BLOB REFERENCES users(uuid), hash_format_version INTEGER NOT NULL DEFAULT 1
-            CHECK(hash_format_version IN (1,2)), operation_history_sha256 BLOB
-            CHECK(operation_history_sha256 IS NULL OR length(operation_history_sha256)=32), object_mode INTEGER NOT NULL DEFAULT 0
-             CHECK(object_mode IN (0,1)), object_journal_version INTEGER NOT NULL DEFAULT 1
-             CHECK(object_journal_version IN (1,2)),
+            chain_sha256 BLOB CHECK(chain_sha256 IS NULL OR length(chain_sha256)=32), created_by_uuid BLOB REFERENCES users(uuid), finalized_by_uuid BLOB REFERENCES users(uuid), operation_history_sha256 BLOB
+            CHECK(operation_history_sha256 IS NULL OR length(operation_history_sha256)=32),
+            object_root_sha256 BLOB CHECK(object_root_sha256 IS NULL OR length(object_root_sha256)=32),
+            object_mode INTEGER NOT NULL DEFAULT 0
+             CHECK(object_mode IN (0,1)),
             FOREIGN KEY (branch_uuid, project_uuid) REFERENCES branches(uuid, project_uuid),
             UNIQUE(branch_uuid, number),
-            CHECK(state!='finalized' OR (finalized_at_ms IS NOT NULL AND snapshot_sha256 IS NOT NULL AND chain_sha256 IS NOT NULL))
+            CHECK(state!='finalized' OR (finalized_at_ms IS NOT NULL AND snapshot_sha256 IS NOT NULL AND chain_sha256 IS NOT NULL)),
+            CHECK(state!='finalized' OR object_mode=0 OR object_root_sha256 IS NOT NULL)
         ))SQL",
         R"SQL(CREATE TABLE role_assignments (
         uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
@@ -254,6 +261,10 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
         ON role_permissions(role_uuid,permission_uuid) WHERE revoked_at_ms IS NULL)SQL",
         R"SQL(CREATE INDEX security_audit_by_actor ON security_audit_events(actor_uuid,sequence))SQL",
         R"SQL(CREATE INDEX user_sessions_by_user ON user_sessions(user_uuid))SQL",
+        R"SQL(CREATE TRIGGER content_objects_no_update BEFORE UPDATE ON content_objects
+            BEGIN SELECT RAISE(ABORT, 'content objects are immutable'); END)SQL",
+        R"SQL(CREATE TRIGGER content_objects_no_delete BEFORE DELETE ON content_objects
+            BEGIN SELECT RAISE(ABORT, 'content objects are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER branch_creator_required BEFORE INSERT ON branches
             WHEN NEW.created_by_uuid IS NULL OR length(NEW.created_by_uuid)!=16
             BEGIN SELECT RAISE(ABORT,'branch creator required'); END)SQL",
@@ -264,8 +275,7 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
                 AND branch_uuid=NEW.uuid AND state='working')
             BEGIN SELECT RAISE(ABORT, 'branch head must be its working revision'); END)SQL",
         R"SQL(CREATE TRIGGER finalize_actor_required BEFORE UPDATE OF state ON revisions
-            WHEN NEW.state='finalized' AND (NEW.hash_format_version!=2 OR
-                NEW.finalized_by_uuid IS NULL OR length(NEW.finalized_by_uuid)!=16)
+            WHEN NEW.state='finalized' AND (NEW.finalized_by_uuid IS NULL OR length(NEW.finalized_by_uuid)!=16)
             BEGIN SELECT RAISE(ABORT,'Finalization actor required'); END)SQL",
         R"SQL(CREATE TRIGGER finalize_requires_history_hash BEFORE UPDATE OF state ON revisions
             WHEN NEW.state='finalized' AND NEW.operation_history_sha256 IS NULL
@@ -464,6 +474,10 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
                 ))
             BEGIN SELECT RAISE(ABORT,'session identity is immutable; spent credentials may only be redacted'); END)SQL",
     };
+} // namespace
+
+bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) const
+{
     for (const char *statement : statements)
     {
         QSqlQuery query(database);
@@ -473,6 +487,49 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
                 *error = query.lastError().text();
             return false;
         }
+    }
+    return true;
+}
+
+bool SqliteBackend::verifySchema(const QSqlDatabase &database, QString *error) const
+{
+    // SQLite stores the original CREATE statement in sqlite_master.sql.
+    // All objects in the current schema must still have their original DDL:
+    // this checks columns, keys, indexes, constraints and trigger bodies,
+    // not just object names. The current project has no schema migrations.
+    static const QRegularExpression declaration(QStringLiteral(
+        R"(^CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX|TRIGGER)\s+([A-Za-z_][A-Za-z_0-9]*))"));
+
+    QSqlQuery query(database);
+    if (!query.prepare(QStringLiteral(
+            "SELECT sql FROM sqlite_master WHERE type=? AND name=?")))
+    {
+        if (error != nullptr)
+            *error = query.lastError().text();
+        return false;
+    }
+
+    for (const char *statement : statements)
+    {
+        const QString expected = QString::fromUtf8(statement);
+        const QRegularExpressionMatch definition = declaration.match(expected);
+        if (!definition.hasMatch())
+        {
+            if (error != nullptr)
+                *error = QStringLiteral("Invalid built-in SQLite schema declaration");
+            return false;
+        }
+
+        query.bindValue(0, definition.captured(1).toLower());
+        query.bindValue(1, definition.captured(2));
+        if (!query.exec() || !query.next() || query.value(0).toString() != expected)
+        {
+            if (error != nullptr)
+                *error = QStringLiteral("SQLite schema is missing or modified: %1")
+                             .arg(definition.captured(2));
+            return false;
+        }
+        query.finish();
     }
     return true;
 }

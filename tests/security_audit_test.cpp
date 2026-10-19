@@ -177,7 +177,7 @@ int main(int argc, char **argv)
     db.close();
     error.clear();
     REQUIRE(!db.openSqlite(file, &error));
-    REQUIRE(error.contains(QStringLiteral("immutability triggers")));
+    REQUIRE(error.contains(QStringLiteral("security_audit_readonly_update")));
     error.clear();
 
     return 0;

@@ -4,6 +4,8 @@
 #include <QCoreApplication>
 #include <QDate>
 #include <QTemporaryDir>
+#include <QSqlDatabase>
+#include <QSqlQuery>
 
 #include <cstdio>
 
@@ -244,6 +246,28 @@ int main(int argc, char **argv)
     database.close();
     REQUIRE(database.openSqlite(directory.filePath(QStringLiteral("model.sqlite")), &error));
     REQUIRE(database.loadHydraulicNetwork(actor, project->working_revision_uuid, network.uuid, &error).has_value());
+    REQUIRE(database.verifyProject(actor, project->project_uuid).valid);
+
+    // Finalized model data lives only in the Merkle tree; its editable
+    // successor is independently materialized for efficient writes.
+    {
+        QSqlDatabase inspector = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("model-merkle-inspector"));
+        inspector.setDatabaseName(directory.filePath(QStringLiteral("model.sqlite")));
+        REQUIRE(inspector.open());
+        QSqlQuery query(inspector);
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+        query.addBindValue(project->working_revision_uuid.toRfc4122());
+        REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 0);
+        query.finish();
+        inspector.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("model-merkle-inspector"));
+    const std::optional<NetworkHydraulic> sealed_network = database.loadHydraulicNetwork(
+        actor, project->working_revision_uuid, network.uuid, &error);
+    REQUIRE(sealed_network && sealed_network->nodes_junctions.size() == 1 &&
+            sealed_network->nodes_junctions.first().elevation_m == updated.elevation_m);
     REQUIRE(database.verifyProject(actor, project->project_uuid).valid);
     return 0;
 }

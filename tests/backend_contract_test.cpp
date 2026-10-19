@@ -63,7 +63,7 @@ int main(int argc, char **argv)
     REQUIRE(contract.hasSchema(connection, &error) == true);
     REQUIRE(contract.verifySchema(connection, &error));
     REQUIRE(contract.hasColumn(connection, QStringLiteral("revisions"),
-                               QStringLiteral("hash_format_version"), &error) == true);
+                               QStringLiteral("operation_history_sha256"), &error) == true);
     REQUIRE(contract.hasColumn(connection, QStringLiteral("role_assignments"),
                                QStringLiteral("revoked_at_ms"), &error) == true);
     REQUIRE(contract.hasColumn(connection, QStringLiteral("password_recovery_tokens"),
@@ -114,7 +114,7 @@ int main(int argc, char **argv)
     QSqlDatabase::removeDatabase(QStringLiteral("damaged"));
     error.clear();
     REQUIRE(!db.openSqlite(file, &error));
-    REQUIRE(error.contains(QStringLiteral("recovery token immutability")));
+    REQUIRE(error.contains(QStringLiteral("recovery_tokens_no_delete")));
 
     // Fresh empty-file creation is independent of previously damaged files.
     const QString fresh_file = temp.filePath(QStringLiteral("new.sqlite"));
@@ -240,7 +240,7 @@ int main(int argc, char **argv)
             REQUIRE(postgres_contract.hasSchema(pg_connection, &error) == true);
             REQUIRE(postgres_contract.verifySchema(pg_connection, &error));
             REQUIRE(postgres_contract.hasColumn(pg_connection, QStringLiteral("revisions"),
-                                                QStringLiteral("hash_format_version"), &error) == true);
+                                                QStringLiteral("operation_history_sha256"), &error) == true);
             REQUIRE(postgres_contract.hasColumn(pg_connection, QStringLiteral("users"),
                                                 QStringLiteral("uuid"), &error) == true);
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
@@ -321,8 +321,8 @@ int main(int argc, char **argv)
             ddl.finish();
 
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                "INSERT INTO revisions(uuid,project_uuid,branch_uuid,number,state,created_at_ms,created_by_uuid,"
-                "hash_format_version) VALUES (?,?,?,1,'working',?,?,2)")));
+                "INSERT INTO revisions(uuid,project_uuid,branch_uuid,number,state,created_at_ms,created_by_uuid) "
+                "VALUES (?,?,?,1,'working',?,?)")));
             ddl.addBindValue(postgres_contract.bindUuid(revision_uuid));
             ddl.addBindValue(postgres_contract.bindUuid(project_uuid));
             ddl.addBindValue(postgres_contract.bindUuid(branch_uuid));
@@ -421,8 +421,8 @@ int main(int argc, char **argv)
 
             // Advance the branch atomically and retain the finalized parent.
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                "INSERT INTO revisions(uuid,project_uuid,branch_uuid,number,state,created_at_ms,created_by_uuid,"
-                "hash_format_version) VALUES (?,?,?,2,'working',?,?,2)")));
+                "INSERT INTO revisions(uuid,project_uuid,branch_uuid,number,state,created_at_ms,created_by_uuid) "
+                "VALUES (?,?,?,2,'working',?,?)")));
             ddl.addBindValue(postgres_contract.bindUuid(successor_uuid));
             ddl.addBindValue(postgres_contract.bindUuid(project_uuid));
             ddl.addBindValue(postgres_contract.bindUuid(branch_uuid));
@@ -481,6 +481,72 @@ int main(int argc, char **argv)
                 REQUIRE(pg_admin.has_value());
                 saved_admin_uuid = pg_admin->uuid;
                 const aowis::db::OperationContext actor{pg_admin->uuid};
+
+                // The session-redaction maintenance path must use portable
+                // bind parameters for PostgreSQL BYTEA and native UUID.
+                const std::optional<aowis::db::UserInfo> pg_alice = postgres_database.createUser(
+                    actor, QStringLiteral("pg-session-user"), &error);
+                REQUIRE(pg_alice.has_value());
+                const aowis::db::OperationContext no_rights{pg_alice->uuid};
+                const std::optional<aowis::db::IssuedSession> pg_active =
+                    postgres_database.issueSession(actor, pg_alice->uuid, 3600, &error);
+                const std::optional<aowis::db::IssuedSession> pg_spent_a =
+                    postgres_database.issueSession(actor, pg_alice->uuid, 3600, &error);
+                const std::optional<aowis::db::IssuedSession> pg_spent_b =
+                    postgres_database.issueSession(actor, pg_alice->uuid, 3600, &error);
+                REQUIRE(pg_active.has_value() && pg_spent_a.has_value() && pg_spent_b.has_value());
+                REQUIRE(postgres_database.revokeSession(actor, pg_spent_a->uuid, &error));
+                REQUIRE(postgres_database.revokeSession(actor, pg_spent_b->uuid, &error));
+                const qint64 redaction_cutoff = QDateTime::currentMSecsSinceEpoch();
+                REQUIRE(!postgres_database.redactSpentSessionTokens(
+                    no_rights, redaction_cutoff, 1, &error).has_value());
+                error.clear();
+                const qint64 pg_audit_before =
+                    postgres_database.verifySecurityAudit(actor).checked_events;
+
+                // Read the real PostgreSQL BYTEA column with the separate
+                // integration connection, not an SQLite-only helper.
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SET search_path TO %1").arg(core_schema)));
+                const auto pgDigest = [&](const QUuid &session_uuid) -> std::optional<QByteArray> {
+                    QSqlQuery digest_query(pg_connection);
+                    if (!digest_query.prepare(QStringLiteral(
+                            "SELECT token_sha256 FROM user_sessions WHERE uuid=?")))
+                        return std::nullopt;
+                    digest_query.addBindValue(postgres_contract.bindUuid(session_uuid));
+                    if (!digest_query.exec() || !digest_query.next())
+                        return std::nullopt;
+                    return digest_query.value(0).toByteArray();
+                };
+                const QByteArray pg_marker_a = QByteArrayLiteral("AOWIS-REDACT-V1!") +
+                    pg_spent_a->uuid.toRfc4122();
+                const QByteArray pg_marker_b = QByteArrayLiteral("AOWIS-REDACT-V1!") +
+                    pg_spent_b->uuid.toRfc4122();
+                const std::optional<QByteArray> pg_original_a = pgDigest(pg_spent_a->uuid);
+                const std::optional<QByteArray> pg_original_b = pgDigest(pg_spent_b->uuid);
+                REQUIRE(pg_original_a.has_value() && pg_original_b.has_value());
+                REQUIRE(pg_original_a->size() == 32 && *pg_original_a != pg_marker_a);
+                REQUIRE(pg_original_b->size() == 32 && *pg_original_b != pg_marker_b);
+                REQUIRE(postgres_database.redactSpentSessionTokens(actor, redaction_cutoff, 1, &error) == 1);
+                const std::optional<QByteArray> pg_first_after_a = pgDigest(pg_spent_a->uuid);
+                const std::optional<QByteArray> pg_first_after_b = pgDigest(pg_spent_b->uuid);
+                REQUIRE(pg_first_after_a.has_value() && pg_first_after_b.has_value());
+                REQUIRE((*pg_first_after_a == pg_marker_a) != (*pg_first_after_b == pg_marker_b));
+                // An already-redacted older credential must not consume the
+                // next batch's limit or receive a duplicate audit event.
+                REQUIRE(postgres_database.redactSpentSessionTokens(actor, redaction_cutoff, 1, &error) == 1);
+                const std::optional<QByteArray> pg_final_a = pgDigest(pg_spent_a->uuid);
+                const std::optional<QByteArray> pg_final_b = pgDigest(pg_spent_b->uuid);
+                REQUIRE(pg_final_a.has_value() && *pg_final_a == pg_marker_a);
+                REQUIRE(pg_final_b.has_value() && *pg_final_b == pg_marker_b);
+                REQUIRE(postgres_database.redactSpentSessionTokens(actor, redaction_cutoff, 1, &error) == 0);
+                REQUIRE(postgres_database.activeSession(pg_active->bearer_token).has_value());
+                const std::optional<QByteArray> pg_active_digest = pgDigest(pg_active->uuid);
+                REQUIRE(pg_active_digest.has_value() && pg_active_digest->size() == 32);
+                REQUIRE(*pg_active_digest != QByteArrayLiteral("AOWIS-REDACT-V1!") +
+                    pg_active->uuid.toRfc4122());
+                REQUIRE(postgres_database.verifySecurityAudit(actor).valid);
+                REQUIRE(postgres_database.verifySecurityAudit(actor).checked_events == pg_audit_before + 2);
+
                 REQUIRE(postgres_database.hasPermission(actor, QStringLiteral("project.create"),
                     aowis::db::AccessScope::system(), &error));
                 const std::optional<aowis::db::ProjectCreation> pg_project =
@@ -575,7 +641,7 @@ int main(int argc, char **argv)
 
                 const std::optional<QByteArray> manifest = reopened.snapshot(actor, working, &error);
                 REQUIRE(manifest.has_value());
-                REQUIRE(manifest->startsWith("AOWIS-OBJECT-MANIFEST-V1"));
+                REQUIRE(manifest->startsWith("AOWIS-REVISION-HISTORY-V1"));
                 const std::optional<aowis::db::Finalization> object_finalized =
                     reopened.finalize(actor, branch, 8, QStringLiteral("Grouped objects"),
                                       QStringLiteral("PostgreSQL history parity"), &error);
@@ -732,6 +798,51 @@ int main(int argc, char **argv)
                 REQUIRE(model_seal->snapshot_sha256 == QCryptographicHash::hash(
                     *model_manifest, QCryptographicHash::Sha256));
                 REQUIRE(reopened.verifyProject(actor, hydraulic_project->project_uuid).valid);
+                // Finalized models exist ONLY as immutable Merkle roots; no
+                // revision-wide SQL copies survive finalization. The new
+                // working head retains fast editable SQL rows and indexes.
+                for (const QString &table : {
+                    QStringLiteral("revision_objects"),
+                    QStringLiteral("hydraulic_network_members"),
+                    QStringLiteral("hydraulic_network_references")})
+                {
+                    REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                        "SELECT COUNT(*) FROM %1 WHERE revision_uuid=?").arg(table)));
+                    ddl.addBindValue(postgres_contract.bindUuid(hydraulic_revision));
+                    REQUIRE_SQL(ddl, ddl.exec());
+                    REQUIRE_SQL(ddl, ddl.next());
+                    REQUIRE(ddl.value(0).toLongLong() == 0);
+                    ddl.finish();
+                }
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(model_seal->new_working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() == 5);
+                ddl.finish();
+                // The successor must inherit working indexes without a
+                // Merkle rehydration pass. SQL handoff and sealed Merkle reads
+                // must have identical hydraulic membership and references.
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE revision_uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(model_seal->new_working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() == 4);
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM hydraulic_network_references WHERE revision_uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(model_seal->new_working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() > 0);
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
+                    "SELECT COUNT(*) FROM revisions WHERE state='sealing'")));
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() == 0);
+                ddl.finish();
                 REQUIRE(reopened.loadHydraulicNetwork(actor, model_seal->new_working_revision_uuid,
                                                      network.uuid, &error).has_value());
                 const std::optional<aowis::db::BranchInfo> design_branch = reopened.createBranch(
@@ -821,6 +932,32 @@ int main(int argc, char **argv)
                 REQUIRE(ddl.value(2).toLongLong() == 522);
                 REQUIRE(ddl.value(3).toLongLong() == 522);
                 ddl.finish();
+                // Fork the 522-object model while its working membership index
+                // is initially empty. The reconstruction must use batched
+                // SQL reads and produce complete derived indexes on PostgreSQL.
+                const std::optional<aowis::db::Finalization> batch_seal = reopened.finalize(
+                    actor, batch_project->main_branch_uuid, batch_revision->generation,
+                    QStringLiteral("Batch baseline"), {}, &error);
+                REQUIRE(batch_seal.has_value());
+                const std::optional<aowis::db::BranchInfo> batch_fork = reopened.createBranch(
+                    actor, batch_project->project_uuid, QStringLiteral("batch-fork"),
+                    batch_seal->finalized_revision_uuid, &error);
+                REQUIRE(batch_fork.has_value());
+                const std::optional<NetworkHydraulic> batch_fork_model =
+                    reopened.loadHydraulicNetwork(actor, batch_fork->head_revision_uuid,
+                                                   batch_network.uuid, &error);
+                REQUIRE(batch_fork_model.has_value());
+                REQUIRE(batch_fork_model->nodes_junctions.size() == 260);
+                REQUIRE(batch_fork_model->links_pipes.size() == 260);
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_fork->head_revision_uuid));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_network.uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toLongLong() == 521);
+                ddl.finish();
+                REQUIRE(reopened.verifyProject(actor, batch_project->project_uuid).valid);
                 reopened.close();
             }
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(core_schema)));

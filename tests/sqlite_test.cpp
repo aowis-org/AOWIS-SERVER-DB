@@ -119,7 +119,6 @@ int main(int argc, char **argv)
     REQUIRE(finalized->snapshot_sha256.size() == 32);
     REQUIRE(db.revision(root, p1->working_revision_uuid, &error)->finalized);
     REQUIRE(db.revision(root, p1->working_revision_uuid, &error)->finalized_by_uuid == root.actor_uuid);
-    REQUIRE(db.revision(root, p1->working_revision_uuid, &error)->hash_version == 2);
     REQUIRE(db.snapshot(root, finalized->new_working_revision_uuid, &error) == original);
     REQUIRE(db.branch(root, p1->main_branch_uuid, &error)->head_revision_uuid == finalized->new_working_revision_uuid);
     REQUIRE(db.revision(root, finalized->new_working_revision_uuid, &error)->number == 2);

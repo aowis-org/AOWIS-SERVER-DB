@@ -22,6 +22,10 @@
 #include <cstdio>
 #include <optional>
 
+#ifdef Q_OS_UNIX
+#include <sys/stat.h>
+#endif
+
 namespace
 {
 QMutex log_mutex;
@@ -109,6 +113,11 @@ private:
 
 int main(int argc, char **argv)
 {
+#ifdef Q_OS_UNIX
+    // Apply only to this server process, before Qt or SQLite create files.
+    // Existing files keep their permissions; embedded library users are unaffected.
+    ::umask(0077);
+#endif
     QCoreApplication application(argc, argv);
     application.setOrganizationName(QStringLiteral("AOWIS"));
     application.setApplicationName(QStringLiteral("AOWIS-SERVER-DB"));

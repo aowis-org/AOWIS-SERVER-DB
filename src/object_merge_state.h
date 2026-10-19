@@ -15,7 +15,7 @@ namespace aowis::db
 // Physical state includes tombstones and version counters, not just live
 // semantic content. Used only for transient preview-to-commit CAS checks.
 std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database, const StorageBackend &backend,
-    const QUuid &revision_uuid, QString *error);
+    const QUuid &revision_uuid, const QByteArray &sealed_root, QString *error);
 }
 
 #endif // AOWIS_DB_OBJECT_MERGE_STATE_H

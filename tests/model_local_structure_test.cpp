@@ -23,6 +23,18 @@ using aowis::db::OperationContext;
 
 namespace
 {
+qint64 rowCount(QSqlDatabase &connection, const QString &table,
+                const QUuid &revision_uuid)
+{
+    QSqlQuery query(connection);
+    if (!query.prepare(QStringLiteral("SELECT COUNT(*) FROM %1 WHERE revision_uuid=?").arg(table)))
+        return -1;
+    query.addBindValue(revision_uuid.toRfc4122());
+    if (!query.exec() || !query.next())
+        return -1;
+    return query.value(0).toLongLong();
+}
+
 bool hasReference(QSqlDatabase &connection, const QUuid &revision_uuid,
                   const QUuid &source_uuid, const QUuid &target_uuid)
 {
@@ -189,9 +201,33 @@ int main(int argc, char **argv)
         db.loadHydraulicNetwork(actor, revision, network.uuid, &error);
     REQUIRE(final_state.has_value());
     REQUIRE(aowis::db::validateHydraulicNetwork(*final_state).valid());
+    // Finalization must transfer exactly the validated SQL working state to
+    // its successor, including its derived hydraulic graph indexes. The
+    // immutable historical revision retains none of these materialized rows.
+    const qint64 before_objects = rowCount(inspector, QStringLiteral("revision_objects"), revision);
+    const qint64 before_members = rowCount(inspector, QStringLiteral("hydraulic_network_members"), revision);
+    const qint64 before_refs = rowCount(inspector, QStringLiteral("hydraulic_network_references"), revision);
+    REQUIRE(before_objects > 400 && before_members > 400 && before_refs > 0);
     const std::optional<aowis::db::Finalization> finalized =
         db.finalize(actor, branch, generation, QStringLiteral("Local structural changes"), {}, &error);
     REQUIRE(finalized.has_value());
+    for (const QString &table : {QStringLiteral("revision_objects"),
+                                 QStringLiteral("hydraulic_network_members"),
+                                 QStringLiteral("hydraulic_network_references")})
+        REQUIRE(rowCount(inspector, table, revision) == 0);
+    REQUIRE(rowCount(inspector, QStringLiteral("revision_objects"),
+                     finalized->new_working_revision_uuid) == before_objects);
+    REQUIRE(rowCount(inspector, QStringLiteral("hydraulic_network_members"),
+                     finalized->new_working_revision_uuid) == before_members);
+    REQUIRE(rowCount(inspector, QStringLiteral("hydraulic_network_references"),
+                     finalized->new_working_revision_uuid) == before_refs);
+    QSqlQuery state_check(inspector);
+    REQUIRE(state_check.exec(QStringLiteral("SELECT COUNT(*) FROM revisions WHERE state='sealing'")));
+    REQUIRE(state_check.next() && state_check.value(0).toLongLong() == 0);
+    state_check.finish();
+    REQUIRE(hasReference(inspector, finalized->new_working_revision_uuid, point.uuid, alternative.uuid));
+    REQUIRE(db.loadHydraulicNetwork(actor, finalized->new_working_revision_uuid,
+                                    network.uuid, &error).has_value());
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
     inspector.close();
     inspector = QSqlDatabase();

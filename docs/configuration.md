@@ -80,4 +80,7 @@ listener binds to `127.0.0.1`; no positional HTTP port is supported.
 
 The INI is **not** a secret store. Protect log and database access with normal
 OS permissions. System service data and logs should be writable by the service
-account, not the entire system.
+account, not the entire system. On Unix, `aowis-server-db` sets `umask(0077)`
+at startup so newly created files and directories are private to the service
+account. It does not change existing permissions. Embedded library users and
+`aowis-db-admin` retain their calling process's filesystem policy.

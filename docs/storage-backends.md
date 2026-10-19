@@ -13,6 +13,15 @@ constraints protect references and finalized rows. SQLite is the default for
 standalone applications. Its database path is set by the INI or, only for
 `aowis-server-db`, by an optional command-line override.
 
+Opening an existing SQLite database verifies the current schema against the
+CREATE statements in `src/sqlite_schema.cpp` (tables, columns, keys, indexes,
+and trigger definitions). Missing or modified definitions cause a clear failure;
+there is no automatic migration or repair. SQLite preserves the original CREATE
+SQL in `sqlite_master`, so even structurally equivalent hand-written DDL must
+match the repository's current schema exactly. Unrelated additional SQL objects
+are not blocked. The schema verification test deliberately damages disposable
+databases to exercise these failures.
+
 ## PostgreSQL
 
 `src/postgres_backend.cpp` and `src/postgres_schema.cpp` implement the QPSQL

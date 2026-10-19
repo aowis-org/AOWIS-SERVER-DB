@@ -378,7 +378,6 @@ QJsonObject revisionJson(const RevisionInfo &revision)
             {QStringLiteral("parent_revision_uuids"), parents},
             {QStringLiteral("created_by_uuid"), uuidString(revision.created_by_uuid)},
             {QStringLiteral("finalized_by_uuid"), uuidString(revision.finalized_by_uuid)},
-            {QStringLiteral("hash_version"), revision.hash_version},
             {QStringLiteral("snapshot_sha256"), QString::fromLatin1(revision.snapshot_sha256.toHex())},
             {QStringLiteral("chain_sha256"), QString::fromLatin1(revision.chain_sha256.toHex())}};
 }
@@ -1163,6 +1162,36 @@ bool HttpRoutes::registerOn(QHttpServer &server)
         for (const BranchInfo &branch : result)
             items.append(branchJson(branch));
         return QHttpServerResponse(QJsonObject{{QStringLiteral("branches"), items}});
+    }))
+        return false;
+
+    if (!server.route(QStringLiteral("/api/v1/projects/<arg>/branches"), post,
+                      [this](const QString &id, const QHttpServerRequest &request) {
+        const std::optional<OperationContext> actor = actorFor(request);
+        if (!actor)
+            return unauthorized();
+        const std::optional<QUuid> project_uuid = parseUuid(id);
+        const std::optional<QJsonObject> body = jsonBody(request);
+        if (!project_uuid || request.url().hasQuery() || !body ||
+            !exactFields(*body, {"name", "base_finalized_revision_uuid"}))
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid branch creation request"));
+        const QJsonValue name_value = body->value(QStringLiteral("name"));
+        const QJsonValue base_value = body->value(QStringLiteral("base_finalized_revision_uuid"));
+        if (!name_value.isString() || !base_value.isString())
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid branch creation fields"));
+        const QString name = name_value.toString();
+        const std::optional<QUuid> base_uuid = parseUuid(base_value.toString());
+        if (!base_uuid || name.trimmed().isEmpty() || name.size() > 256)
+            return jsonError(Status::BadRequest, QStringLiteral("Invalid branch name or base revision UUID"));
+        if (!this->database_.hasPermission(*actor, QStringLiteral("project.branch.create"),
+                                           AccessScope::project(*project_uuid)))
+            return jsonError(Status::Forbidden, QStringLiteral("Branch creation denied"));
+        QString error;
+        const std::optional<BranchInfo> result = this->database_.createBranch(
+            *actor, *project_uuid, name, *base_uuid, &error);
+        if (!result)
+            return jsonError(Status::Conflict, QStringLiteral("Branch creation invalid or conflicted"));
+        return QHttpServerResponse(branchJson(*result), Status::Created);
     }))
         return false;
 

@@ -70,6 +70,12 @@ add_library(aowis-db-core STATIC
     src/security_catalog.cpp
     src/history.cpp
     src/objects.cpp
+    src/content_store.h
+    src/content_store.cpp
+    src/merkle_tree.h
+    src/merkle_tree.cpp
+    src/revision_root.h
+    src/revision_root.cpp
     src/object_groups.cpp
     src/model_codec.cpp
     src/model_persistence.cpp
@@ -162,7 +168,9 @@ if(BUILD_TESTING)
     set_property(GLOBAL APPEND PROPERTY AOWIS_DB_TEST_EXECUTABLES aowis-db-admin-cli-tests)
     aowis_add_db_test(aowis-db-sqlite-tests aowis-db-sqlite tests/sqlite_test.cpp)
     aowis_add_db_test(aowis-db-backend-contract-tests aowis-db-backend-contract tests/backend_contract_test.cpp)
+    aowis_add_db_test(aowis-db-sqlite-schema-verification-tests aowis-db-sqlite-schema-verification tests/sqlite_schema_verification_test.cpp)
     aowis_add_db_test(aowis-db-history-tests aowis-db-history tests/history_test.cpp)
+    aowis_add_db_test(aowis-db-revision-hash-contract-tests aowis-db-revision-hash-contract tests/revision_hash_contract_test.cpp)
     aowis_add_db_test(aowis-db-revision-ancestry-tests aowis-db-revision-ancestry tests/revision_ancestry_test.cpp)
     aowis_add_db_test(aowis-db-object-merge-preview-tests aowis-db-object-merge-preview tests/object_merge_preview_test.cpp)
     aowis_add_db_test(aowis-db-object-merge-commit-tests aowis-db-object-merge-commit tests/object_merge_commit_test.cpp)
@@ -171,6 +179,9 @@ if(BUILD_TESTING)
     aowis_add_db_test(aowis-db-object-merge-field-resolutions-tests aowis-db-object-merge-field-resolutions tests/object_merge_field_resolutions_test.cpp)
     aowis_add_db_test(aowis-db-object-merge-metadata-tests aowis-db-object-merge-metadata tests/object_merge_metadata_test.cpp)
     aowis_add_db_test(aowis-db-object-merge-tags-tests aowis-db-object-merge-tags tests/object_merge_tags_test.cpp)
+    aowis_add_db_test(aowis-db-content-store-tests aowis-db-content-store tests/content_store_test.cpp)
+    aowis_add_db_test(aowis-db-merkle-tree-tests aowis-db-merkle-tree tests/merkle_tree_test.cpp)
+    aowis_add_db_test(aowis-db-revision-root-tests aowis-db-revision-root tests/revision_root_test.cpp)
     aowis_add_db_test(aowis-db-objects-tests aowis-db-objects tests/objects_test.cpp)
     aowis_add_db_test(aowis-db-model-tests aowis-db-model tests/model_persistence_test.cpp)
     aowis_add_db_test(aowis-db-object-groups-tests aowis-db-object-groups tests/object_groups_test.cpp)
@@ -206,6 +217,8 @@ if(BUILD_TESTING)
         target_link_libraries(aowis-db-http-tests PRIVATE aowis-db-http)
         aowis_add_db_test(aowis-db-http-mutations-tests aowis-db-http-mutations tests/http_mutations_test.cpp)
         target_link_libraries(aowis-db-http-mutations-tests PRIVATE aowis-db-http)
+        aowis_add_db_test(aowis-db-http-branch-create-tests aowis-db-http-branch-create tests/http_branch_create_test.cpp)
+        target_link_libraries(aowis-db-http-branch-create-tests PRIVATE aowis-db-http)
         aowis_add_db_test(aowis-db-http-merge-preview-tests aowis-db-http-merge-preview tests/http_merge_preview_test.cpp)
         target_link_libraries(aowis-db-http-merge-preview-tests PRIVATE aowis-db-http)
         aowis_add_db_test(aowis-db-http-merge-commit-tests aowis-db-http-merge-commit tests/http_merge_commit_test.cpp)

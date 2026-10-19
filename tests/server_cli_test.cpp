@@ -5,6 +5,7 @@
 
 #include <QDebug>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QHostAddress>
@@ -26,6 +27,10 @@
 #include <QUrl>
 
 #include <optional>
+
+#ifdef Q_OS_UNIX
+#include <sys/stat.h>
+#endif
 
 #define REQUIRE(condition) do { \
     if (!(condition)) { qCritical().noquote() << "FAILED" << __FILE__ << __LINE__ << #condition; return 1; } \
@@ -260,7 +265,7 @@ int main(int argc, char **argv)
     QTemporaryDir temporary;
     REQUIRE(temporary.isValid());
     const QString ini_file = temporary.filePath(QStringLiteral("server.ini"));
-    const QString configured_db = temporary.filePath(QStringLiteral("configured.sqlite"));
+    const QString configured_db = temporary.filePath(QStringLiteral("server-created/configured.sqlite"));
     const QString override_db = temporary.filePath(QStringLiteral("overridden.sqlite"));
     const QString log_file = temporary.filePath(QStringLiteral("log.txt"));
 
@@ -280,11 +285,31 @@ int main(int argc, char **argv)
     }
 
     const QStringList configuration{QStringLiteral("--config"), ini_file};
+#ifdef Q_OS_UNIX
+    // Deliberately allow public file creation in the parent process. The
+    // server must still create private database and log files/directories.
+    const mode_t original_umask = ::umask(0);
+#endif
     const ServerResult default_start = tryServer(executable, configuration, port);
+#ifdef Q_OS_UNIX
+    ::umask(original_umask);
+#endif
     REQUIRE(default_start.started && default_start.listening);
     REQUIRE(default_start.health_status == 200 && default_start.anonymous_status == 401);
     REQUIRE(QFileInfo::exists(configured_db));
     REQUIRE(!QFileInfo::exists(override_db));
+#ifdef Q_OS_UNIX
+    struct stat info {};
+    const QByteArray database_path = QFile::encodeName(configured_db);
+    const QByteArray directory_path = QFile::encodeName(QFileInfo(configured_db).absolutePath());
+    const QByteArray log_path = QFile::encodeName(log_file);
+    REQUIRE(::stat(database_path.constData(), &info) == 0);
+    REQUIRE((info.st_mode & 0077) == 0);
+    REQUIRE(::stat(directory_path.constData(), &info) == 0);
+    REQUIRE((info.st_mode & 0077) == 0);
+    REQUIRE(::stat(log_path.constData(), &info) == 0);
+    REQUIRE((info.st_mode & 0077) == 0);
+#endif
 
     const ServerResult override_start = tryServer(executable,
         configuration + QStringList{override_db}, port);

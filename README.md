@@ -10,6 +10,116 @@ project, revision, authorization, and history logic, but deployment and
 large-project performance still need hardening. **Do not expose the included
 HTTP executable directly to the public internet.**
 
+## Git-inspired, structurally shared revision storage
+
+**AOWIS uses Git-inspired immutable, structurally shared snapshots:**
+every finalized project revision is a complete logical model, but unchanged
+objects and Merkle subtrees are reused across revisions and branches. This is
+a foundational feature for large, long-lived water infrastructure networks,
+not merely a compression option.
+
+The storage architecture combines:
+
+- **Canonical bulk construction.** Building an initial snapshot uses a
+  single in-memory radix-tree construction and bounded immutable-content
+  batches. PostgreSQL does not perform a network round trip for every
+  intermediate Merkle node. Incremental revisions still update only changed
+  UUID paths, preserving the same deterministic tree roots.
+- **Content-addressed immutable objects.** Serialized model-object bytes have
+  SHA-256 identities. Identical bytes stored under the same kind are written
+  once and can be referenced by many revisions or branches.
+- **Persistent Merkle snapshot trees (finalized roots now integrated).**
+  Finalized object-mode revisions carry an immutable root mapping model UUIDs
+  to content identities. Editing one
+  object creates a new object and copies only the small tree path needed to
+  reach it. Everything else stays shared.
+- **Efficient historical lookup.** Finalized single-object `object()` reads
+  now use their immutable Merkle roots, without replaying revision diffs or
+  consulting SQL revision-object rows. Tree depth depends on UUID length,
+  **not revision count**. Finalized bulk object listings use breadth-first,
+  batched Merkle-tree traversal and verified content reads instead of
+  revision-object SQL rows. Finalized hydraulic-network model loads also
+  resolve their root and referenced entities from sealed Merkle data.
+- **Cryptographically linked revisions.** Finalized revision hashes now
+  commit to the Merkle root (for object-mode revisions), edit-history digest,
+  authorship, and parent
+  revision hashes. Historical branches and merges remain immutable.
+- **Normal editing and undo/redo.** A working branch retains its own state;
+  model validation, permissions, edit groups, and durable undo/redo continue
+  to operate on the same transactional core.
+- **Both storage engines.** SQLite and PostgreSQL implement the same content
+  hashing and tree-node semantics; neither backend defines the hash format.
+
+### Implementation status
+
+**Stage 1 — complete:** The immutable `content_objects` table and cross-backend
+SHA-256 content-store API provide deduplicated blobs and integrity-checked
+write-once storage, independent of the transport or persistence backend.
+
+**Stage 2 — complete (internal foundation):** A persistent, prefix-compressed
+16-way Merkle radix tree maps 128-bit object UUIDs to immutable blob hashes.
+The tree supports deterministic roots, lookup, insert/update/delete, batched
+changes, and full ordered enumeration. A change writes only its affected
+search path, preserving older roots exactly; no history replay is necessary.
+Its depth is bounded by the UUID's 32 hexadecimal digits, regardless of
+whether the project has 10 revisions or 10,000. Regression tests run against
+both SQLite and PostgreSQL.
+
+**Stage 3 — physical storage cutover implemented:** Finalized object-mode revisions seal
+and persist a Merkle root covering every model object, its version, and its
+delete state. Consecutive revisions reuse their parent's root and update the
+UUID paths changed in the operation journal. Historical single-object reads
+now come from the sealed tree with strict decoding and hash checks. Finalized
+snapshot manifests use immutable stored bytes; object-mode successors do not
+copy the full manifest into another working-revision row. Batched
+Merkle-tree traversal and blob loading now power finalized `objects()` reads,
+including PostgreSQL. Historical `loadHydraulicNetwork()` also reconstructs
+models from the sealed Merkle objects, independently of copied hydraulic
+membership and SQL object rows. Three-way merge previews now read finalized
+base/source states from ordered, batch-decoded Merkle snapshots; working
+heads remain SQL-backed. Creating a branch now rebuilds its editable object
+rows from the immutable finalized Merkle root, including exact versions and
+tombstones; PostgreSQL uses bounded bulk inserts rather than a network round
+trip per object. **New branches also rebuild hydraulic ownership and reference
+indexes from their finalized Merkle model**, not historical SQL index copies.
+Finalization now seals the Merkle root and **hands its already-validated working
+SQL model and hydraulic indexes to the new editable revision with three
+set-based SQL transfers**, then removes all old-revision materialized rows
+within the same transaction. It does not repeatedly decode the complete
+Merkle tree to reconstruct an identical working head. Finalized revisions
+contain **no duplicated `revision_objects`, membership, or reference rows**.
+Full verification checks every reachable immutable tree and blob and rebuilds
+the independently recorded edit/group-history manifest. Merge safety continues
+to check transient working-head rows against their parent's immutable root.
+
+**Measured storage savings:** On the October 19, 2026 benchmark, SQLite
+with 1,000 pipes and 50 revisions occupied **6.4 MB**, compared with
+**126.9 MB** under full revision copying (about **95% less**). SQLite with
+10,000 pipes and 10 revisions occupied **60.9 MB** versus **302 MB** before
+(about **80% less**). Finalized object-mode revisions retain **no duplicated
+SQL object rows**. These measurements are workload-dependent, not guaranteed
+ratios for all projects.
+
+**Performance tradeoff and active optimization:** Working heads still
+materialize objects and derived hydraulic indexes for transactional edits.
+Reconstructing those temporary rows from Merkle blobs after every finalization
+caused significant latency. The finalization path now transfers the already-
+validated SQL head transactionally, without a Merkle round trip per entity or
+rebuilding hydraulic indexes. Branch creation still constructs an independent
+working head from its finalized base Merkle root, because branches cannot
+borrow another branch's mutable SQL state. Branch creation now builds
+those derived indexes from the already-verified new working object rows,
+without traversing the same finalized Merkle tree a second time. Missing
+membership rows are fetched in bounded SQL batches, including during the
+initial branch-index build. SQLite bulk writes and verification-local hash
+caching remain in place. Branch creation and initial sealing are still
+O(network size); further optimization should follow benchmarks, not guesses.
+
+The content store is an internal primitive, not a new public REST endpoint.
+
+Technical contract, full migration roadmap, and tradeoffs:
+[docs/git-inspired-storage.md](docs/git-inspired-storage.md).
+
 ## Features and layout
 
 - **Projects → branches → revisions:** permanent UUIDv7 identities from

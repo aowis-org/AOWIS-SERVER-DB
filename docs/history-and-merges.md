@@ -8,11 +8,33 @@ an ordered list of parent revisions, so a merge commit can carry two parents.
 The revision graph is acyclic and cannot cross project boundaries.
 
 A finalized snapshot is verified with a SHA-256 content digest and a
-cryptographic chain digest including immutable metadata and the hashes of its
-parents. The original historical chain encoding and its actor-attributed
-successor remain readable. Keep their format identifiers and byte layout
-unchanged, including `AOWIS-REVISION-DAG-V1` and `AOWIS-REVISION-DAG-V2`.
-These are stored compatibility contracts, not feature-stage names.
+cryptographic chain digest covering immutable metadata, the complete
+operation-history digest, and the hashes of its ordered parents.
+
+The current pre-release chain input is SHA-256 of, in order:
+
+1. ASCII `AOWIS-REVISION-DAG-V1` plus a trailing NUL (22 bytes).
+2. Project, branch, revision, creator and finalizer UUIDs (five RFC 4122
+   16-byte values).
+3. Creation time, revision number, finalization time (unsigned 64-bit,
+   big-endian; times are Unix milliseconds).
+4. Title and message as UTF-8, each prefixed with an unsigned 64-bit,
+   big-endian byte length.
+5. Snapshot SHA-256 (32 bytes), operation-history SHA-256 (32 bytes),
+   and 32-byte model-object Merkle root (all zeros for opaque-snapshot mode).
+6. Ordered parent count (unsigned 64-bit big-endian), then parent UUID and
+   chain SHA-256 for each `parent_position` in ascending order.
+
+There is only one accepted revision-chain encoding; old pre-release encodings
+are deliberately unsupported. The operation-history digest is also
+recalculated independently during verification. For object-mode revisions,
+verification traverses the sealed Merkle root and compares every immutable
+content blob with the materialized SQL object rows. Changing a journal entry or
+its stored seal cannot go undetected without recomputing the chain hash.
+
+**Pre-release:** Schema and hash encoding changes may require recreating
+throwaway development databases. We do not support automatic migrations or
+compatibility with previous development-only hashes until the first release.
 
 ## Journal and undo/redo
 

@@ -30,6 +30,11 @@ const char *const statements[] = {
     UNIQUE(project_uuid, name),
     UNIQUE(uuid, project_uuid)
 ))SQL",
+    R"SQL(CREATE TABLE content_objects (
+    sha256 BYTEA PRIMARY KEY NOT NULL CHECK(length(sha256)=32),
+    kind TEXT NOT NULL CHECK(kind IN ('blob','tree')),
+    payload BYTEA NOT NULL
+))SQL",
     R"SQL(CREATE TABLE group_memberships (
     uuid UUID PRIMARY KEY NOT NULL,
     group_uuid UUID NOT NULL,
@@ -172,7 +177,7 @@ const char *const statements[] = {
     project_uuid UUID NOT NULL,
     branch_uuid UUID NOT NULL,
     number BIGINT NOT NULL CHECK(number>=1),
-    state TEXT NOT NULL CHECK(state IN ('working','finalized')),
+    state TEXT NOT NULL CHECK(state IN ('working','sealing','finalized')),
     generation BIGINT NOT NULL DEFAULT 0 CHECK(generation>=0),
     created_at_ms BIGINT NOT NULL,
     finalized_at_ms BIGINT,
@@ -182,16 +187,15 @@ const char *const statements[] = {
     chain_sha256 BYTEA CHECK(chain_sha256 IS NULL OR length(chain_sha256)=32),
     created_by_uuid UUID,
     finalized_by_uuid UUID,
-    hash_format_version BIGINT NOT NULL DEFAULT 1
-            CHECK(hash_format_version IN (1,2)),
     operation_history_sha256 BYTEA
             CHECK(operation_history_sha256 IS NULL OR length(operation_history_sha256)=32),
+    object_root_sha256 BYTEA CHECK(object_root_sha256 IS NULL OR length(object_root_sha256)=32),
     object_mode BIGINT NOT NULL DEFAULT 0
              CHECK(object_mode IN (0,1)),
-    object_journal_version BIGINT NOT NULL DEFAULT 1
-             CHECK(object_journal_version IN (1,2)),
+
     UNIQUE(branch_uuid, number),
-    CHECK(state!='finalized' OR (finalized_at_ms IS NOT NULL AND snapshot_sha256 IS NOT NULL AND chain_sha256 IS NOT NULL))
+    CHECK(state!='finalized' OR (finalized_at_ms IS NOT NULL AND snapshot_sha256 IS NOT NULL AND chain_sha256 IS NOT NULL)),
+    CHECK(state!='finalized' OR object_mode=0 OR object_root_sha256 IS NOT NULL)
 ))SQL",
     R"SQL(CREATE TABLE role_assignments (
     uuid UUID PRIMARY KEY NOT NULL,
@@ -331,6 +335,13 @@ const char *const statements[] = {
     R"SQL(CREATE INDEX user_sessions_by_user ON user_sessions(user_uuid))SQL",
     R"SQL(CREATE UNIQUE INDEX users_username_nocase_unique ON users(lower(username)))SQL",
     R"SQL(CREATE UNIQUE INDEX groups_name_nocase_unique ON groups(lower(name)))SQL",
+    R"SQL(CREATE FUNCTION aowis_guard_content_objects_immutable() RETURNS trigger LANGUAGE plpgsql AS $aowis$
+BEGIN
+    RAISE EXCEPTION 'content objects are immutable' USING ERRCODE = '23514';
+END
+$aowis$)SQL",
+    R"SQL(CREATE TRIGGER content_objects_no_update BEFORE UPDATE ON content_objects FOR EACH ROW EXECUTE FUNCTION aowis_guard_content_objects_immutable())SQL",
+    R"SQL(CREATE TRIGGER content_objects_no_delete BEFORE DELETE ON content_objects FOR EACH ROW EXECUTE FUNCTION aowis_guard_content_objects_immutable())SQL",
     R"SQL(CREATE FUNCTION aowis_guard_branch_creator_required() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
     IF NEW.created_by_uuid IS NULL THEN
@@ -353,8 +364,7 @@ $aowis$)SQL",
     R"SQL(CREATE TRIGGER branch_head_must_be_working BEFORE UPDATE OF head_revision_uuid ON branches FOR EACH ROW EXECUTE FUNCTION aowis_guard_branch_head_must_be_working())SQL",
     R"SQL(CREATE FUNCTION aowis_guard_finalize_actor_required() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF NEW.state='finalized' AND (NEW.hash_format_version!=2 OR
-                NEW.finalized_by_uuid IS NULL) THEN
+    IF NEW.state='finalized' AND NEW.finalized_by_uuid IS NULL THEN
         RAISE EXCEPTION 'Finalization actor required' USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
@@ -905,6 +915,7 @@ bool PostgresBackend::verifySchema(const QSqlDatabase &database, QString *error)
 {
     const QStringList tables = {
         QStringLiteral("branches"),
+        QStringLiteral("content_objects"),
         QStringLiteral("group_memberships"),
         QStringLiteral("groups"),
         QStringLiteral("hydraulic_network_members"),
@@ -995,6 +1006,8 @@ bool PostgresBackend::verifySchema(const QSqlDatabase &database, QString *error)
     const QStringList triggers = {
         QStringLiteral("branch_creator_required"),
         QStringLiteral("branch_head_must_be_working"),
+        QStringLiteral("content_objects_no_update"),
+        QStringLiteral("content_objects_no_delete"),
         QStringLiteral("finalize_actor_required"),
         QStringLiteral("finalize_requires_history_hash"),
         QStringLiteral("finalize_requires_snapshot"),

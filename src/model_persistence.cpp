@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "revision_root.h"
 
 #include <aowis/db/model_persistence.h>
 #include <aowis/db/model_validation.h>
@@ -1002,6 +1003,108 @@ bool insertFreshHydraulicReferences(const StorageBackend &backend,
 
 } // namespace
 
+// A fork has already materialized and verified every Merkle object in its new
+// SQL working head. Rebuild its derived indexes from THOSE bytes rather than
+// re-traversing the finalized Merkle tree and downloading every blob twice.
+// No historical SQL index rows are read or retained. This runs inside the
+// branch-creation transaction; failures roll back objects and indexes alike.
+bool Database::rebuildWorkingHydraulicIndexes(
+    const QUuid &working_revision, QString *error)
+{
+    QSqlQuery roots(this->database_);
+    if (!roots.prepare(QStringLiteral(
+            "SELECT object_uuid,content FROM revision_objects "
+            "WHERE revision_uuid=? AND kind='hydraulic.network' AND deleted=0 "
+            "ORDER BY object_uuid")))
+    {
+        assignError(error, roots.lastError().text());
+        return false;
+    }
+    roots.addBindValue(this->backend_->bindUuid(working_revision));
+    if (!roots.exec())
+    {
+        assignError(error, roots.lastError().text());
+        return false;
+    }
+
+    // Snapshot the roots before inserting membership/reference rows. The
+    // source of truth is the finalized Merkle model, NOT historical SQL rows.
+    QVector<QPair<QUuid, QByteArray>> networks;
+    while (roots.next())
+    {
+        networks.append(qMakePair(this->backend_->readUuid(roots.value(0)),
+                                   roots.value(1).toByteArray()));
+    }
+    if (roots.lastError().isValid())
+    {
+        assignError(error, roots.lastError().text());
+        return false;
+    }
+    roots.finish();
+
+    const QString uuid_placeholder = this->database_.driverName() == QStringLiteral("QPSQL")
+        ? QStringLiteral("CAST(? AS UUID)") : QStringLiteral("?");
+    constexpr qsizetype batch_size = 256;
+    for (const QPair<QUuid, QByteArray> &root : networks)
+    {
+        const std::optional<NetworkIndex> index = decodeIndex(root.second, error);
+        if (!index || index->metadata.uuid != root.first)
+        {
+            if (index)
+                assignError(error, QStringLiteral("Invalid network root UUID in Merkle branch"));
+            return false;
+        }
+        // This validates every referenced model object, including its type,
+        // UUID, deletion state and complete hydraulic reference graph.
+        // The membership index is still empty: the working loader falls back
+        // to a batched primary-key lookup, not one query per UUID.
+        const std::optional<NetworkHydraulic> network =
+            loadHydraulicNetworkUnchecked(working_revision, root.first, error);
+        if (!network)
+            return false;
+
+        const QSet<QUuid> ids = referencedIds(*index);
+        const QList<QUuid> members = ids.values();
+        for (qsizetype offset = 0; offset < members.size(); offset += batch_size)
+        {
+            const qsizetype count = qMin(batch_size, members.size() - offset);
+            QString placeholders;
+            for (qsizetype item = 0; item < count; ++item)
+            {
+                if (item != 0)
+                    placeholders += QLatin1Char(',');
+                placeholders += uuid_placeholder;
+            }
+            QSqlQuery insert(this->database_);
+            if (!insert.prepare(QStringLiteral(
+                    "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
+                    "SELECT %1,%1,object_uuid FROM revision_objects "
+                    "WHERE revision_uuid=%1 AND deleted=0 AND object_uuid IN (%2)")
+                    .arg(uuid_placeholder, placeholders)))
+            {
+                assignError(error, insert.lastError().text());
+                return false;
+            }
+            insert.addBindValue(this->backend_->bindUuid(working_revision));
+            insert.addBindValue(this->backend_->bindUuid(root.first));
+            insert.addBindValue(this->backend_->bindUuid(working_revision));
+            for (qsizetype item = 0; item < count; ++item)
+                insert.addBindValue(this->backend_->bindUuid(members.at(offset + item)));
+            if (!insert.exec() || insert.numRowsAffected() != count)
+            {
+                assignError(error, insert.lastError().text().isEmpty()
+                    ? QStringLiteral("Merkle branch membership count mismatch")
+                    : insert.lastError().text());
+                return false;
+            }
+        }
+        if (!insertFreshHydraulicReferences(*this->backend_, this->database_,
+                                             working_revision, *network, error))
+            return false;
+    }
+    return true;
+}
+
 // References are derived from the validated Model graph, not authoritative
 // revision content. Preserve unchanged rows when a save only modifies scalar
 // properties (or when a multi-object edit changes other parts of the graph).
@@ -1489,95 +1592,125 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetwork(
 std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
     const QUuid &revision_uuid, const QUuid &network_uuid, QString *error) const
 {
-    // Fetch only the root, then the rows belonging to this network. Other
-    // networks in the same revision are never deserialized on a local edit.
-    QSqlQuery root(this->database_);
-    if (!root.prepare(QStringLiteral(
-            "SELECT content FROM revision_objects WHERE revision_uuid=? AND object_uuid=? "
-            "AND kind='hydraulic.network' AND deleted=0")))
-    {
-        assignError(error, root.lastError().text());
+    const std::optional<RevisionInfo> revision = revisionUnchecked(revision_uuid, error);
+    if (!revision)
         return std::nullopt;
-    }
-    root.addBindValue(this->backend_->bindUuid(revision_uuid));
-    root.addBindValue(this->backend_->bindUuid(network_uuid));
-    if (!root.exec())
-    {
-        assignError(error, root.lastError().text());
-        return std::nullopt;
-    }
-    if (!root.next())
-    {
-        assignError(error, QStringLiteral("Hydraulic network is not stored in this revision"));
-        return std::nullopt;
-    }
-    const std::optional<NetworkIndex> index = decodeIndex(root.value(0).toByteArray(), error);
-    root.finish();
-    if (!index || index->metadata.uuid != network_uuid)
-    {
-        if (index)
-            assignError(error, QStringLiteral("Hydraulic network identity mismatch"));
-        return std::nullopt;
-    }
-    const QSet<QUuid> references = referencedIds(*index);
+    std::optional<NetworkIndex> index;
     QHash<QUuid, ModelObject> rows;
-    QSqlQuery members(this->database_);
-    if (!members.prepare(QStringLiteral(
-            "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
-            "FROM hydraulic_network_members m JOIN revision_objects o "
-            "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
-            "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+    if (revision->finalized)
     {
-        assignError(error, members.lastError().text());
-        return std::nullopt;
-    }
-    members.addBindValue(this->backend_->bindUuid(revision_uuid));
-    members.addBindValue(this->backend_->bindUuid(network_uuid));
-    if (!members.exec())
-    {
-        assignError(error, members.lastError().text());
-        return std::nullopt;
-    }
-    while (members.next())
-    {
-        const QUuid uuid = this->backend_->readUuid(members.value(0));
-        if (!references.contains(uuid))
-            continue; // Root changed, membership index not committed yet.
-        rows.insert(uuid, ModelObject{uuid, members.value(1).toString(),
-                    members.value(2).toByteArray(), members.value(3).toLongLong(),
-                    members.value(4).toBool()});
-    }
-    members.finish();
-    // Only root edits may introduce new referenced UUIDs before the membership
-    // index is synchronized. Indexed edits normally need zero extra queries.
-    QSqlQuery newly_referenced(this->database_);
-    if (!newly_referenced.prepare(QStringLiteral(
-            "SELECT kind,content,version,deleted FROM revision_objects "
-            "WHERE revision_uuid=? AND object_uuid=?")))
-    {
-        assignError(error, newly_referenced.lastError().text());
-        return std::nullopt;
-    }
-    for (const QUuid &uuid : references)
-    {
-        if (rows.contains(uuid))
-            continue;
-        newly_referenced.bindValue(0, this->backend_->bindUuid(revision_uuid));
-        newly_referenced.bindValue(1, this->backend_->bindUuid(uuid));
-        if (!newly_referenced.exec())
+        // Finalized snapshots are authoritative in the immutable Merkle tree.
+        // Neither revision_objects nor the copied membership index is needed.
+        if (revision->object_root_sha256.size() != 32)
         {
-            assignError(error, newly_referenced.lastError().text());
+            assignError(error, QStringLiteral("Finalized hydraulic revision lacks a Merkle root"));
             return std::nullopt;
         }
-        if (!newly_referenced.next())
+        const std::optional<MerkleObjectRecord> root = readRevisionObject(
+            this->database_, revision->object_root_sha256, network_uuid, error);
+        if (!root || root->deleted || root->kind != QStringLiteral("hydraulic.network"))
+        {
+            if (root)
+                assignError(error, QStringLiteral("Hydraulic network is not stored in this revision"));
+            return std::nullopt;
+        }
+        index = decodeIndex(root->content, error);
+        if (!index || index->metadata.uuid != network_uuid)
+        {
+            if (index)
+                assignError(error, QStringLiteral("Hydraulic network identity mismatch"));
+            return std::nullopt;
+        }
+        const QSet<QUuid> references = referencedIds(*index);
+        const std::optional<QVector<MerkleObjectRecord>> records =
+            readRevisionObjectsSelected(this->database_, revision->object_root_sha256,
+                                        references, error);
+        if (!records)
+            return std::nullopt;
+        rows.reserve(records->size());
+        for (const MerkleObjectRecord &record : *records)
+        {
+            rows.insert(record.uuid, ModelObject{record.uuid, record.kind,
+                                                 record.content, record.version, record.deleted});
+        }
+    }
+    else
+    {
+        // Fetch only the root, then the rows belonging to this network. Other
+        // networks in the same revision are never deserialized on a local edit.
+        QSqlQuery root(this->database_);
+        if (!root.prepare(QStringLiteral(
+                "SELECT content FROM revision_objects WHERE revision_uuid=? AND object_uuid=? "
+                "AND kind='hydraulic.network' AND deleted=0")))
+        {
+            assignError(error, root.lastError().text());
+            return std::nullopt;
+        }
+        root.addBindValue(this->backend_->bindUuid(revision_uuid));
+        root.addBindValue(this->backend_->bindUuid(network_uuid));
+        if (!root.exec())
+        {
+            assignError(error, root.lastError().text());
+            return std::nullopt;
+        }
+        if (!root.next())
+        {
+            assignError(error, QStringLiteral("Hydraulic network is not stored in this revision"));
+            return std::nullopt;
+        }
+        index = decodeIndex(root.value(0).toByteArray(), error);
+        root.finish();
+        if (!index || index->metadata.uuid != network_uuid)
+        {
+            if (index)
+                assignError(error, QStringLiteral("Hydraulic network identity mismatch"));
+            return std::nullopt;
+        }
+        const QSet<QUuid> references = referencedIds(*index);
+        QSqlQuery members(this->database_);
+        if (!members.prepare(QStringLiteral(
+                "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
+                "FROM hydraulic_network_members m JOIN revision_objects o "
+                "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
+                "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+        {
+            assignError(error, members.lastError().text());
+            return std::nullopt;
+        }
+        members.addBindValue(this->backend_->bindUuid(revision_uuid));
+        members.addBindValue(this->backend_->bindUuid(network_uuid));
+        if (!members.exec())
+        {
+            assignError(error, members.lastError().text());
+            return std::nullopt;
+        }
+        while (members.next())
+        {
+            const QUuid uuid = this->backend_->readUuid(members.value(0));
+            if (!references.contains(uuid))
+                continue; // Root changed, membership index not committed yet.
+            rows.insert(uuid, ModelObject{uuid, members.value(1).toString(),
+                        members.value(2).toByteArray(), members.value(3).toLongLong(),
+                        members.value(4).toBool()});
+        }
+        members.finish();
+        // An incomplete ownership index is expected immediately after a
+        // branch is materialized. Fetch missing UUIDs in bounded batches so
+        // creating a large branch does not issue one query per pipe/junction.
+        // This also handles newly referenced objects during working edits.
+        QSet<QUuid> missing = references;
+        for (QHash<QUuid, ModelObject>::const_iterator item = rows.cbegin();
+             item != rows.cend(); ++item)
+            missing.remove(item.key());
+        if (!missing.isEmpty() &&
+            !fetchObjectsForNetworkSave(*this->backend_, this->database_,
+                                        revision_uuid, missing, rows, error))
+            return std::nullopt;
+        if (rows.size() != references.size())
         {
             assignError(error, QStringLiteral("Missing referenced hydraulic entity"));
             return std::nullopt;
         }
-        rows.insert(uuid, ModelObject{uuid, newly_referenced.value(0).toString(),
-                    newly_referenced.value(1).toByteArray(),
-                    newly_referenced.value(2).toLongLong(), newly_referenced.value(3).toBool()});
-        newly_referenced.finish();
     }
     NetworkHydraulic result = index->metadata;
     QSet<QUuid> seen{network_uuid};

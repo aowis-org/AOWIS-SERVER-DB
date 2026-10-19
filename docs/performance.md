@@ -6,7 +6,7 @@ operations before optimizing object copying or finalization.
 
 ## Opt-in network persistence benchmark
 
-Build the benchmark explicitly (it is **not** part of the normal 51-test CTest
+Build the benchmark explicitly (it is **not** part of the normal CTest
 suite and has no pass/fail timing thresholds):
 
 ```bash
@@ -28,6 +28,53 @@ branch creation and integrity verification, plus the SQLite file size after
 closing the database. The construction of the in-memory test network is not
 included in the database-operation timings.
 
+### Revision-history growth (opt-in)
+
+Measure **many finalized revisions** instead of just one. Each new revision
+changes one existing junction, finalizes the entire project and creates its
+next working revision. This intentionally isolates revision copying costs from
+full-network imports and avoids artificial no-op finalizations.
+
+```bash
+cmake --build build-linux-tests --target aowis-db-network-benchmark
+./build-linux-tests/aowis-db-network-benchmark 1000 --revisions 10
+./build-linux-tests/aowis-db-network-benchmark 1000 --revisions 50
+./build-linux-tests/aowis-db-network-benchmark 10000 --revisions 10
+```
+
+For the high-end network case, begin with one revision before running many:
+
+```bash
+./build-linux-tests/aowis-db-network-benchmark 100000 --revisions 1
+```
+
+For each run, record these results:
+
+- `finalized_revisions`: number of finalized main-branch revisions.
+- `revision_object_rows`: physical object rows across **all** revisions,
+  including the two working heads (`main` and the `alternative` branch).
+- `revision_samples_number_edit_ms_finalize_ms`: `revision:edit_ms:finalize_ms`
+  tuples, separated by semicolons. The first tuple describes the original
+  edit/finalize and later tuples describe incremental revisions.
+- `repeat_finalize_total_ms`, `repeat_finalize_max_ms`: finalization timing
+  for revisions 2 through N, excluding the first baseline finalization.
+- `sqlite_file_bytes` / `postgres_schema_bytes`: physical storage used after
+  the benchmark closes its main connection (SQLite) or its final writes
+  (PostgreSQL).
+- `verify_history_ms`: full-history verification time after N finalizations.
+
+The benchmark creates an independent `alternative` branch from the first
+finalized revision **after** completing the main-branch history. The extra
+working head and its object rows are deliberately included in the total
+storage measurements; compare runs of the same shape. After the last
+iteration, the benchmark reloads the latest working model and checks the
+final edited junction to catch incorrect revision inheritance.
+
+The revision count is bounded to 1..100 to avoid accidental runaway benchmark
+runs. There are no pass/fail performance thresholds; run multiple times under
+similar host load and compare results empirically. The benchmark remains
+separate from CTest and must not run against operational databases.
+
 ### PostgreSQL: same workload, disposable schema
 
 To compare backend behavior without using your configured AOWIS database,
@@ -37,6 +84,7 @@ benchmark via one command:
 ```bash
 ./tools/benchmark_network_postgres.sh 1000
 ./tools/benchmark_network_postgres.sh 10000
+./tools/benchmark_network_postgres.sh 1000 --revisions 10
 ```
 
 The helper requires Docker Engine/Compose v2 and an existing configured CMake
@@ -76,8 +124,9 @@ conclusions; do not assume small-network timings extrapolate linearly.
 uses the whole-network save API. They intentionally measure different workloads.
 SQLite file bytes count the final database file after closing the connection,
 not transient WAL peaks or process memory. PostgreSQL schema bytes count its
-relation storage only, not cluster overhead or WAL. Benchmarking concurrent
-editors, history growth, and peak memory remain separate follow-up work.
+relation storage only, not cluster overhead or WAL. Benchmarking concurrent editors and peak memory remains separate follow-up
+work. The optional `--revisions` workload measures history growth, but not
+peak RAM or simultaneous editing throughput.
 
 ## Profile a network save
 
@@ -163,3 +212,47 @@ include this routine (development schemas can be recreated from scratch).
 This optimization avoids three client/server SQL executions per new entity.
 Benchmark timings are hardware- and load-dependent; use the PostgreSQL runner
 for an actual before/after measurement.
+
+## Merkle-root construction and reproducible revision benchmarks
+
+The first object-mode revision has no finalized parent root to reuse. It now
+builds its canonical Merkle radix tree in memory and inserts immutable nodes
+and blobs in batches; incremental revisions continue using copy-on-write updates
+for their changed UUIDs. Both paths must produce identical root hashes for
+identical model states.
+
+**Always rebuild the benchmark executable after changing the storage engine.**
+The regular CTest build can leave this opt-in benchmark binary outdated:
+
+```bash
+cmake --build build-linux-tests --target aowis-db-network-benchmark
+./build-linux-tests/aowis-db-network-benchmark 1000 --revisions 50
+./build-linux-tests/aowis-db-network-benchmark 10000 --revisions 10
+./tools/benchmark_network_postgres.sh 1000 --revisions 10
+```
+
+`revision_object_rows` counts retained *working* SQL rows under Merkle
+cutover, not all historical model objects. The SQLite database file size is a
+physical allocation measurement and may include reusable pages. Compare
+multiple network sizes, revision counts, and backends before attributing
+performance changes to a particular optimization.
+
+### Git-inspired working-head performance (October 2026)
+
+After switching finalized revisions to shared Merkle roots, moving the SQL
+working head at finalization gave much faster *subsequent* revisions:
+
+- SQLite, 1,000 pipes: 50 subsequent finalizations in about 2.8 s total.
+- SQLite, 10,000 pipes: 10 subsequent finalizations in about 6.1 s total.
+- PostgreSQL, 1,000 pipes: 10 subsequent finalizations in about 8.6 s total.
+
+The first seal and **independent branch creation** still rebuild substantial
+model state. Before the branch-index optimization, branch creation took 1.0 s
+for 1,000 pipes and 12.0 s for 10,000 pipes on SQLite; 1.0 s for 1,000 pipes
+on PostgreSQL. During branch creation we now reuse the working object rows
+already reconstructed and hash-verified from the Merkle root, instead of
+reading all finalized immutable objects a second time. Missing working
+network members are retrieved with bounded SQL batches. This is an optimization
+of redundant I/O, **not** an O(1) branch-creation guarantee. Re-run the
+original disposable benchmarks and compare `create_branch_ms` directly.
+

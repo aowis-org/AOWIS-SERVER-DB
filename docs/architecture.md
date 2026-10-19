@@ -48,15 +48,17 @@ SQL migration runner. Empty databases are initialized, and existing database
 schemas are validated. During development, discard only genuinely disposable
 database files when changing the schema. Do not remove data you intend to keep.
 
-## Integrity and compatibility
+## Integrity and pre-release format
 
-Finalized revision snapshots are protected by SHA-256 digests over deterministic
-persisted representations, revision metadata, and ordered parent hashes.
-Object-history and security-audit integrity use their own defined encodings.
-These byte-level contracts include format identifiers with numeric suffixes
-(for example `AOWIS-REVISION-DAG-V2`). **Those identifiers must not be renamed**:
-they are written into the data and used when verifying historical records.
-They are not development patch numbers or SQL migration versions.
+Finalized revisions are protected by SHA-256 digests over the deterministic
+persisted snapshot, operation history, creator/finalizer identities, immutable
+revision metadata and ordered parent hashes. The one current revision-chain
+format is defined in [History and merges](history-and-merges.md).
+
+This is pre-release software: we deliberately do not implement old revision
+hash formats or SQL migrations. Disposable development databases must be
+recreated when an incompatible schema or hash format change is introduced.
+Freeze these contracts before the first release; only then plan migrations.
 
 The database does not protect against a privileged administrator intentionally
 rewriting data and recomputing its hashes. SQL triggers provide application

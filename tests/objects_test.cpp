@@ -80,13 +80,15 @@ int main(int argc, char **argv)
     REQUIRE(!db.undoLastChange(root, branch, 5, &error));
     REQUIRE(!db.replaceWorkingSnapshot(root, branch, 5, QByteArray("legacy"), &error));
     const std::optional<QByteArray> working_manifest = db.snapshot(root, rev1, &error);
-    REQUIRE(working_manifest.has_value() && working_manifest->startsWith("AOWIS-OBJECT-MANIFEST-V1"));
-    REQUIRE(working_manifest->contains(pipe.toRfc4122()));
-    REQUIRE(working_manifest->contains(junction.toRfc4122()));
+    REQUIRE(working_manifest.has_value() && working_manifest->startsWith("AOWIS-REVISION-HISTORY-V1"));
+    // Compact history seal: two 32-byte hashes following the domain magic.
+    REQUIRE(working_manifest->size() == int(sizeof("AOWIS-REVISION-HISTORY-V1")) + 64);
 
     const std::optional<aowis::db::Finalization> finalized = db.finalize(
         root, branch, 5, QStringLiteral("Design"), QStringLiteral("object history"), &error);
     REQUIRE(finalized.has_value());
+    REQUIRE(db.revision(root, rev1, &error)->object_root_sha256.size() == 32);
+    REQUIRE(db.revision(root, finalized->new_working_revision_uuid, &error)->object_root_sha256.isEmpty());
     REQUIRE(finalized->snapshot_sha256 == QCryptographicHash::hash(
         *working_manifest, QCryptographicHash::Sha256));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
@@ -115,14 +117,25 @@ int main(int argc, char **argv)
         inspector.setDatabaseName(path);
         REQUIRE(inspector.open());
         QSqlQuery query(inspector);
-        // The portable SQL boundary must not change the existing SQLite
-        // 16-byte UUID representation used by persisted object history.
+        // Finalized revisions have no per-revision physical object rows.
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+        query.addBindValue(rev1.toRfc4122());
+        REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 0);
+        query.finish();
         REQUIRE(query.prepare(QStringLiteral(
             "SELECT object_uuid FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")));
-        query.addBindValue(rev1.toRfc4122());
+        query.addBindValue(finalized->new_working_revision_uuid.toRfc4122());
         query.addBindValue(pipe.toRfc4122());
         REQUIRE(query.exec() && query.next());
         REQUIRE(query.value(0).toByteArray() == pipe.toRfc4122());
+        query.finish();
+        // Immutable manifests belong to finalized revisions only. Working
+        // object-mode branches should not store a duplicated full manifest.
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM snapshots WHERE revision_uuid=?")));
+        query.addBindValue(finalized->new_working_revision_uuid.toRfc4122());
+        REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 0);
         query.finish();
         REQUIRE(query.prepare(QStringLiteral(
             "SELECT uuid,actor_uuid,object_uuid FROM object_events "
@@ -133,23 +146,24 @@ int main(int argc, char **argv)
         REQUIRE(query.value(1).toByteArray() == root.actor_uuid.toRfc4122());
         REQUIRE(query.value(2).toByteArray() == pipe.toRfc4122());
         query.finish();
-        REQUIRE(query.prepare(QStringLiteral(
-            "UPDATE revision_objects SET content=? WHERE revision_uuid=? AND object_uuid=?")));
-        query.addBindValue(QByteArray("tamper"));
-        query.addBindValue(rev1.toRfc4122());
-        query.addBindValue(pipe.toRfc4122());
-        REQUIRE(!query.exec());
-        REQUIRE(query.exec(QStringLiteral("DROP TRIGGER finalized_object_update")));
-        REQUIRE(query.prepare(QStringLiteral(
-            "UPDATE revision_objects SET content=? WHERE revision_uuid=? AND object_uuid=?")));
-        query.addBindValue(QByteArray("tamper"));
-        query.addBindValue(rev1.toRfc4122());
-        query.addBindValue(pipe.toRfc4122());
-        REQUIRE(query.exec());
-        query.finish();
         inspector.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("object-inspector"));
-    REQUIRE(!db.verifyProject(root, project->project_uuid).valid);
+    // Finalized reads use the sealed Merkle root with no duplicate SQL copies.
+    REQUIRE(db.object(root, rev1, pipe, &error)->content == first);
+    const QVector<aowis::db::ModelObject> sealed_objects = db.objects(root, rev1, &error);
+    REQUIRE(sealed_objects.size() == 2);
+    bool found_original_pipe = false;
+    for (const aowis::db::ModelObject &item : sealed_objects)
+    {
+        if (item.uuid == pipe)
+        {
+            REQUIRE(item.content == first && item.version == 4 && !item.deleted);
+            found_original_pipe = true;
+        }
+    }
+    REQUIRE(found_original_pipe);
+    REQUIRE(db.snapshot(root, rev1, &error) == working_manifest);
+    REQUIRE(db.verifyProject(root, project->project_uuid).valid);
     return 0;
 }

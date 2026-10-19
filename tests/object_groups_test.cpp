@@ -115,7 +115,7 @@ int main(int argc, char **argv)
     REQUIRE(db.revision(actor, rev1, &error)->generation == 20);
     REQUIRE(!db.redoObjectGroup(unauthorized, branch, 20, &error));
     const std::optional<QByteArray> manifest = db.snapshot(actor, rev1, &error);
-    REQUIRE(manifest && manifest->startsWith("AOWIS-OBJECT-MANIFEST-V1"));
+    REQUIRE(manifest && manifest->startsWith("AOWIS-REVISION-HISTORY-V1"));
     const std::optional<aowis::db::Finalization> final = db.finalize(actor, branch, 20,
                     QStringLiteral("Grouped history"), QStringLiteral("Undo/redo journal"), &error);
     REQUIRE(final.has_value());
@@ -152,6 +152,12 @@ int main(int argc, char **argv)
         inspect.close();
     }
     QSqlDatabase::removeDatabase(QStringLiteral("groups-inspect"));
-    REQUIRE(!db.verifyProject(actor, project->project_uuid).valid);
+    // Historical snapshot reads use the immutable bytes, but verification must
+    // also rebuild the sealed journal and reject tampering with undo/redo groups.
+    REQUIRE(db.snapshot(actor, rev1, &error) == manifest);
+    const aowis::db::IntegrityReport corrupted = db.verifyProject(actor, project->project_uuid);
+    REQUIRE(!corrupted.valid);
+    REQUIRE(corrupted.failed_revision_uuid == rev1);
+    REQUIRE(corrupted.error.contains(QStringLiteral("manifest differs")));
     return 0;
 }

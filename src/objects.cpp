@@ -2,6 +2,7 @@
 #include <aowis/model/uuid.h>
 
 #include "storage_backend.h"
+#include "revision_root.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -85,42 +86,11 @@ std::optional<int> Database::objectMode(const QUuid &revision_uuid, QString *err
     return query.value(0).toInt();
 }
 
-bool Database::copyObjects(const QUuid &from_revision, const QUuid &to_revision, QString *error)
-{
-    QSqlQuery query(this->database_);
-    if (!prepare(query, QStringLiteral(
-            "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-            "SELECT ?,object_uuid,kind,content,version,deleted FROM revision_objects WHERE revision_uuid=?"), error))
-        return false;
-    query.addBindValue(this->backend_->bindUuid(to_revision));
-    query.addBindValue(this->backend_->bindUuid(from_revision));
-    if (!run(query, error))
-        return false;
-    QSqlQuery members(this->database_);
-    if (!prepare(members, QStringLiteral(
-            "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
-            "SELECT ?,network_uuid,entity_uuid FROM hydraulic_network_members WHERE revision_uuid=?"), error))
-        return false;
-    members.addBindValue(this->backend_->bindUuid(to_revision));
-    members.addBindValue(this->backend_->bindUuid(from_revision));
-    if (!run(members, error))
-        return false;
-    QSqlQuery references(this->database_);
-    if (!prepare(references, QStringLiteral(
-            "INSERT INTO hydraulic_network_references"
-            "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
-            "SELECT ?,network_uuid,source_uuid,target_uuid,field "
-            "FROM hydraulic_network_references WHERE revision_uuid=?"), error))
-        return false;
-    references.addBindValue(this->backend_->bindUuid(to_revision));
-    references.addBindValue(this->backend_->bindUuid(from_revision));
-    return run(references, error);
-}
-
-// Contains the full ordered journal (including before/after bytes) and live
-// object state. The immutable manifest format is frozen: UUIDs in hash
-// preimages are always 16 RFC-4122 bytes, independent of the SQL backend.
-// This must remain byte-identical for SQLite and for future native UUID types.
+// A compact, deterministic history seal for the working/finalized revision.
+// The project model is committed separately through the immutable Merkle root
+// (included in the chain hash); copying all model objects into this manifest
+// would defeat structural sharing. Every journal/group record is independently
+// rehashed during full integrity verification.
 std::optional<QByteArray> Database::objectManifest(const QUuid &revision_uuid, QString *error) const
 {
     QSqlQuery events(this->database_);
@@ -159,42 +129,11 @@ std::optional<QByteArray> Database::objectManifest(const QUuid &revision_uuid, Q
     log.append(entries);
     const QByteArray journal_sha256 = QCryptographicHash::hash(log, QCryptographicHash::Sha256);
 
-    QSqlQuery objects(this->database_);
-    if (!prepare(objects, QStringLiteral(
-            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
-            "WHERE revision_uuid=? ORDER BY object_uuid"), error))
-        return std::nullopt;
-    objects.addBindValue(this->backend_->bindUuid(revision_uuid));
-    if (!run(objects, error))
-        return std::nullopt;
-    QByteArray manifest("AOWIS-OBJECT-MANIFEST-V1\0", 25);
+    constexpr char manifest_magic[] = "AOWIS-REVISION-HISTORY-V1";
+    QByteArray manifest(manifest_magic, sizeof(manifest_magic));
     manifest.append(journal_sha256);
-    QByteArray objects_bytes;
-    quint64 object_count = 0;
-    while (objects.next())
-    {
-        objects_bytes.append(this->backend_->readUuid(objects.value(0)).toRfc4122());
-        appendField(objects_bytes, objects.value(1).toString().toUtf8());
-        appendU64(objects_bytes, objects.value(3).toULongLong());
-        const bool deleted = objects.value(4).toBool();
-        objects_bytes.append(deleted ? '\x01' : '\x00');
-        if (!deleted)
-            appendField(objects_bytes, objects.value(2).toByteArray());
-        ++object_count;
-    }
-    appendU64(manifest, object_count);
-    manifest.append(objects_bytes);
-    QSqlQuery format(this->database_);
-    if (!prepare(format, QStringLiteral(
-            "SELECT object_journal_version FROM revisions WHERE uuid=?"), error))
-        return std::nullopt;
-    format.addBindValue(this->backend_->bindUuid(revision_uuid));
-    if (!run(format, error) || !format.next())
-        return std::nullopt;
-    if (format.value(0).toInt() == 1)
-        return manifest; // Preserve the exact historical manifest encoding for finalized hashes.
-    // Grouped edits append an ordered, domain-separated representation of immutable
-    // groups and their exact member-event identities.
+    // All object-mode revisions use ONE pre-release history format.
+    // The grouped history is hashed below, not embedded verbatim.
     QByteArray grouped("AOWIS-OBJECT-GROUPS-V1\0", 23);
     QSqlQuery groups(this->database_);
     if (!prepare(groups, QStringLiteral(
@@ -238,7 +177,7 @@ std::optional<QByteArray> Database::objectManifest(const QUuid &revision_uuid, Q
     }
     appendU64(grouped, count);
     grouped.append(group_entries);
-    appendField(manifest, grouped);
+    manifest.append(QCryptographicHash::hash(grouped, QCryptographicHash::Sha256));
     return manifest;
 }
 
@@ -249,6 +188,23 @@ std::optional<ModelObject> Database::object(const OperationContext &actor, const
     if (!revision || !requirePermission(actor, QStringLiteral("project.read"),
                                         AccessScope::branch(revision->branch_uuid), error))
         return std::nullopt;
+    const std::optional<int> mode = revision->finalized ? objectMode(revision_uuid, error) : std::optional<int>(0);
+    if (!mode)
+        return std::nullopt;
+    if (revision->finalized && *mode == 1)
+    {
+        if (revision->object_root_sha256.size() != 32)
+        {
+            setError(error, QStringLiteral("Finalized revision has no valid Merkle root"));
+            return std::nullopt;
+        }
+        const std::optional<MerkleObjectRecord> sealed = readRevisionObject(
+            this->database_, revision->object_root_sha256, object_uuid, error);
+        if (!sealed)
+            return std::nullopt;
+        return ModelObject{sealed->uuid, sealed->kind, sealed->content,
+                           sealed->version, sealed->deleted};
+    }
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral(
             "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
@@ -274,6 +230,33 @@ QVector<ModelObject> Database::objects(const OperationContext &actor, const QUui
     if (!revision || !requirePermission(actor, QStringLiteral("project.read"),
                                         AccessScope::branch(revision->branch_uuid), error))
         return result;
+    if (revision->finalized)
+    {
+        const std::optional<int> mode = objectMode(revision_uuid, error);
+        if (!mode)
+            return result;
+        if (*mode == 1)
+        {
+            if (revision->object_root_sha256.size() != 32)
+            {
+                setError(error, QStringLiteral("Finalized revision has no valid Merkle root"));
+                return result;
+            }
+            const std::optional<QVector<MerkleObjectRecord>> sealed = readRevisionObjects(
+                this->database_, revision->object_root_sha256, error);
+            if (!sealed)
+                return result;
+            result.reserve(sealed->size());
+            for (const MerkleObjectRecord &record : *sealed)
+            {
+                if (!record.deleted)
+                    result.append(ModelObject{record.uuid, record.kind, record.content,
+                                              record.version, record.deleted});
+            }
+            return result;
+        }
+    }
+    // Working revisions remain SQL-backed until the write/index migration.
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral(
             "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "

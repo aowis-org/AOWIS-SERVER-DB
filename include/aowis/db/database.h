@@ -116,9 +116,11 @@ struct RevisionInfo
     qint64 generation = 0;
     QByteArray snapshot_sha256;
     QByteArray chain_sha256;
+    // Immutable Merkle root on finalized object-mode revisions; empty for
+    // working and opaque-snapshot revisions. Roots identify full model state.
+    QByteArray object_root_sha256;
     QUuid created_by_uuid;
     QUuid finalized_by_uuid;
-    int hash_version = 1;
 };
 
 // Read-only DAG comparison. Merge bases are the maximal common ancestors:
@@ -562,7 +564,10 @@ private:
                                           QString *error) const;
     std::optional<QByteArray> objectManifest(const QUuid &revision_uuid, QString *error) const;
     std::optional<int> objectMode(const QUuid &revision_uuid, QString *error) const;
-    bool copyObjects(const QUuid &from_revision, const QUuid &to_revision, QString *error);
+    // Derive editable-head-only hydraulic indexes from the already materialized
+    // and SHA-256-checked working objects, never historical SQL index rows.
+    bool rebuildWorkingHydraulicIndexes(const QUuid &working_revision,
+                                        QString *error);
     bool replaceNetworkMembership(const QUuid &revision_uuid, const QUuid &network_uuid,
                                   const QSet<QUuid> &entity_uuids, QString *error) const;
     bool replaceHydraulicReferences(const QUuid &revision_uuid,

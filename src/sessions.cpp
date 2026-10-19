@@ -22,6 +22,13 @@ void setError(QString *error, const QString &value)
         *error = value;
 }
 
+// Stable 32-byte marker already accepted by both backends' session guards.
+// Keep its bytes unchanged: previously redacted records must remain recognizable.
+QByteArray redactedSessionDigest(const QUuid &session_uuid)
+{
+    return QByteArrayLiteral("AOWIS-REDACT-V1!") + session_uuid.toRfc4122();
+}
+
 QByteArray sessionDigest(const QByteArray &random_bytes)
 {
     QByteArray data("AOWIS-SESSION-V1\0", 17);
@@ -95,7 +102,7 @@ bool hasSessionCapacity(const QSqlDatabase &connection, const StorageBackend &ba
 // A spent session's digest is overwritten with an unmistakably non-secret
 // marker, unique to that session UUID. The 16-byte prefix is ASCII
 // "AOWIS-REDACT-V1!" followed by the session's 16-byte RFC 4122 UUID.
-// SQLite enforces that a digest may be changed only to precisely this marker.
+// Both SQLite and PostgreSQL allow changing a spent digest only to this marker.
 // No token hash or bearer token is kept in the security audit record.
 std::optional<int> Database::redactSpentSessionTokens(const OperationContext &admin,
                                                        qint64 cutoff_ms, int max_count,
@@ -117,13 +124,16 @@ std::optional<int> Database::redactSpentSessionTokens(const OperationContext &ad
     // Preserve full session metadata: only spent credential digests are
     // redacted. Sessions must be revoked or expired, and their last use date
     // must be at or before the selected retention cutoff.
+    // Portable across SQLite BLOBs and PostgreSQL BYTEA/UUID. A spent
+    // credential is selected only if it is not already the stable redaction
+    // marker for its own UUID. Don't impose SQL LIMIT before filtering:
+    // already-redacted earlier sessions must not consume the batch limit.
     QSqlQuery select(this->database_);
     if (!select.prepare(QStringLiteral(R"SQL(
-        SELECT uuid FROM user_sessions
+        SELECT uuid, token_sha256 FROM user_sessions
         WHERE (expires_at_ms<=? OR (revoked_at_ms IS NOT NULL AND revoked_at_ms<=?))
           AND (revoked_at_ms IS NOT NULL OR expires_at_ms<=?)
-          AND token_sha256!=CAST(x'414f5749532d5245444143542d563121' || uuid AS BLOB)
-        ORDER BY expires_at_ms,uuid LIMIT ?
+        ORDER BY expires_at_ms,uuid
     )SQL")))
     {
         setError(error, select.lastError().text());
@@ -133,32 +143,36 @@ std::optional<int> Database::redactSpentSessionTokens(const OperationContext &ad
     select.addBindValue(cutoff_ms);
     select.addBindValue(cutoff_ms);
     select.addBindValue(now);
-    select.addBindValue(max_count);
     if (!select.exec())
     {
         setError(error, select.lastError().text());
         rollback();
         return std::nullopt;
     }
-    QVector<QUuid> session_ids;
-    while (select.next())
-        session_ids.append(this->backend_->readUuid(select.value(0)));
+    QVector<QPair<QUuid, QByteArray>> candidates;
+    while (candidates.size() < max_count && select.next())
+    {
+        const QUuid id = this->backend_->readUuid(select.value(0));
+        const QByteArray previous_digest = select.value(1).toByteArray();
+        if (previous_digest != redactedSessionDigest(id))
+            candidates.append(qMakePair(id, previous_digest));
+    }
     select.finish();
 
     QSqlQuery update(this->database_);
     if (!update.prepare(QStringLiteral(
-            "UPDATE user_sessions SET token_sha256="
-            "CAST(x'414f5749532d5245444143542d563121' || uuid AS BLOB) "
-            "WHERE uuid=? AND token_sha256!="
-            "CAST(x'414f5749532d5245444143542d563121' || uuid AS BLOB)")))
+            "UPDATE user_sessions SET token_sha256=? "
+            "WHERE uuid=? AND token_sha256=?")))
     {
         setError(error, update.lastError().text());
         rollback();
         return std::nullopt;
     }
-    for (const QUuid &id : session_ids)
+    for (const QPair<QUuid, QByteArray> &candidate : candidates)
     {
-        update.bindValue(0, this->backend_->bindUuid(id));
+        update.bindValue(0, redactedSessionDigest(candidate.first));
+        update.bindValue(1, this->backend_->bindUuid(candidate.first));
+        update.bindValue(2, candidate.second);
         if (!update.exec() || update.numRowsAffected() != 1)
         {
             setError(error, QStringLiteral("Unable to redact spent session credential: %1")
@@ -168,7 +182,7 @@ std::optional<int> Database::redactSpentSessionTokens(const OperationContext &ad
         }
         update.finish();
         if (!writeSecurityAuditEvent(admin.actor_uuid, QStringLiteral("session.token.redact"),
-                                     id, error))
+                                     candidate.first, error))
         {
             rollback();
             return std::nullopt;
@@ -180,7 +194,7 @@ std::optional<int> Database::redactSpentSessionTokens(const OperationContext &ad
         rollback();
         return std::nullopt;
     }
-    return session_ids.size();
+    return candidates.size();
 }
 
 std::optional<IssuedSession> Database::issueSession(const OperationContext &admin,

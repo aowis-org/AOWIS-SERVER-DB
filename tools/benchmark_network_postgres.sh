@@ -8,11 +8,12 @@ STARTED=false
 
 usage() {
     cat <<'HELP'
-Usage: ./tools/benchmark_network_postgres.sh [PIPE_COUNT]
+Usage: ./tools/benchmark_network_postgres.sh [PIPE_COUNT] [--revisions N]
 
 Run the opt-in AOWIS network-persistence benchmark against a disposable
 PostgreSQL 17 Docker Compose instance. Defaults to 1000 pipes. The container,
-test schema and all benchmark data are destroyed at exit.
+test schema and all benchmark data are destroyed at exit. By default the
+benchmark finalizes one revision; --revisions N permits 1..100 revisions.
 
 Set AOWIS_DB_BENCH_BUILD_DIR to use a different configured CMake build
 folder (default: build-linux-tests). No CTest tests are run.
@@ -23,12 +24,25 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
     exit 0
 fi
-if (( $# > 1 )); then
+if (( $# > 3 )); then
     usage >&2
     exit 2
 fi
-count="${1:-1000}"
-if [[ ! "$count" =~ ^[1-9][0-9]*$ ]] || (( count > 100000 )); then
+count=1000
+if (( $# > 0 )) && [[ "$1" != --revisions ]]; then
+    count="$1"
+    shift
+fi
+revision_args=()
+if (( $# > 0 )); then
+    if (( $# != 2 )) || [[ "$1" != --revisions ]] ||
+       [[ ! "$2" =~ ^[1-9][0-9]*$ ]] || (( ${#2} > 3 )) || (( 10#$2 > 100 )); then
+        usage >&2
+        exit 2
+    fi
+    revision_args=(--revisions "$2")
+fi
+if [[ ! "$count" =~ ^[1-9][0-9]*$ ]] || (( ${#count} > 6 )) || (( 10#$count > 100000 )); then
     printf 'PIPE_COUNT must be an integer between 1 and 100000.\n' >&2
     exit 2
 fi
@@ -93,4 +107,4 @@ if [[ ! -f "${build_dir}/CMakeCache.txt" ]]; then
 fi
 cmake --build "$build_dir" --target aowis-db-network-benchmark
 printf '=== PostgreSQL network benchmark: %s pipes ===\n' "$count"
-"${build_dir}/aowis-db-network-benchmark" "$count" --postgres
+"${build_dir}/aowis-db-network-benchmark" "$count" "${revision_args[@]}" --postgres

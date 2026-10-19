@@ -27,6 +27,27 @@ response schemas. The route groups are:
 | `/api/v1/branches/{uuid}/merge`, `/api/v1/branches/{uuid}/finalize` | Merge and finalization |
 | `/api/v1/admin/...` | Authorized user, group, role and permission administration |
 
+### Create a branch
+
+`POST /api/v1/projects/{project_uuid}/branches` creates a new working branch
+from an existing **finalized** revision in the same project. The request must
+contain exactly these two JSON fields:
+
+```json
+{
+  "name": "alternative-design",
+  "base_finalized_revision_uuid": "019a4d09-8362-7bd5-9bc9-1df7c88118e4"
+}
+```
+
+On success the server returns `201 Created` and the usual branch object:
+`uuid`, `project_uuid`, `name`, `head_revision_uuid`, `created_by_uuid`.
+Authentication is required (`401` if missing), and the actor needs
+`project.branch.create` for the project (`403` otherwise) and `project.read`
+for the base revision's branch. An invalid request returns `400`; duplicate
+branch names, nonfinalized bases, cross-project bases and inaccessible bases
+are rejected with `409`. No client-supplied creator identity is accepted.
+
 The table is a navigation aid, not an independently versioned API schema;
 consult `src/http_routes.cpp` for exact HTTP methods, dynamic route patterns,
 request fields and error responses.

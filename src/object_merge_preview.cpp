@@ -1,6 +1,7 @@
 #include <aowis/db/database.h>
 #include "object_merge_state.h"
 #include "model_field_merge.h"
+#include "revision_root.h"
 
 #include <algorithm>
 #include <limits>
@@ -22,28 +23,48 @@ void setError(QString *error, const QString &message)
         *error = message;
 }
 
-// Stream the three object revisions in stable UUID order. Holding only one
-// row per revision avoids retaining every unchanged network entity in memory.
-// Tombstones are deliberately absent from semantic comparison; their physical
-// rows are still covered by the separate left-side generation digest.
+// Three-way merge comparisons use ordered UUID cursors. Finalized tips are
+// authoritative Merkle snapshots; only editable tips use SQL. Immutable
+// content is fetched in bounded batches, not one PostgreSQL call per object
+// and not three entire model payloads resident at once.
 struct LiveObjectCursor
 {
     QSqlQuery query;
     const StorageBackend &backend_;
+    const QSqlDatabase &database_;
     std::optional<ModelObject> current;
     QByteArray previous_id;
+    bool sealed_ = false;
+    QVector<merkle_tree::Entry> entries_;
+    qsizetype next_entry_ = 0;
+    QVector<MerkleObjectRecord> batch_;
+    qsizetype next_batch_ = 0;
 
     LiveObjectCursor(const QSqlDatabase &database, const StorageBackend &backend)
-        : query(database), backend_(backend)
+        : query(database), backend_(backend), database_(database)
     {
-        // SQLite supports interleaved forward-only statements on the same
-        // connection. PostgreSQL cannot safely use that access pattern.
         if (database.driverName() == QStringLiteral("QSQLITE"))
             this->query.setForwardOnly(true);
     }
 
-    bool open(const QUuid &revision_uuid, QString *error)
+    bool open(const QUuid &revision_uuid, bool finalized, const QByteArray &root,
+              QString *error)
     {
+        this->sealed_ = finalized;
+        if (finalized)
+        {
+            if (root.size() != 32)
+            {
+                setError(error, QStringLiteral("Finalized merge revision has no valid Merkle root"));
+                return false;
+            }
+            const std::optional<QVector<merkle_tree::Entry>> listed =
+                merkle_tree::entries(this->database_, root, error);
+            if (!listed)
+                return false;
+            this->entries_ = *listed;
+            return advance(error);
+        }
         if (!this->query.prepare(QStringLiteral(
                 "SELECT object_uuid,kind,content,version FROM revision_objects "
                 "WHERE revision_uuid=? AND deleted=0 ORDER BY object_uuid")))
@@ -63,6 +84,42 @@ struct LiveObjectCursor
     bool advance(QString *error)
     {
         this->current.reset();
+        if (this->sealed_)
+        {
+            while (true)
+            {
+                if (this->next_batch_ >= this->batch_.size())
+                {
+                    if (this->next_entry_ >= this->entries_.size())
+                        return true;
+                    const qsizetype count = qMin(qsizetype(256),
+                        this->entries_.size() - this->next_entry_);
+                    const QVector<merkle_tree::Entry> portion =
+                        this->entries_.mid(this->next_entry_, count);
+                    const std::optional<QVector<MerkleObjectRecord>> fetched =
+                        readRevisionObjectEntries(this->database_, portion, error);
+                    if (!fetched)
+                        return false;
+                    this->batch_ = *fetched;
+                    this->next_batch_ = 0;
+                    this->next_entry_ += count;
+                }
+                const MerkleObjectRecord &record = this->batch_.at(this->next_batch_++);
+                if (record.deleted)
+                    continue;
+                const QByteArray raw_uuid = record.uuid.toRfc4122();
+                if (record.uuid.isNull() ||
+                    (!this->previous_id.isEmpty() && raw_uuid <= this->previous_id))
+                {
+                    setError(error, QStringLiteral("Invalid or duplicate UUID in Merkle merge stream"));
+                    return false;
+                }
+                this->previous_id = raw_uuid;
+                this->current = ModelObject{record.uuid, record.kind, record.content,
+                    record.version, false};
+                return true;
+            }
+        }
         if (!this->query.next())
         {
             if (this->query.lastError().isValid())
@@ -91,6 +148,8 @@ struct LiveObjectCursor
     {
         this->current.reset();
         this->query.finish();
+        this->entries_.clear();
+        this->batch_.clear();
     }
 };
 
@@ -103,9 +162,42 @@ bool sameContent(const std::optional<ModelObject> &a, const std::optional<ModelO
 
 } // namespace
 
-std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database, const StorageBackend &backend,
-    const QUuid &revision_uuid, QString *error)
+std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database,
+    const StorageBackend &backend, const QUuid &revision_uuid,
+    const QByteArray &sealed_root, QString *error)
 {
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    const auto addField = [&hash](const QByteArray &value) {
+        hash.addData(QByteArray::number(value.size()));
+        hash.addData(QByteArrayView(":", 1));
+        hash.addData(value);
+    };
+    if (!sealed_root.isEmpty())
+    {
+        // Same digest format as physical working rows, but derived from the
+        // authoritative immutable root. Includes tombstones and versions.
+        const std::optional<QVector<merkle_tree::Entry>> entries =
+            merkle_tree::entries(database, sealed_root, error);
+        if (!entries)
+            return std::nullopt;
+        for (qsizetype start = 0; start < entries->size(); start += 256)
+        {
+            const QVector<merkle_tree::Entry> portion = entries->mid(start, 256);
+            const std::optional<QVector<MerkleObjectRecord>> records =
+                readRevisionObjectEntries(database, portion, error);
+            if (!records)
+                return std::nullopt;
+            for (const MerkleObjectRecord &record : *records)
+            {
+                addField(record.uuid.toRfc4122());
+                addField(record.kind.toUtf8());
+                addField(record.content);
+                addField(QByteArray::number(record.version));
+                addField(QByteArray::number(record.deleted ? 1 : 0));
+            }
+        }
+        return hash.result();
+    }
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
             "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
@@ -120,14 +212,6 @@ std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database
         setError(error, query.lastError().text());
         return std::nullopt;
     }
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    // Length-prefixed fields prevent ambiguous concatenations. All physical
-    // rows are included (even deleted ones), unlike the semantic preview.
-    const auto addField = [&hash](const QByteArray &value) {
-        hash.addData(QByteArray::number(value.size()));
-        hash.addData(QByteArrayView(":", 1));
-        hash.addData(value);
-    };
     while (query.next())
     {
         const QUuid object_uuid = backend.readUuid(query.value(0));
@@ -136,8 +220,6 @@ std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database
             setError(error, QStringLiteral("Invalid object UUID in physical merge digest"));
             return std::nullopt;
         }
-        // The digest remains the same RFC-4122 byte stream, not the SQL
-        // driver's UUID representation. SQLite's historical digest is stable.
         addField(object_uuid.toRfc4122());
         addField(query.value(1).toString().toUtf8());
         addField(query.value(2).toByteArray());
@@ -230,16 +312,19 @@ std::optional<ObjectMergePreview> Database::previewObjectMergeBounded(const Oper
         right_cursor.finish();
         return fail();
     };
-    if (!base_cursor.open(base_uuid, error) ||
-        !left_cursor.open(left_revision_uuid, error) ||
-        !right_cursor.open(right_revision_uuid, error))
+    if (!base_cursor.open(base_uuid, true, base->object_root_sha256, error) ||
+        !left_cursor.open(left_revision_uuid, left_revision->finalized,
+                          left_revision->object_root_sha256, error) ||
+        !right_cursor.open(right_revision_uuid, right_revision->finalized,
+                           right_revision->object_root_sha256, error))
         return failScan();
 
     // Captured inside the same read transaction as the three-way comparison:
     // an unjournaled update cannot silently alter the working head between
     // this preview and a subsequent write transaction.
     const std::optional<QByteArray> physical = mergePhysicalObjectDigest(
-        this->database_, *this->backend_, left_revision_uuid, error);
+        this->database_, *this->backend_, left_revision_uuid,
+        left_revision->finalized ? left_revision->object_root_sha256 : QByteArray(), error);
     if (!physical)
         return failScan();
 

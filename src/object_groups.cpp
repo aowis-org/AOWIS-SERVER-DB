@@ -100,13 +100,6 @@ std::optional<QUuid> Database::writeObjectGroupInTransaction(const RevisionInfo 
         fail(error, QStringLiteral("Group does not cover all committed object edits"));
         return std::nullopt;
     }
-    QSqlQuery format(this->database_);
-    if (!prepare(format, QStringLiteral(
-            "UPDATE revisions SET object_journal_version=2 WHERE uuid=? AND state='working'"), error))
-        return std::nullopt;
-    format.addBindValue(this->backend_->bindUuid(revision.uuid));
-    if (!run(format, error) || format.numRowsAffected() != 1)
-        return std::nullopt;
     return group_uuid;
 }
 

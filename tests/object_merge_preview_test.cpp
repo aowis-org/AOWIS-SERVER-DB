@@ -291,5 +291,28 @@ int main(int argc, char **argv)
     REQUIRE(!db.previewObjectMerge(root, left_merge->finalized_revision_uuid,
         right_merge->finalized_revision_uuid, &error));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
+
+    // Finalized merge sources are exclusively Merkle-backed: old SQL
+    // object copies are absent, not merely ignored.
+    {
+        QSqlDatabase inspection = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("merkle-merge-inspection"));
+        inspection.setDatabaseName(path);
+        REQUIRE(inspection.open());
+        QSqlQuery query(inspection);
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+        query.addBindValue(base_uuid.toRfc4122());
+        REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 0);
+        query.finish();
+        inspection.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("merkle-merge-inspection"));
+    const std::optional<ObjectMergePreview> sealed_preview =
+        db.previewObjectMerge(root, left_uuid, right_uuid, &error);
+    REQUIRE(sealed_preview && sealed_preview->changes.size() == preview->changes.size());
+    REQUIRE(sealed_preview->conflict_count == preview->conflict_count);
+    REQUIRE(findChange(*sealed_preview, only_left)->base->content == QByteArray("base"));
+    REQUIRE(db.verifyProject(root, project->project_uuid).valid);
     return 0;
 }

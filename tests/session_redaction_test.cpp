@@ -146,7 +146,7 @@ int main(int argc, char **argv)
     REQUIRE(short_lived.has_value());
     QThread::msleep(1150);
     REQUIRE(!db.activeSession(short_lived->bearer_token).has_value());
-    REQUIRE(db.redactSpentSessionTokens(root, QDateTime::currentMSecsSinceEpoch(), 20, &error) == 1);
+    REQUIRE(db.redactSpentSessionTokens(root, QDateTime::currentMSecsSinceEpoch(), 1, &error) == 1);
     REQUIRE(digestFor(file, short_lived->uuid, QStringLiteral("expired-digest")) == markerFor(short_lived->uuid));
     REQUIRE(db.activeSession(active->bearer_token).has_value());
     REQUIRE(db.verifySecurityAudit(root).valid);

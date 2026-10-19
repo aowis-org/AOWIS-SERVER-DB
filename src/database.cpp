@@ -3,11 +3,13 @@
 
 #include "sqlite_backend.h"
 #include "postgres_backend.h"
+#include "revision_root.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QStringList>
 #include <QVariant>
 
 namespace aowis::db
@@ -56,8 +58,8 @@ void appendField(QByteArray &bytes, const QByteArray &field)
     bytes.append(field);
 }
 
-// The original digest format is explicitly domain-separated and byte-order-defined. Do not change
-// this encoding for old finalized revisions; introduce a new hash version.
+// One pre-release chain format. The exact bytes are deterministic and include
+// the complete model snapshot, operation history, authors and ordered parents.
 QByteArray chainDigest(const QUuid &project_uuid,
                        const QUuid &branch_uuid,
                        const QUuid &revision_uuid,
@@ -68,29 +70,28 @@ QByteArray chainDigest(const QUuid &project_uuid,
                        const QString &title,
                        const QString &message,
                        const QByteArray &snapshot_hash,
-                       int hash_version,
                        const QUuid &creator_uuid,
-                       const QUuid &finalizer_uuid)
+                       const QUuid &finalizer_uuid,
+                       const QByteArray &history_hash,
+                       const QByteArray &object_root)
 {
-    if (hash_version != 1 && hash_version != 2)
+    if (snapshot_hash.size() != digest_length || history_hash.size() != digest_length ||
+        object_root.size() != digest_length)
         return {};
-    QByteArray bytes = hash_version == 1
-        ? QByteArray("AOWIS-REVISION-DAG-V1\0", 22)
-        : QByteArray("AOWIS-REVISION-DAG-V2\0", 22);
+    QByteArray bytes("AOWIS-REVISION-DAG-V1\0", 22);
     bytes.append(uuidBytes(project_uuid));
     bytes.append(uuidBytes(branch_uuid));
     bytes.append(uuidBytes(revision_uuid));
-    if (hash_version == 2)
-    {
-        bytes.append(uuidBytes(creator_uuid));
-        bytes.append(uuidBytes(finalizer_uuid));
-        appendInt64(bytes, static_cast<quint64>(created_at_ms));
-    }
+    bytes.append(uuidBytes(creator_uuid));
+    bytes.append(uuidBytes(finalizer_uuid));
+    appendInt64(bytes, static_cast<quint64>(created_at_ms));
     appendInt64(bytes, static_cast<quint64>(number));
     appendInt64(bytes, static_cast<quint64>(finalized_at_ms));
     appendField(bytes, title.toUtf8());
     appendField(bytes, message.toUtf8());
     bytes.append(snapshot_hash);
+    bytes.append(history_hash);
+    bytes.append(object_root);
     appendInt64(bytes, static_cast<quint64>(parents.size()));
     for (const QPair<QUuid, QByteArray> &parent : parents)
     {
@@ -413,7 +414,7 @@ std::optional<RevisionInfo> Database::revisionUnchecked(const QUuid &revision_uu
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral(
             "SELECT uuid,project_uuid,branch_uuid,number,state,generation,"
-            "snapshot_sha256,chain_sha256,created_at_ms,created_by_uuid,finalized_by_uuid,hash_format_version "
+            "snapshot_sha256,chain_sha256,created_at_ms,created_by_uuid,finalized_by_uuid,object_root_sha256 "
             "FROM revisions WHERE uuid=?"), error))
         return std::nullopt;
     query.addBindValue(this->backend_->bindUuid(revision_uuid));
@@ -434,9 +435,9 @@ std::optional<RevisionInfo> Database::revisionUnchecked(const QUuid &revision_uu
     result.generation = query.value(5).toLongLong();
     result.snapshot_sha256 = query.value(6).toByteArray();
     result.chain_sha256 = query.value(7).toByteArray();
+    result.object_root_sha256 = query.value(11).toByteArray();
     result.created_by_uuid = this->backend_->readUuid(query.value(9));
     result.finalized_by_uuid = this->backend_->readUuid(query.value(10));
-    result.hash_version = query.value(11).toInt();
     QSqlQuery parents(this->database_);
     if (!prepare(parents, QStringLiteral(
             "SELECT parent_revision_uuid FROM revision_parents WHERE revision_uuid=? "
@@ -473,6 +474,15 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
     if (!base || !base->finalized || base->project_uuid != project_uuid)
     {
         setError(error, QStringLiteral("Branch base must be a finalized revision in the same project"));
+        rollback();
+        return std::nullopt;
+    }
+    // Branch creation copies the base revision's full snapshot and objects.
+    // An actor allowed to create branches must also be able to read that base,
+    // including when it belongs to a different branch in the same project.
+    if (!requirePermission(OperationContext{actor_uuid}, QStringLiteral("project.read"),
+                           AccessScope::branch(base->branch_uuid), error))
+    {
         rollback();
         return std::nullopt;
     }
@@ -515,7 +525,12 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             ok = run(query, error);
         }
     }
-    if (ok)
+    const std::optional<int> base_mode = ok ? objectMode(base_finalized_revision_uuid, error) : std::nullopt;
+    if (ok && !base_mode)
+        ok = false;
+    // Object-mode working revisions reconstruct their current manifest from
+    // editable objects; they must not copy a full immutable manifest blob.
+    if (ok && *base_mode == 0)
     {
         ok = prepare(query, QStringLiteral(
             "INSERT INTO snapshots(revision_uuid,format_version,content) "
@@ -527,8 +542,25 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
             ok = run(query, error) && query.numRowsAffected() == 1;
         }
     }
-    if (ok)
-        ok = copyObjects(base_finalized_revision_uuid, result.head_revision_uuid, error);
+    if (ok && *base_mode == 1)
+    {
+        // The immutable Merkle snapshot is authoritative for object contents.
+        // Historical revision_objects rows are not a source of truth and will
+        // be removed entirely in the finalized-row cutover.
+        if (base->object_root_sha256.size() != digest_length)
+        {
+            setError(error, QStringLiteral("Finalized base revision is missing its Merkle root"));
+            ok = false;
+        }
+        else
+        {
+            ok = materializeWorkingObjectsFromRoot(
+                this->database_, *this->backend_, result.head_revision_uuid,
+                base->object_root_sha256, error);
+        }
+        if (ok)
+            ok = rebuildWorkingHydraulicIndexes(result.head_revision_uuid, error);
+    }
     if (ok)
     {
         ok = prepare(query, QStringLiteral(
@@ -606,7 +638,15 @@ std::optional<QByteArray> Database::snapshotUnchecked(const QUuid &revision_uuid
     if (!mode)
         return std::nullopt;
     if (*mode == 1)
-        return objectManifest(revision_uuid, error);
+    {
+        const std::optional<RevisionInfo> info = revisionUnchecked(revision_uuid, error);
+        if (!info)
+            return std::nullopt;
+        if (!info->finalized)
+            return objectManifest(revision_uuid, error);
+        // Finalized object-mode revisions have an immutable stored manifest.
+        // Never reconstruct historical bytes from transient SQL model rows.
+    }
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral("SELECT content FROM snapshots WHERE revision_uuid=?"), error))
         return std::nullopt;
@@ -658,7 +698,30 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
         return std::nullopt;
     }
     const std::optional<int> mode = objectMode(r->uuid, error);
-    const std::optional<QByteArray> body = mode ? snapshotUnchecked(r->uuid, error) : std::nullopt;
+    if (!mode)
+        return std::nullopt;
+    // Publish the Merkle root only at finalization, within one transaction.
+    // Temporary working rows are removed after sealing; immutable trees
+    // alone represent finalized model snapshots.
+    QByteArray object_root(digest_length, '\0');
+    if (*mode == 1)
+    {
+        QByteArray inherited_root;
+        if (!r->parent_revision_uuids.isEmpty())
+        {
+            const std::optional<RevisionInfo> first_parent =
+                revisionUnchecked(r->parent_revision_uuids.first(), error);
+            if (!first_parent || !first_parent->finalized)
+                return std::nullopt;
+            inherited_root = first_parent->object_root_sha256;
+        }
+        const std::optional<QByteArray> sealed = buildRevisionRoot(
+            this->database_, *this->backend_, r->uuid, inherited_root, error);
+        if (!sealed)
+            return std::nullopt;
+        object_root = *sealed;
+    }
+    const std::optional<QByteArray> body = snapshotUnchecked(r->uuid, error);
     if (!body)
     {
         return std::nullopt;
@@ -703,28 +766,61 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
     result.chain_sha256 = chainDigest(r->project_uuid, r->branch_uuid, r->uuid,
                                      parent_hashes, r->number, r->created_at_ms, now,
                                      title, message, result.snapshot_sha256,
-                                     2, r->created_by_uuid, actor_uuid);
+                                     r->created_by_uuid, actor_uuid, *operation_digest, object_root);
     result.new_working_revision_uuid = createUuidV7();
 
+    // The immutable root now owns the finalized snapshot, but the *existing*
+    // SQL working state is already validated. For object-mode revisions hand
+    // that state directly to the next working head instead of decoding every
+    // Merkle blob and rebuilding the hydraulic indexes after finalization.
+    //
+    // "sealing" exists only inside this write transaction: it releases the
+    // one-working-revision uniqueness slot while preserving the old SQL rows
+    // long enough for set-based INSERT ... SELECT statements. No committed
+    // revision may remain in that state. On any error the caller rolls back.
     QSqlQuery query(this->database_);
-    bool ok = prepare(query, QStringLiteral(
-        "UPDATE revisions SET state='finalized', finalized_at_ms=?, title=?, message=?, "
-        "snapshot_sha256=?,chain_sha256=?, finalized_by_uuid=?, hash_format_version=2, "
-        "operation_history_sha256=? "
-        "WHERE uuid=? AND state='working' AND generation=?"), error);
-    if (ok)
+    bool ok = true;
+    if (*mode == 1)
     {
-        query.addBindValue(now);
-        query.addBindValue(title.isNull() ? QStringLiteral("") : title);
-        query.addBindValue(message.isNull() ? QStringLiteral("") : message);
-        query.addBindValue(result.snapshot_sha256);
-        query.addBindValue(result.chain_sha256);
-        query.addBindValue(this->backend_->bindUuid(actor_uuid));
-        query.addBindValue(*operation_digest);
-        query.addBindValue(this->backend_->bindUuid(r->uuid));
-        query.addBindValue(expected_generation);
-        ok = run(query, error) && query.numRowsAffected() == 1;
+        ok = prepare(query, QStringLiteral(
+            "UPDATE revisions SET state='sealing' "
+            "WHERE uuid=? AND state='working' AND generation=?"), error);
+        if (ok)
+        {
+            query.addBindValue(this->backend_->bindUuid(r->uuid));
+            query.addBindValue(expected_generation);
+            ok = run(query, error) && query.numRowsAffected() == 1;
+        }
     }
+
+    const auto sealOldRevision = [&](const QString &expected_state) -> bool
+    {
+        QSqlQuery update(this->database_);
+        if (!prepare(update, QStringLiteral(
+                "UPDATE revisions SET state='finalized', finalized_at_ms=?, title=?, message=?, "
+                "snapshot_sha256=?,chain_sha256=?, finalized_by_uuid=?, "
+                "operation_history_sha256=?, object_root_sha256=? "
+                "WHERE uuid=? AND state=? AND generation=?"), error))
+            return false;
+        update.addBindValue(now);
+        update.addBindValue(title.isNull() ? QStringLiteral("") : title);
+        update.addBindValue(message.isNull() ? QStringLiteral("") : message);
+        update.addBindValue(result.snapshot_sha256);
+        update.addBindValue(result.chain_sha256);
+        update.addBindValue(this->backend_->bindUuid(actor_uuid));
+        update.addBindValue(*operation_digest);
+        update.addBindValue(*mode == 1 ? QVariant(object_root) : QVariant());
+        update.addBindValue(this->backend_->bindUuid(r->uuid));
+        update.addBindValue(expected_state);
+        update.addBindValue(expected_generation);
+        return run(update, error) && update.numRowsAffected() == 1;
+    };
+
+    // For opaque snapshot revisions the old ordering is retained: finalize
+    // before inserting the successor, since there is no SQL model to pass on.
+    if (ok && *mode == 0)
+        ok = sealOldRevision(QStringLiteral("working"));
+
     if (ok)
     {
         ok = prepare(query, QStringLiteral(
@@ -742,6 +838,80 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             ok = run(query, error);
         }
     }
+    // Object-mode rows are NOT retained as historical storage. They move from
+    // one temporary editable SQL head to the next and are discarded from the
+    // old revision before its immutable state is published. No root traversal,
+    // payload decoding, or rebuilding of hydraulic indexes is needed here.
+    if (ok && *mode == 1)
+    {
+        const QStringList transfers{
+            QStringLiteral(
+                "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
+                "SELECT ?,object_uuid,kind,content,version,deleted "
+                "FROM revision_objects WHERE revision_uuid=?"),
+            QStringLiteral(
+                "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
+                "SELECT ?,network_uuid,entity_uuid FROM hydraulic_network_members WHERE revision_uuid=?"),
+            QStringLiteral(
+                "INSERT INTO hydraulic_network_references"
+                "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
+                "SELECT ?,network_uuid,source_uuid,target_uuid,field "
+                "FROM hydraulic_network_references WHERE revision_uuid=?")
+        };
+        for (const QString &statement : transfers)
+        {
+            QSqlQuery transfer(this->database_);
+            if (!prepare(transfer, statement, error))
+            {
+                ok = false;
+                break;
+            }
+            transfer.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
+            transfer.addBindValue(this->backend_->bindUuid(r->uuid));
+            if (!run(transfer, error))
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (ok)
+        {
+            for (const QString &table : {QStringLiteral("hydraulic_network_references"),
+                                         QStringLiteral("hydraulic_network_members"),
+                                         QStringLiteral("revision_objects")})
+            {
+                QSqlQuery purge(this->database_);
+                if (!prepare(purge, QStringLiteral("DELETE FROM %1 WHERE revision_uuid=?").arg(table), error))
+                {
+                    ok = false;
+                    break;
+                }
+                purge.addBindValue(this->backend_->bindUuid(r->uuid));
+                if (!run(purge, error))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (ok)
+            ok = sealOldRevision(QStringLiteral("sealing"));
+    }
+
+    // The sealed manifest belongs only to its finalized predecessor.
+    if (ok && *mode == 0)
+    {
+        ok = prepare(query, QStringLiteral(
+            "INSERT INTO snapshots (revision_uuid,format_version,content) "
+            "SELECT ?,format_version,content FROM snapshots WHERE revision_uuid=?"), error);
+        if (ok)
+        {
+            query.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
+            query.addBindValue(this->backend_->bindUuid(r->uuid));
+            ok = run(query, error) && query.numRowsAffected() == 1;
+        }
+    }
+    // Both predecessors are finalized before publishing the ancestry edge.
     if (ok)
     {
         ok = prepare(query, QStringLiteral(
@@ -754,20 +924,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
             ok = run(query, error);
         }
     }
-    if (ok)
-    {
-        ok = prepare(query, QStringLiteral(
-            "INSERT INTO snapshots (revision_uuid,format_version,content) "
-            "SELECT ?,format_version,content FROM snapshots WHERE revision_uuid=?"), error);
-        if (ok)
-        {
-            query.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
-            query.addBindValue(this->backend_->bindUuid(r->uuid));
-            ok = run(query, error) && query.numRowsAffected() == 1;
-        }
-    }
-    if (ok && *mode == 1)
-        ok = copyObjects(r->uuid, result.new_working_revision_uuid, error);
+
     if (ok)
     {
         ok = prepare(query, QStringLiteral(
@@ -799,7 +956,7 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
     QString error;
     if (!prepare(revisions, QStringLiteral(
         "SELECT uuid,branch_uuid,number,finalized_at_ms,title,message,"
-        "snapshot_sha256,chain_sha256,hash_format_version,created_by_uuid,finalized_by_uuid,created_at_ms FROM revisions "
+        "snapshot_sha256,chain_sha256,created_by_uuid,finalized_by_uuid,created_at_ms,object_root_sha256 FROM revisions "
         "WHERE project_uuid=? AND state='finalized' ORDER BY finalized_at_ms,uuid"), &error))
     {
         report.error = error;
@@ -812,6 +969,11 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
         return report;
     }
 
+    // A project may have thousands of highly overlapping immutable roots.
+    // Keep verified content only for THIS invocation; every subsequent
+    // verification starts clean and independently checks database bytes.
+    QHash<QByteArray, QByteArray> verified_merkle_nodes;
+    QSet<QByteArray> verified_merkle_blobs;
     while (revisions.next())
     {
         const QUuid current_uuid = this->backend_->readUuid(revisions.value(0));
@@ -822,10 +984,10 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
         const QString message = revisions.value(5).toString();
         const QByteArray recorded_snapshot_hash = revisions.value(6).toByteArray();
         const QByteArray recorded_chain_hash = revisions.value(7).toByteArray();
-        const int hash_version = revisions.value(8).toInt();
-        const QUuid creator_uuid = this->backend_->readUuid(revisions.value(9));
-        const QUuid finalizer_uuid = this->backend_->readUuid(revisions.value(10));
-        const qint64 created_at_ms = revisions.value(11).toLongLong();
+        const QUuid creator_uuid = this->backend_->readUuid(revisions.value(8));
+        const QUuid finalizer_uuid = this->backend_->readUuid(revisions.value(9));
+        const qint64 created_at_ms = revisions.value(10).toLongLong();
+        const QByteArray stored_root = revisions.value(11).toByteArray();
 
         report.failed_revision_uuid = current_uuid;
         const std::optional<QByteArray> body = snapshotUnchecked(current_uuid, &error);
@@ -837,16 +999,25 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
         }
         if (*mode == 1)
         {
-            QSqlQuery stored(this->database_);
-            if (!prepare(stored, QStringLiteral("SELECT content FROM snapshots WHERE revision_uuid=?"), &error))
+            if (stored_root.size() != digest_length ||
+                !verifyRevisionRootCached(this->database_, stored_root,
+                    verified_merkle_nodes, verified_merkle_blobs, &error))
             {
-                report.error = error;
+                report.error = QStringLiteral("Finalized revision Merkle root mismatch: %1").arg(error);
                 return report;
             }
-            stored.addBindValue(this->backend_->bindUuid(current_uuid));
-            if (!run(stored, &error) || !stored.next() || !body || stored.value(0).toByteArray() != *body)
+            // Rebuild the manifest using the sealed Merkle objects AND the
+            // independent event/group journal. No finalized SQL object rows
+            // are retained; modifying the journal must still be detected.
+            const std::optional<QByteArray> reconstructed = objectManifest(current_uuid, &error);
+            if (!reconstructed)
             {
-                report.error = QStringLiteral("Finalized object manifest differs from persisted snapshot");
+                report.error = QStringLiteral("Cannot reconstruct finalized object manifest: %1").arg(error);
+                return report;
+            }
+            if (!body || *reconstructed != *body)
+            {
+                report.error = QStringLiteral("Finalized object manifest differs from persisted SQL history");
                 return report;
             }
         }
@@ -874,16 +1045,18 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
             report.error = error;
             return report;
         }
-        if (!operation_seal.value(0).isNull())
+        const QByteArray expected_history_hash = operation_seal.value(0).toByteArray();
+        operation_seal.finish();
+        if (expected_history_hash.size() != digest_length)
         {
-            const QByteArray expected_history_hash = operation_seal.value(0).toByteArray();
-            operation_seal.finish();
-            const std::optional<QByteArray> actual_history_hash = historyDigest(current_uuid, &error);
-            if (!actual_history_hash || expected_history_hash != *actual_history_hash)
-            {
-                report.error = QStringLiteral("Finalized operation history hash mismatch: %1").arg(error);
-                return report;
-            }
+            report.error = QStringLiteral("Finalized operation history seal is missing or invalid");
+            return report;
+        }
+        const std::optional<QByteArray> actual_history_hash = historyDigest(current_uuid, &error);
+        if (!actual_history_hash || expected_history_hash != *actual_history_hash)
+        {
+            report.error = QStringLiteral("Finalized operation history hash mismatch: %1").arg(error);
+            return report;
         }
 
         QVector<QPair<QUuid, QByteArray>> parent_hashes;
@@ -900,7 +1073,8 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
         }
         if (chainDigest(project_uuid, branch_uuid, current_uuid, parent_hashes,
                         number, created_at_ms, when, title, message, recorded_snapshot_hash,
-                        hash_version, creator_uuid, finalizer_uuid) != recorded_chain_hash)
+                        creator_uuid, finalizer_uuid, expected_history_hash,
+                        *mode == 1 ? stored_root : QByteArray(digest_length, '\0')) != recorded_chain_hash)
         {
             report.error = QStringLiteral("Revision chain hash mismatch");
             return report;

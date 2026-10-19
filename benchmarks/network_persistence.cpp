@@ -10,6 +10,7 @@
 #include <QSqlQuery>
 #include <QTemporaryDir>
 #include <QTextStream>
+#include <QStringList>
 
 #include <cstdio>
 #include <optional>
@@ -82,6 +83,18 @@ public:
     QString databaseName() const { return this->database_name_; }
     QString schemaName() const { return this->schema_name_; }
 
+    std::optional<qint64> objectRows(QString *error) const
+    {
+        QSqlQuery rows(this->connection_);
+        if (!rows.exec(QStringLiteral("SELECT COUNT(*) FROM %1.revision_objects").arg(this->schema_name_)) ||
+            !rows.next())
+        {
+            *error = rows.lastError().text();
+            return std::nullopt;
+        }
+        return rows.value(0).toLongLong();
+    }
+
     std::optional<qint64> storageBytes(QString *error) const
     {
         QSqlQuery size(this->connection_);
@@ -109,6 +122,32 @@ private:
     QSqlDatabase connection_;
     bool created_ = false;
 };
+
+std::optional<qint64> sqliteObjectRows(const QString &path, QString *error)
+{
+    const QString connection_name = QStringLiteral("aowis-benchmark-count-") +
+        createUuidV7().toString(QUuid::Id128);
+    qint64 result = -1;
+    {
+        QSqlDatabase connection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection_name);
+        connection.setDatabaseName(path);
+        if (!connection.open())
+            *error = connection.lastError().text();
+        else
+        {
+            QSqlQuery rows(connection);
+            if (rows.exec(QStringLiteral("SELECT COUNT(*) FROM revision_objects")) && rows.next())
+                result = rows.value(0).toLongLong();
+            else
+                *error = rows.lastError().text();
+        }
+        connection.close();
+    }
+    QSqlDatabase::removeDatabase(connection_name);
+    if (result < 0)
+        return std::nullopt;
+    return result;
+}
 }
 
 // An opt-in measurement tool, not a pass/fail CTest. Timing depends on the
@@ -124,13 +163,17 @@ int main(int argc, char **argv)
     bool postgres = false;
     bool has_count = false;
     int count = 1000;
+    int revision_count = 1;
+    bool revisions_option_seen = false;
     for (int index = 1; index < arguments.size(); ++index)
     {
         const QString argument = arguments.at(index);
         if (argument == QStringLiteral("--help"))
         {
-            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--postgres]\n"
+            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres]\n"
                       "Default PIPE_COUNT: 1000; allowed range: 1..100000.\n"
+                      "Default revisions: 1; allowed range: 1..100 finalized revisions.\n"
+                      "Each additional revision changes one junction and finalizes.\n"
                       "SQLite uses a temporary file. PostgreSQL requires a dedicated\n"
                       "AOWIS_DB_TEST_PG_DB and libpq PG* connection settings;\n"
                       "a random temporary schema is created and deleted.\n";
@@ -141,11 +184,24 @@ int main(int argc, char **argv)
             postgres = true;
             continue;
         }
+        if (argument == QStringLiteral("--revisions") && !revisions_option_seen)
+        {
+            revisions_option_seen = true;
+            bool revisions_ok = false;
+            if (index + 1 < arguments.size())
+                revision_count = arguments.at(++index).toInt(&revisions_ok);
+            if (!revisions_ok || revision_count < 1 || revision_count > 100)
+            {
+                errors << "--revisions requires an integer between 1 and 100.\n";
+                return 2;
+            }
+            continue;
+        }
         bool number_ok = false;
         const int parsed_count = argument.toInt(&number_ok);
         if (has_count || !number_ok || parsed_count < 1 || parsed_count > 100000)
         {
-            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--postgres]\n"
+            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres]\n"
                       "PIPE_COUNT must be an integer between 1 and 100000.\n";
             return 2;
         }
@@ -259,6 +315,66 @@ int main(int argc, char **argv)
         return fail(QStringLiteral("Finalize revision"));
     const qint64 finalize_ms = timer.elapsed();
 
+    // Revision-growth workload: every successive working revision inherits all
+    // existing objects. Change only one junction before each finalization so
+    // the measurements expose the cost of copying largely unchanged models.
+    // All data lives in a disposable database/schema; this is NOT a CTest.
+    QUuid current_working_revision = finalization->new_working_revision_uuid;
+    qint64 total_repeated_edit_ms = 0;
+    qint64 total_repeated_finalize_ms = 0;
+    qint64 max_repeated_finalize_ms = 0;
+    QStringList revision_samples;
+    revision_samples.append(QStringLiteral("1:%1:%2").arg(single_edit_ms).arg(finalize_ms));
+    for (int revision_number = 2; revision_number <= revision_count; ++revision_number)
+    {
+        const std::optional<aowis::db::ModelObject> current_entity = database.object(
+            actor, current_working_revision, updated_junction.uuid, &error);
+        if (!current_entity || current_entity->deleted)
+            return fail(QStringLiteral("Find junction for repeated edit"));
+        updated_junction.elevation_m += 1.0;
+        timer.restart();
+        if (!aowis::db::putHydraulicEntity(database, actor, project->main_branch_uuid,
+                                          updated_junction, current_entity->version, &error))
+            return fail(QStringLiteral("Edit junction in next revision"));
+        const qint64 edit_ms = timer.elapsed();
+        const std::optional<aowis::db::RevisionInfo> working = database.revision(
+            actor, current_working_revision, &error);
+        if (!working || working->finalized)
+            return fail(QStringLiteral("Read next working revision"));
+        timer.restart();
+        const std::optional<aowis::db::Finalization> next = database.finalize(
+            actor, project->main_branch_uuid, working->generation,
+            QStringLiteral("Benchmark revision %1").arg(revision_number), {}, &error);
+        if (!next)
+            return fail(QStringLiteral("Finalize next revision"));
+        const qint64 next_finalize_ms = timer.elapsed();
+        current_working_revision = next->new_working_revision_uuid;
+        total_repeated_edit_ms += edit_ms;
+        total_repeated_finalize_ms += next_finalize_ms;
+        if (next_finalize_ms > max_repeated_finalize_ms)
+            max_repeated_finalize_ms = next_finalize_ms;
+        revision_samples.append(QStringLiteral("%1:%2:%3")
+            .arg(revision_number).arg(edit_ms).arg(next_finalize_ms));
+    }
+
+    // Confirm the newest working head actually inherited the last edit.
+    const std::optional<NetworkHydraulic> latest = database.loadHydraulicNetwork(
+        actor, current_working_revision, network.uuid, &error);
+    if (!latest)
+        return fail(QStringLiteral("Reload newest working revision"));
+    bool inherited = false;
+    for (const HydraulicNodeJunction &junction : latest->nodes_junctions)
+    {
+        if (junction.uuid == updated_junction.uuid &&
+            junction.elevation_m == updated_junction.elevation_m)
+            inherited = true;
+    }
+    if (!inherited)
+    {
+        error = QStringLiteral("Latest working model did not inherit the final edit");
+        return fail(QStringLiteral("Check revision inheritance"));
+    }
+
     timer.restart();
     const std::optional<aowis::db::BranchInfo> branch = database.createBranch(
         actor, project->project_uuid, QStringLiteral("alternative"),
@@ -270,7 +386,7 @@ int main(int argc, char **argv)
     timer.restart();
     const aowis::db::IntegrityReport report = database.verifyProject(
         actor, project->project_uuid);
-    if (!report.valid || report.checked_revisions != 1)
+    if (!report.valid || report.checked_revisions != revision_count)
     {
         error = report.error;
         return fail(QStringLiteral("Verify finalized history"));
@@ -278,6 +394,13 @@ int main(int argc, char **argv)
     const qint64 verify_ms = timer.elapsed();
 
     database.close();
+    std::optional<qint64> object_rows;
+    if (postgres)
+        object_rows = postgres_schema.objectRows(&error);
+    else
+        object_rows = sqliteObjectRows(db_path, &error);
+    if (!object_rows)
+        return fail(QStringLiteral("Count stored revision objects"));
     std::optional<qint64> postgres_bytes;
     if (postgres)
     {
@@ -288,13 +411,19 @@ int main(int argc, char **argv)
     output << (postgres ? "backend=postgres\n" : "backend=sqlite\n")
            << "pipes=" << count << "\n"
            << "junctions=" << count << "\n"
+           << "finalized_revisions=" << revision_count << "\n"
+           << "revision_object_rows=" << *object_rows << "\n"
            << "initial_save_ms=" << initial_save_ms << "\n"
            << "load_ms=" << load_ms << "\n"
            << "unchanged_save_ms=" << unchanged_save_ms << "\n"
            << "single_entity_edit_ms=" << single_edit_ms << "\n"
            << "finalize_ms=" << finalize_ms << "\n"
            << "create_branch_ms=" << branch_ms << "\n"
-           << "verify_history_ms=" << verify_ms << "\n";
+           << "verify_history_ms=" << verify_ms << "\n"
+           << "repeat_finalize_total_ms=" << total_repeated_finalize_ms << "\n"
+           << "repeat_finalize_max_ms=" << max_repeated_finalize_ms << "\n"
+           << "repeat_edit_total_ms=" << total_repeated_edit_ms << "\n"
+           << "revision_samples_number_edit_ms_finalize_ms=" << revision_samples.join(QLatin1Char(';')) << "\n";
     if (postgres)
         output << "postgres_schema_bytes=" << *postgres_bytes << "\n";
     else

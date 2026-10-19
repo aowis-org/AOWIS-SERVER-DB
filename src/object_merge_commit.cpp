@@ -1,6 +1,7 @@
 #include <aowis/db/database.h>
 #include "object_merge_state.h"
 #include "model_field_merge.h"
+#include "revision_root.h"
 
 #include <QMap>
 #include <QSet>
@@ -33,34 +34,18 @@ bool execute(QSqlQuery &query, QString *error)
     return false;
 }
 
-// A new working head is copied byte-for-byte from its finalized parent.
-// Guard against unjournaled SQL edits, including tombstone/version changes.
+// For a generation-zero working head, compare the materialized working rows
+// against the immutable finalized parent root, not the obsolete copied SQL
+// rows of the historical revision. This also detects unjournaled mutations.
 bool samePhysicalObjects(const QSqlDatabase &database, const StorageBackend &backend,
-                         const QUuid &working_uuid, const QUuid &parent_uuid, QString *error)
+                         const QUuid &working_uuid, const QByteArray &parent_root,
+                         QString *error)
 {
-    QSqlQuery query(database);
-    if (!query.prepare(QStringLiteral(
-            "SELECT EXISTS(SELECT object_uuid,kind,content,version,deleted "
-            "FROM revision_objects WHERE revision_uuid=? EXCEPT "
-            "SELECT object_uuid,kind,content,version,deleted "
-            "FROM revision_objects WHERE revision_uuid=?) OR "
-            "EXISTS(SELECT object_uuid,kind,content,version,deleted "
-            "FROM revision_objects WHERE revision_uuid=? EXCEPT "
-            "SELECT object_uuid,kind,content,version,deleted "
-            "FROM revision_objects WHERE revision_uuid=?)")))
+    if (parent_root.size() != 32 ||
+        !verifyWorkingObjectsAgainstRoot(database, backend, working_uuid, parent_root, error))
     {
-        setError(error, query.lastError().text());
-        return false;
-    }
-    query.addBindValue(backend.bindUuid(working_uuid));
-    query.addBindValue(backend.bindUuid(parent_uuid));
-    query.addBindValue(backend.bindUuid(parent_uuid));
-    query.addBindValue(backend.bindUuid(working_uuid));
-    if (!execute(query, error) || !query.next())
-        return false;
-    if (query.value(0).toBool())
-    {
-        setError(error, QStringLiteral("Merge target no longer matches its finalized parent"));
+        if (error != nullptr && error->isEmpty())
+            *error = QStringLiteral("Merge target no longer matches its finalized parent");
         return false;
     }
     return true;
@@ -267,7 +252,7 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
     // captured with the preview. This catches non-journal SQL modifications
     // even if they bypass revision generation counters.
     const std::optional<QByteArray> locked_state = mergePhysicalObjectDigest(
-        this->database_, *this->backend_, latest->uuid, error);
+        this->database_, *this->backend_, latest->uuid, QByteArray(), error);
     if (!locked_state || *locked_state != preview->left_physical_sha256)
     {
         if (locked_state)
@@ -277,7 +262,8 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
     // Preserve the stricter invariant for generation-zero heads: no
     // unjournaled physical difference from the finalized parent is allowed.
     if (latest->generation == 0 &&
-        !samePhysicalObjects(this->database_, *this->backend_, latest->uuid, left_uuid, error))
+        !samePhysicalObjects(this->database_, *this->backend_, latest->uuid,
+                             left->object_root_sha256, error))
         return fail();
     QSqlQuery lookup(this->database_);
     if (!lookup.prepare(QStringLiteral(

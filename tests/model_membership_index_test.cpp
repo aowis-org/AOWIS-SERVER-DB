@@ -5,6 +5,7 @@
 #include <QDebug>
 #include <QSqlDatabase>
 #include <QSqlQuery>
+#include <QStringList>
 #include <QTemporaryDir>
 
 using aowis::db::Database;
@@ -19,21 +20,28 @@ using aowis::db::OperationContext;
 
 namespace
 {
-NetworkHydraulic makeNetwork()
+NetworkHydraulic makeNetwork(int pipe_count = 1)
 {
     NetworkHydraulic network;
     network.uuid = createUuidV7();
     HydraulicNodeReservoir source;
     source.uuid = createUuidV7();
-    HydraulicNodeJunction destination;
-    destination.uuid = createUuidV7();
-    HydraulicLinkPipe pipe;
-    pipe.uuid = createUuidV7();
-    pipe.node_uuid_from = source.uuid;
-    pipe.node_uuid_to = destination.uuid;
     network.nodes_reservoirs.append(source);
-    network.nodes_junctions.append(destination);
-    network.links_pipes.append(pipe);
+    QUuid previous = source.uuid;
+    for (int index = 0; index < pipe_count; ++index)
+    {
+        HydraulicNodeJunction junction;
+        junction.uuid = createUuidV7();
+        junction.id = QStringLiteral("junction-%1").arg(index);
+        network.nodes_junctions.append(junction);
+        HydraulicLinkPipe pipe;
+        pipe.uuid = createUuidV7();
+        pipe.id = QStringLiteral("pipe-%1").arg(index);
+        pipe.node_uuid_from = previous;
+        pipe.node_uuid_to = junction.uuid;
+        network.links_pipes.append(pipe);
+        previous = junction.uuid;
+    }
     return network;
 }
 
@@ -166,8 +174,88 @@ int main(int argc, char **argv)
     }
     QSqlDatabase::removeDatabase(QStringLiteral("index-clone"));
 
+    // Finalized indexes are not materialized at all. Forks reconstruct
+    // transient working indexes from the authoritative Merkle snapshot.
+    {
+        QSqlDatabase inspection = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("index-finalized-absence"));
+        inspection.setDatabaseName(path);
+        REQUIRE(inspection.open());
+        REQUIRE(membershipCount(inspection, project->working_revision_uuid, first.uuid) == 0);
+        REQUIRE(membershipCount(inspection, project->working_revision_uuid, second.uuid) == 0);
+        QSqlQuery count(inspection);
+        REQUIRE(count.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE revision_uuid=?")));
+        count.addBindValue(project->working_revision_uuid.toRfc4122());
+        REQUIRE(count.exec() && count.next() && count.value(0).toInt() == 0);
+        inspection.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("index-finalized-absence"));
+
+    const std::optional<aowis::db::BranchInfo> reconstructed = db.createBranch(
+        actor, project->project_uuid, QStringLiteral("merkle-index-rebuild"),
+        project->working_revision_uuid, &error);
+    REQUIRE(reconstructed.has_value());
+    REQUIRE(db.loadHydraulicNetwork(actor, reconstructed->head_revision_uuid,
+                                    first.uuid, &error).has_value());
+    REQUIRE(db.loadHydraulicNetwork(actor, reconstructed->head_revision_uuid,
+                                    second.uuid, &error).has_value());
+    {
+        QSqlDatabase inspection = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("index-rebuilt-check"));
+        inspection.setDatabaseName(path);
+        REQUIRE(inspection.open());
+        REQUIRE(membershipCount(inspection, reconstructed->head_revision_uuid, first.uuid) == 3);
+        REQUIRE(membershipCount(inspection, reconstructed->head_revision_uuid, second.uuid) == 3);
+        QSqlQuery count(inspection);
+        REQUIRE(count.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE revision_uuid=?")));
+        count.addBindValue(reconstructed->head_revision_uuid.toRfc4122());
+        REQUIRE(count.exec() && count.next() && count.value(0).toInt() > 0);
+        inspection.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("index-rebuilt-check"));
+
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
     REQUIRE(db.loadHydraulicNetwork(actor, sealed->new_working_revision_uuid, first.uuid, &error).has_value());
+
+    // A fresh fork has no hydraulic membership index while it reconstructs
+    // the network. Exercise multiple 300-key fallback batches, then verify
+    // that only the newly created editable head holds SQL index rows.
+    const std::optional<aowis::db::ProjectCreation> large_project =
+        db.createProject(actor, QStringLiteral("Large fork"), &error);
+    REQUIRE(large_project.has_value());
+    const NetworkHydraulic large_network = makeNetwork(330);
+    REQUIRE(db.saveHydraulicNetwork(actor, large_project->main_branch_uuid,
+                                    0, large_network, &error));
+    const qint64 large_generation = db.revision(
+        actor, large_project->working_revision_uuid, &error)->generation;
+    const std::optional<aowis::db::Finalization> large_seal = db.finalize(
+        actor, large_project->main_branch_uuid, large_generation,
+        QStringLiteral("Large baseline"), {}, &error);
+    REQUIRE(large_seal.has_value());
+    const std::optional<aowis::db::BranchInfo> large_fork = db.createBranch(
+        actor, large_project->project_uuid, QStringLiteral("large-fork"),
+        large_seal->finalized_revision_uuid, &error);
+    REQUIRE(large_fork.has_value());
+    const std::optional<NetworkHydraulic> forked_model = db.loadHydraulicNetwork(
+        actor, large_fork->head_revision_uuid, large_network.uuid, &error);
+    REQUIRE(forked_model.has_value());
+    REQUIRE(forked_model->nodes_junctions.size() == 330);
+    REQUIRE(forked_model->links_pipes.size() == 330);
+    {
+        QSqlDatabase inspection = QSqlDatabase::addDatabase(
+            QStringLiteral("QSQLITE"), QStringLiteral("large-index-check"));
+        inspection.setDatabaseName(path);
+        REQUIRE(inspection.open());
+        REQUIRE(membershipCount(inspection, large_seal->finalized_revision_uuid,
+                                large_network.uuid) == 0);
+        REQUIRE(membershipCount(inspection, large_fork->head_revision_uuid,
+                                large_network.uuid) == 661);
+        inspection.close();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("large-index-check"));
+    REQUIRE(db.verifyProject(actor, large_project->project_uuid).valid);
     db.close();
     REQUIRE(db.openSqlite(path, &error));
     REQUIRE(db.verifyProject(actor, project->project_uuid).valid);
