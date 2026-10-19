@@ -1,10 +1,12 @@
 #include <aowis/db/model_persistence.h>
 #include <aowis/model/uuid.h>
 
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QDebug>
 #include <QFileInfo>
+#include <QList>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -15,6 +17,11 @@
 
 #include <cstdio>
 #include <optional>
+
+#ifdef Q_OS_LINUX
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
@@ -151,6 +158,64 @@ std::optional<qint64> sqliteObjectRows(const QString &path, QString *error)
 }
 }
 
+namespace
+{
+struct ProcessMemory
+{
+    qint64 resident_kb = -1;
+    qint64 high_water_kb = -1;
+};
+
+// Procfs files may report a length of zero even though they are readable.
+// QFile::atEnd() before the first read can therefore suppress the *entire*
+// scan on some Qt versions. Use stdio streaming rather than a size/EOF check.
+// Linux ru_maxrss gives an independent, kernel-maintained peak in KiB.
+ProcessMemory processMemory()
+{
+    ProcessMemory result;
+#ifdef Q_OS_LINUX
+    if (std::FILE *status = std::fopen("/proc/self/status", "r"))
+    {
+        char buffer[512];
+        while (std::fgets(buffer, sizeof(buffer), status) != nullptr)
+        {
+            long long value = -1;
+            if (std::sscanf(buffer, "VmRSS: %lld kB", &value) == 1)
+                result.resident_kb = value;
+            else if (std::sscanf(buffer, "VmHWM: %lld kB", &value) == 1)
+                result.high_water_kb = value;
+        }
+        std::fclose(status);
+    }
+    if (result.resident_kb < 0)
+    {
+        // /proc/self/statm reports pages. No Qt file-size or cached EOF
+        // behavior is involved in the fallback either.
+        if (std::FILE *statm = std::fopen("/proc/self/statm", "r"))
+        {
+            unsigned long long pages = 0;
+            unsigned long long resident_pages = 0;
+            if (std::fscanf(statm, "%llu %llu", &pages, &resident_pages) == 2)
+            {
+                const long page_bytes = sysconf(_SC_PAGESIZE);
+                if (page_bytes > 0)
+                    result.resident_kb = static_cast<qint64>(resident_pages) * page_bytes / 1024;
+            }
+            std::fclose(statm);
+        }
+    }
+    struct rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) == 0)
+    {
+        const qint64 peak = static_cast<qint64>(usage.ru_maxrss);
+        if (result.high_water_kb < peak)
+            result.high_water_kb = peak;
+    }
+#endif
+    return result;
+}
+}
+
 // An opt-in measurement tool, not a pass/fail CTest. Timing depends on the
 // filesystem, host hardware, Qt build, network size and database contents.
 // Keep this workload realistic but deterministic in structure: one reservoir,
@@ -163,6 +228,8 @@ int main(int argc, char **argv)
     const QStringList arguments = app.arguments();
     bool postgres = false;
     bool profile_phases = false;
+    bool measure_memory = false;
+    bool deep_verify = false;
     bool has_count = false;
     int count = 1000;
     int revision_count = 1;
@@ -172,19 +239,31 @@ int main(int argc, char **argv)
         const QString argument = arguments.at(index);
         if (argument == QStringLiteral("--help"))
         {
-            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile]\n"
+            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile] [--memory] [--deep-verify]\n"
                       "Default PIPE_COUNT: 1000; allowed range: 1..100000.\n"
                       "Default revisions: 1; allowed range: 1..100 finalized revisions.\n"
                       "Each additional revision changes one junction and finalizes.\n"
                       "SQLite uses a temporary file. PostgreSQL requires a dedicated\n"
                       "AOWIS_DB_TEST_PG_DB and libpq PG* connection settings;\n"
                       "a random temporary schema is created and deleted.\n"
-                      "--profile prints opt-in phase timings (microseconds) to stderr.\n";
+                      "--profile prints Merkle, network save and load timings to stderr.\n"
+                      "--memory prints current and peak process RSS at workload checkpoints.\n"
+                      "--deep-verify also replays object journals against Merkle revisions.\n";
             return 0;
         }
         if (argument == QStringLiteral("--profile") && !profile_phases)
         {
             profile_phases = true;
+            continue;
+        }
+        if (argument == QStringLiteral("--memory") && !measure_memory)
+        {
+            measure_memory = true;
+            continue;
+        }
+        if (argument == QStringLiteral("--deep-verify") && !deep_verify)
+        {
+            deep_verify = true;
             continue;
         }
         if (argument == QStringLiteral("--postgres") && !postgres)
@@ -209,7 +288,7 @@ int main(int argc, char **argv)
         const int parsed_count = argument.toInt(&number_ok);
         if (has_count || !number_ok || parsed_count < 1 || parsed_count > 100000)
         {
-            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile]\n"
+            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile] [--memory] [--deep-verify]\n"
                       "PIPE_COUNT must be an integer between 1 and 100000.\n";
             return 2;
         }
@@ -221,7 +300,42 @@ int main(int argc, char **argv)
     // the core's diagnostics before opening a database; normal test runs and
     // server processes keep profiling disabled by default.
     if (profile_phases)
+    {
         qputenv("AOWIS_DB_PROFILE_PHASES", "1");
+        qputenv("AOWIS_DB_PROFILE_SAVE", "1");
+        qputenv("AOWIS_DB_PROFILE_LOAD", "1");
+    }
+
+#ifndef Q_OS_LINUX
+    if (measure_memory)
+    {
+        errors << "--memory currently requires Linux /proc/self/status.\n";
+        return 2;
+    }
+#endif
+
+    // One line per stage, immediately to stderr: if the OS terminates a
+    // 100k-pipe run, its last successful checkpoint is still available.
+    const auto checkpoint = [measure_memory](const char *stage) {
+        if (!measure_memory)
+            return;
+        const ProcessMemory reading = processMemory();
+        std::fprintf(stderr,
+                     "aowis_db_memory stage=%s rss_kb=%lld peak_rss_kb=%lld\n",
+                     stage, static_cast<long long>(reading.resident_kb),
+                     static_cast<long long>(reading.high_water_kb));
+        std::fflush(stderr);
+    };
+    if (measure_memory)
+    {
+        const ProcessMemory startup = processMemory();
+        if (startup.resident_kb < 0 || startup.high_water_kb < 0)
+        {
+            errors << "Linux process memory counters are unavailable; cannot honor --memory.\n";
+            return 1;
+        }
+    }
+    checkpoint("startup");
 
     QString error;
     const auto fail = [&errors, &error](const QString &step) {
@@ -247,6 +361,7 @@ int main(int argc, char **argv)
     }
     else if (!database.openSqlite(db_path, &error))
         return fail(QStringLiteral("Open SQLite"));
+    checkpoint("database_open");
     const std::optional<aowis::db::UserInfo> administrator =
         database.bootstrapAdministrator(QStringLiteral("benchmark-admin"), &error);
     if (!administrator)
@@ -285,19 +400,26 @@ int main(int argc, char **argv)
         previous_node = junction.uuid;
     }
 
+    checkpoint("network_constructed");
     QElapsedTimer timer;
     timer.start();
     if (!database.saveHydraulicNetwork(actor, project->main_branch_uuid, 0, network, &error))
         return fail(QStringLiteral("Save network"));
     const qint64 initial_save_ms = timer.elapsed();
+    checkpoint("initial_save");
 
     timer.restart();
-    const std::optional<NetworkHydraulic> loaded = database.loadHydraulicNetwork(
-        actor, project->working_revision_uuid, network.uuid, &error);
-    if (!loaded || loaded->links_pipes.size() != count ||
-        loaded->nodes_junctions.size() != count)
-        return fail(QStringLiteral("Load network"));
-    const qint64 load_ms = timer.elapsed();
+    qint64 load_ms = -1;
+    {
+        const std::optional<NetworkHydraulic> loaded = database.loadHydraulicNetwork(
+            actor, project->working_revision_uuid, network.uuid, &error);
+        if (!loaded || loaded->links_pipes.size() != count ||
+            loaded->nodes_junctions.size() != count)
+            return fail(QStringLiteral("Load network"));
+        load_ms = timer.elapsed();
+        checkpoint("initial_load");
+    }
+    checkpoint("initial_load_released");
 
     const std::optional<aowis::db::RevisionInfo> before = database.revision(
         actor, project->working_revision_uuid, &error);
@@ -308,6 +430,7 @@ int main(int argc, char **argv)
                                        before->generation, network, &error))
         return fail(QStringLiteral("Save unchanged network"));
     const qint64 unchanged_save_ms = timer.elapsed();
+    checkpoint("unchanged_save");
 
     HydraulicNodeJunction updated_junction = network.nodes_junctions.first();
     updated_junction.elevation_m += 1.0;
@@ -328,6 +451,7 @@ int main(int argc, char **argv)
     if (!finalization)
         return fail(QStringLiteral("Finalize revision"));
     const qint64 finalize_ms = timer.elapsed();
+    checkpoint("first_finalize");
 
     // Revision-growth workload: every successive working revision inherits all
     // existing objects. Change only one junction before each finalization so
@@ -371,23 +495,31 @@ int main(int argc, char **argv)
             .arg(revision_number).arg(edit_ms).arg(next_finalize_ms));
     }
 
+    checkpoint("additional_revisions");
+
     // Confirm the newest working head actually inherited the last edit.
-    const std::optional<NetworkHydraulic> latest = database.loadHydraulicNetwork(
-        actor, current_working_revision, network.uuid, &error);
-    if (!latest)
-        return fail(QStringLiteral("Reload newest working revision"));
-    bool inherited = false;
-    for (const HydraulicNodeJunction &junction : latest->nodes_junctions)
+    // Release this complete network before branch creation; otherwise the
+    // benchmark would artificially retain several full copies at once.
     {
-        if (junction.uuid == updated_junction.uuid &&
-            junction.elevation_m == updated_junction.elevation_m)
-            inherited = true;
+        const std::optional<NetworkHydraulic> latest = database.loadHydraulicNetwork(
+            actor, current_working_revision, network.uuid, &error);
+        if (!latest)
+            return fail(QStringLiteral("Reload newest working revision"));
+        bool inherited = false;
+        for (const HydraulicNodeJunction &junction : latest->nodes_junctions)
+        {
+            if (junction.uuid == updated_junction.uuid &&
+                junction.elevation_m == updated_junction.elevation_m)
+                inherited = true;
+        }
+        if (!inherited)
+        {
+            error = QStringLiteral("Latest working model did not inherit the final edit");
+            return fail(QStringLiteral("Check revision inheritance"));
+        }
+        checkpoint("working_head_load");
     }
-    if (!inherited)
-    {
-        error = QStringLiteral("Latest working model did not inherit the final edit");
-        return fail(QStringLiteral("Check revision inheritance"));
-    }
+    checkpoint("working_head_load_released");
 
     timer.restart();
     const std::optional<aowis::db::BranchInfo> branch = database.createBranch(
@@ -396,6 +528,34 @@ int main(int argc, char **argv)
     if (!branch)
         return fail(QStringLiteral("Create branch"));
     const qint64 branch_ms = timer.elapsed();
+    checkpoint("branch_creation");
+
+    // A branch from revision 1 must not accidentally inherit later edits
+    // made to the main branch. Exercise a full load on the forked model.
+    timer.restart();
+    qint64 branch_load_ms = -1;
+    {
+        const std::optional<NetworkHydraulic> branch_model = database.loadHydraulicNetwork(
+            actor, branch->head_revision_uuid, network.uuid, &error);
+        if (!branch_model || branch_model->links_pipes.size() != count ||
+            branch_model->nodes_junctions.size() != count)
+            return fail(QStringLiteral("Verify forked network size"));
+        bool preserved_baseline = false;
+        for (const HydraulicNodeJunction &junction : branch_model->nodes_junctions)
+        {
+            if (junction.uuid == updated_junction.uuid &&
+                junction.elevation_m == network.nodes_junctions.first().elevation_m + 1.0)
+                preserved_baseline = true;
+        }
+        if (!preserved_baseline)
+        {
+            error = QStringLiteral("Forked revision did not preserve its finalized baseline");
+            return fail(QStringLiteral("Verify branch independence"));
+        }
+        branch_load_ms = timer.elapsed();
+        checkpoint("branch_load");
+    }
+    checkpoint("branch_load_released");
 
     timer.restart();
     const aowis::db::IntegrityReport report = database.verifyProject(
@@ -406,8 +566,25 @@ int main(int argc, char **argv)
         return fail(QStringLiteral("Verify finalized history"));
     }
     const qint64 verify_ms = timer.elapsed();
+    checkpoint("verify_history");
+
+    qint64 deep_verify_ms = -1;
+    if (deep_verify)
+    {
+        timer.restart();
+        const aowis::db::IntegrityReport deep_report = database.verifyProjectJournal(
+            actor, project->project_uuid);
+        if (!deep_report.valid || deep_report.checked_revisions != revision_count)
+        {
+            error = deep_report.error;
+            return fail(QStringLiteral("Verify journal/Merkle consistency"));
+        }
+        deep_verify_ms = timer.elapsed();
+        checkpoint("verify_journal");
+    }
 
     database.close();
+    checkpoint("database_closed");
     std::optional<qint64> object_rows;
     if (postgres)
         object_rows = postgres_schema.objectRows(&error);
@@ -433,11 +610,20 @@ int main(int argc, char **argv)
            << "single_entity_edit_ms=" << single_edit_ms << "\n"
            << "finalize_ms=" << finalize_ms << "\n"
            << "create_branch_ms=" << branch_ms << "\n"
+           << "branch_load_ms=" << branch_load_ms << "\n"
            << "verify_history_ms=" << verify_ms << "\n"
            << "repeat_finalize_total_ms=" << total_repeated_finalize_ms << "\n"
            << "repeat_finalize_max_ms=" << max_repeated_finalize_ms << "\n"
            << "repeat_edit_total_ms=" << total_repeated_edit_ms << "\n"
            << "revision_samples_number_edit_ms_finalize_ms=" << revision_samples.join(QLatin1Char(';')) << "\n";
+    if (deep_verify)
+        output << "verify_journal_ms=" << deep_verify_ms << "\n";
+    if (measure_memory)
+    {
+        const ProcessMemory final_memory = processMemory();
+        output << "process_rss_end_kb=" << final_memory.resident_kb << "\n"
+               << "process_peak_rss_kb=" << final_memory.high_water_kb << "\n";
+    }
     if (postgres)
         output << "postgres_schema_bytes=" << *postgres_bytes << "\n";
     else

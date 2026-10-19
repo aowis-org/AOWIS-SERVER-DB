@@ -872,6 +872,33 @@ int main(int argc, char **argv)
                 const std::optional<aowis::db::ProjectCreation> batch_project =
                     reopened.createProject(actor, QStringLiteral("PostgreSQL reference batches"), &error);
                 REQUIRE(batch_project.has_value());
+                // The PostgreSQL event guard must reject an event that skips
+                // sequence 1, even if an administrator has already advanced
+                // the working generation to 2. Bulk imports are allowed to
+                // pre-advance generation only when they append a gap-free
+                // sequence. Roll back this attempted SQL-level corruption.
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("BEGIN")));
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "UPDATE revisions SET generation=2,object_mode=1 WHERE uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_project->working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE(ddl.numRowsAffected() == 1);
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "INSERT INTO object_events(uuid,revision_uuid,object_uuid,actor_uuid,"
+                    "sequence,occurred_at_ms,kind,action,before_version,after_version,"
+                    "before_content,after_content,before_deleted) "
+                    "VALUES (?,?,?,?,2,1,'hydraulic.pipe','put',-1,1,NULL,?,1)")));
+                ddl.addBindValue(postgres_contract.bindUuid(createUuidV7()));
+                ddl.addBindValue(postgres_contract.bindUuid(batch_project->working_revision_uuid));
+                ddl.addBindValue(postgres_contract.bindUuid(createUuidV7()));
+                ddl.addBindValue(postgres_contract.bindUuid(saved_admin_uuid));
+                ddl.addBindValue(QByteArray("invalid journal gap"));
+                REQUIRE_SQL(ddl, !ddl.exec());
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK")));
+                REQUIRE(reopened.revision(actor, batch_project->working_revision_uuid,
+                                          &error)->generation == 0);
                 NetworkHydraulic batch_network;
                 batch_network.uuid = createUuidV7();
                 batch_network.id = QStringLiteral("PG-REFERENCE-BATCH");
@@ -960,6 +987,7 @@ int main(int argc, char **argv)
                 REQUIRE(ddl.value(0).toLongLong() == 521);
                 ddl.finish();
                 REQUIRE(reopened.verifyProject(actor, batch_project->project_uuid).valid);
+                REQUIRE(reopened.verifyProjectJournal(actor, batch_project->project_uuid).valid);
                 reopened.close();
             }
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(core_schema)));

@@ -8,12 +8,16 @@ STARTED=false
 
 usage() {
     cat <<'HELP'
-Usage: ./tools/benchmark_network_postgres.sh [PIPE_COUNT] [--revisions N]
+Usage: ./tools/benchmark_network_postgres.sh [PIPE_COUNT] [--revisions N] [--memory] [--deep-verify] [--profile]
 
 Run the opt-in AOWIS network-persistence benchmark against a disposable
 PostgreSQL 17 Docker Compose instance. Defaults to 1000 pipes. The container,
 test schema and all benchmark data are destroyed at exit. By default the
 benchmark finalizes one revision; --revisions N permits 1..100 revisions.
+--memory records AOWIS client RSS checkpoints and high-water mark (Linux).
+--deep-verify replays object journals against finalized Merkle snapshots.
+--profile emits opt-in detailed storage phase timings to stderr.
+PostgreSQL container memory is NOT included in the client RSS measurements.
 
 Set AOWIS_DB_BENCH_BUILD_DIR to use a different configured CMake build
 folder (default: build-linux-tests). No CTest tests are run.
@@ -24,28 +28,47 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
     exit 0
 fi
-if (( $# > 3 )); then
-    usage >&2
-    exit 2
-fi
 count=1000
-if (( $# > 0 )) && [[ "$1" != --revisions ]]; then
-    count="$1"
-    shift
-fi
+count_seen=false
+revision_seen=false
 revision_args=()
-if (( $# > 0 )); then
-    if (( $# != 2 )) || [[ "$1" != --revisions ]] ||
-       [[ ! "$2" =~ ^[1-9][0-9]*$ ]] || (( ${#2} > 3 )) || (( 10#$2 > 100 )); then
-        usage >&2
-        exit 2
-    fi
-    revision_args=(--revisions "$2")
-fi
-if [[ ! "$count" =~ ^[1-9][0-9]*$ ]] || (( ${#count} > 6 )) || (( 10#$count > 100000 )); then
-    printf 'PIPE_COUNT must be an integer between 1 and 100000.\n' >&2
-    exit 2
-fi
+extra_args=()
+while (( $# > 0 )); do
+    case "$1" in
+        --revisions)
+            if [[ "$revision_seen" == true ]] || (( $# < 2 )) ||
+               [[ ! "$2" =~ ^[1-9][0-9]*$ ]] || (( ${#2} > 3 )) ||
+               (( 10#$2 > 100 )); then
+                usage >&2
+                exit 2
+            fi
+            revision_seen=true
+            revision_args=(--revisions "$2")
+            shift 2
+            ;;
+        --memory|--deep-verify|--profile)
+            for existing in "${extra_args[@]}"; do
+                if [[ "$existing" == "$1" ]]; then
+                    usage >&2
+                    exit 2
+                fi
+            done
+            extra_args+=("$1")
+            shift
+            ;;
+        *)
+            if [[ "$count_seen" == true ]] ||
+               [[ ! "$1" =~ ^[1-9][0-9]*$ ]] || (( ${#1} > 6 )) ||
+               (( 10#$1 > 100000 )); then
+                usage >&2
+                exit 2
+            fi
+            count="$1"
+            count_seen=true
+            shift
+            ;;
+    esac
+done
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     printf 'Docker Engine and Compose v2 are required for the PostgreSQL benchmark.\n' >&2
     exit 1
@@ -107,4 +130,4 @@ if [[ ! -f "${build_dir}/CMakeCache.txt" ]]; then
 fi
 cmake --build "$build_dir" --target aowis-db-network-benchmark
 printf '=== PostgreSQL network benchmark: %s pipes ===\n' "$count"
-"${build_dir}/aowis-db-network-benchmark" "$count" "${revision_args[@]}" --postgres
+"${build_dir}/aowis-db-network-benchmark" "$count" "${revision_args[@]}" "${extra_args[@]}" --postgres

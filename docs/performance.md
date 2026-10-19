@@ -48,6 +48,68 @@ For the high-end network case, begin with one revision before running many:
 ./build-linux-tests/aowis-db-network-benchmark 100000 --revisions 1
 ```
 
+### Large-network stress and peak memory (Linux, opt-in)
+
+First establish a baseline at 10,000 pipes, then try 100,000. The latter can
+consume substantial RAM, CPU and temporary disk space. These are intentionally
+**not CTest tests**, and there are no timing or memory pass/fail thresholds.
+
+```bash
+cmake --build build-linux-tests --target aowis-db-network-benchmark
+./build-linux-tests/aowis-db-network-benchmark 10000 --revisions 3 --memory --deep-verify \
+    2>&1 | tee /tmp/aowis-db-stress-10k.log
+./build-linux-tests/aowis-db-network-benchmark 100000 --revisions 1 --memory --deep-verify \
+    2>&1 | tee /tmp/aowis-db-stress-100k.log
+```
+
+The 100,000-pipe case creates 100,000 junctions, 100,000 pipes and one
+reservoir. It saves the complete model, loads and resaves it, edits one
+junction, finalizes the first revision, creates a branch, reloads the branch
+and checks it retains the finalized baseline, then verifies history. With
+`--deep-verify` it additionally replays the journal against each Merkle root.
+For larger revision histories, use `--revisions 3` first, and only then
+consider larger counts; replaying full histories can be expensive.
+
+`--memory` prints `aowis_db_memory stage=... rss_kb=... peak_rss_kb=...`
+lines **immediately to stderr** after each major operation, including model
+construction, initial save, first seal, new revisions, branch creation,
+branch reload, and verification. The high-water mark comes from Linux
+`/proc/self/status` (`VmHWM`), so it captures peak resident memory reached
+between checkpoints; `rss_kb` is current process RSS. Memory includes Qt,
+network fixture copies, SQLite client libraries and all other memory in the
+**benchmark process**; it is not database-engine-only allocation profiling.
+The final result includes `process_peak_rss_kb` and `process_rss_end_kb`.
+The memory option is Linux-only. If the OS terminates the process, the last
+printed checkpoint remains available even though the final result is absent.
+
+`--deep-verify` adds `verify_journal_ms` to the ordinary benchmark result and
+checks that the Step 1 journal-to-Merkle verifier accepts all finalized
+revisions. `branch_load_ms` measures loading the independently forked model;
+the benchmark checks that subsequent main-branch edits have not leaked into
+that fork. Both new checks are opt-in only where explicitly indicated, except
+that branch reload/inheritance checks run for every benchmark invocation.
+
+For PostgreSQL, start small before moving to larger disposable models:
+
+```bash
+./tools/benchmark_network_postgres.sh 10000 --revisions 1 --memory --deep-verify \
+    2>&1 | tee /tmp/aowis-db-postgres-stress-10k.log
+# Only after examining the 10k result and available host memory:
+./tools/benchmark_network_postgres.sh 100000 --revisions 1 --memory --deep-verify \
+    2>&1 | tee /tmp/aowis-db-postgres-stress-100k.log
+```
+
+**Important:** On PostgreSQL, `--memory` measures only the AOWIS benchmark
+client's RSS. The PostgreSQL server runs in a separate Docker container with
+independent memory consumption. Monitor its container memory with Docker if
+needed; do **not** interpret client RSS as total PostgreSQL workload RAM.
+The disposable Docker container and its data are removed on exit.
+
+If preserving shell pipeline failures matters in your terminal, use
+`set -o pipefail` before the `tee` commands. Avoid running simultaneous stress
+benchmarks when making comparisons: CPU contention, I/O, database caching and
+other workloads change both timing and memory behavior.
+
 For each run, record these results:
 
 - `finalized_revisions`: number of finalized main-branch revisions.
@@ -124,9 +186,10 @@ conclusions; do not assume small-network timings extrapolate linearly.
 uses the whole-network save API. They intentionally measure different workloads.
 SQLite file bytes count the final database file after closing the connection,
 not transient WAL peaks or process memory. PostgreSQL schema bytes count its
-relation storage only, not cluster overhead or WAL. Benchmarking concurrent editors and peak memory remains separate follow-up
-work. The optional `--revisions` workload measures history growth, but not
-peak RAM or simultaneous editing throughput.
+relation storage only, not cluster overhead or WAL. The opt-in `--memory`
+checkpoints now report **client-process** resident memory and high-water
+usage. Benchmarking simultaneous editing throughput remains separate work;
+PostgreSQL server/container RAM is not included in client RSS.
 
 ## Profile first-seal and branch phases (opt-in)
 
@@ -357,3 +420,70 @@ With `--profile`, compare `merkle_bulk_build`'s `construct_hash_nodes` and
 `content_nodes` `hash_and_deduplicate` phase. The latter no longer repeats
 SHA-256 work on all Merkle nodes. First-seal time can still vary with CPU,
 storage and concurrent build/test load.
+
+## Diagnose 100k memory and PostgreSQL import/load latency
+
+The `--memory` benchmark option reads `/proc/self/status` via a streaming
+reader (procfs reports zero file size on many kernels), falls back to
+`/proc/self/statm` for current RSS and checks `getrusage(RUSAGE_SELF)` for
+peak RSS. All values are in KiB and refer to the **AOWIS benchmark process**.
+If counters are unavailable, the benchmark now fails instead of silently
+reporting `-1` at every checkpoint. PostgreSQL's Docker container has
+separate server memory consumption; client RSS is not its total footprint.
+
+The benchmark's `--profile` option now enables three complementary traces:
+`aowis_db_profile` (Merkle and transaction phases),
+`aowis_network_save_profile` (validation, lookup, fresh insert, indexes,
+group and commit), and `aowis_network_load_profile` (root lookup, indexed
+membership join, fallback lookups and decoding). The load trace reports
+`referenced`, `indexed` and `fallback` counts; `fallback` should usually be
+zero for a completely materialized working branch.
+
+Start with a disposable **1,000- or 10,000-pipe** PostgreSQL run to identify
+the 140-second fresh-network import and 48-second branch-load path without
+risking an unnecessarily costly 100k run:
+
+```bash
+./tools/benchmark_network_postgres.sh 10000 --revisions 1 --memory --profile     2>&1 | tee /tmp/aowis-db-postgres-diagnostics-10k.log
+```
+
+In the log, compare `aowis_network_save_profile writes_ms` with
+`index_ms`, then compare `aowis_network_load_profile member_scan_ms` with
+`fallback_ms` and `decode_ms`. The PostgreSQL fresh-insert routine currently
+updates the same revision generation once per object; a large number of
+PostgreSQL MVCC versions is a plausible cause of disproportionate import
+latency, **but it needs measurement before changing the event/trigger
+invariants**. Do not relax the immutable event guard for a speedup.
+
+Once memory counters work, repeat the 100k SQLite run with `--memory`, and
+measure PostgreSQL server memory separately if proceeding to 100k there.
+
+### PostgreSQL large-network import and working-head reads
+
+The PostgreSQL fresh-network importer advances `revisions.generation` once
+per 128-object JSON batch, rather than updating the same revision row once
+per object. It still inserts one immutable object event per object, with
+consecutive original sequence numbers. The database event trigger enforces
+that each event extends the journal by exactly one and cannot exceed the
+working generation; a bulk batch that fails halfway aborts its enclosing
+transaction. SQLite and non-fresh edits retain their existing checked paths.
+
+This avoids retaining tens of thousands of uncommitted versions of the same
+revision row and makes later SQL foreign-key and trigger checks substantially
+less expensive. The storage schema, event payloads, final Merkle root, and
+revision-generation API are unchanged. A PostgreSQL contract test exercises
+multiple 128-object batches, replay verification, and rejection of an event
+sequence gap.
+
+On large PostgreSQL working networks (512 or more referenced entities), model
+loads now fetch the exact UUIDs listed in the network root through bounded
+revision/object primary-key requests. This avoids a highly unstable
+PostgreSQL join plan immediately following finalize/branch materialization.
+Missing references, object-kind mismatches and tombstones still fail through
+the normal decoder checks. Smaller networks and SQLite retain indexed joins.
+
+With `--profile`, working loads report `direct_lookup` separately from
+`indexed`; the `member_scan_ms` phase measures the selected lookup strategy.
+The benchmark should show whether this fixes the former 140-second PostgreSQL
+10,000-pipe first save and 47-second branch-load regression. No performance
+improvement is asserted until a live PostgreSQL benchmark confirms it.

@@ -181,8 +181,10 @@ bool fetchIndexedNetworkObjectsForSave(const StorageBackend &backend,
 // versions to read or reconcile. The caller has already checked permissions,
 // revision generation, all incoming UUIDs and network-wide validation inside
 // a write transaction. Use reusable statements for the same writes produced
-// by modifyObjectInTransaction: one object row, one generation increment and
-// one immutable journal event per entity, in exactly the input order.
+// by modifyObjectInTransaction: one object row and one immutable journal
+// event per entity, in the same sequence order. PostgreSQL advances the
+// generation once per bounded batch while a gap-free trigger validates each
+// event; SQLite retains its checked per-object generation increments.
 //
 // Do not use this path for replacements, deletions, tombstones or UUIDs
 // already present in the revision. Those retain the checked general path.
@@ -216,9 +218,9 @@ bool insertFreshNetworkObjects(const StorageBackend &backend,
 
     // A Qt/QPSQL exec is a network round trip. Sending three statements for
     // each entity (object, generation, event) dominates large fresh imports.
-    // The backend's guarded PL/pgSQL function performs exactly those same
-    // operations in the original order, within this transaction, using
-    // bounded JSON batches. Existing objects and SQLite retain their paths.
+    // The backend's guarded PL/pgSQL function advances generation once per
+    // bounded JSON batch and appends every object and event in original order,
+    // within this transaction. Existing objects and SQLite retain their paths.
     if (database.driverName() == QStringLiteral("QPSQL"))
     {
         QSqlQuery batch(database);
@@ -1592,6 +1594,19 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetwork(
 std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
     const QUuid &revision_uuid, const QUuid &network_uuid, QString *error) const
 {
+    // Opt-in diagnostic only: separate indexed joins (or direct PK lookups)
+    // from missing-members fallback and model decoding.
+    const bool profile_load = qEnvironmentVariableIsSet("AOWIS_DB_PROFILE_LOAD");
+    QElapsedTimer load_clock;
+    if (profile_load)
+        load_clock.start();
+    qint64 root_ms = 0;
+    qint64 members_ms = 0;
+    qint64 fallback_ms = 0;
+    qsizetype referenced_count = 0;
+    qsizetype indexed_count = 0;
+    qsizetype direct_lookup_count = 0;
+    qsizetype fallback_count = 0;
     const std::optional<RevisionInfo> revision = revisionUnchecked(revision_uuid, error);
     if (!revision)
         return std::nullopt;
@@ -1622,6 +1637,9 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
             return std::nullopt;
         }
         const QSet<QUuid> references = referencedIds(*index);
+        referenced_count = references.size();
+        if (profile_load)
+            root_ms = load_clock.elapsed();
         const std::optional<QVector<MerkleObjectRecord>> records =
             readRevisionObjectsSelected(this->database_, revision->object_root_sha256,
                                         references, error);
@@ -1633,6 +1651,8 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
             rows.insert(record.uuid, ModelObject{record.uuid, record.kind,
                                                  record.content, record.version, record.deleted});
         }
+        if (profile_load)
+            members_ms = load_clock.elapsed() - root_ms;
     }
     else
     {
@@ -1667,33 +1687,58 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
             return std::nullopt;
         }
         const QSet<QUuid> references = referencedIds(*index);
-        QSqlQuery members(this->database_);
-        if (!members.prepare(QStringLiteral(
-                "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
-                "FROM hydraulic_network_members m JOIN revision_objects o "
-                "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
-                "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+        referenced_count = references.size();
+        if (profile_load)
+            root_ms = load_clock.elapsed();
+        // PostgreSQL can choose a catastrophically expensive join plan on a
+        // freshly transferred working head (before autovacuum/ANALYZE catches
+        // up). The decoded root already supplies the exact UUID set, so for
+        // large QPSQL networks read it by bounded revision/object PK lookups
+        // instead. This also handles an initially empty membership index when
+        // a new branch is materialized. The shared record/type checks below
+        // still require exactly the requested UUIDs and valid object types.
+        const bool indexed_direct =
+            this->database_.driverName() == QStringLiteral("QPSQL") && references.size() >= 512;
+        if (indexed_direct)
         {
-            assignError(error, members.lastError().text());
-            return std::nullopt;
+            if (!fetchObjectsForNetworkSave(*this->backend_, this->database_,
+                                            revision_uuid, references, rows, error))
+                return std::nullopt;
         }
-        members.addBindValue(this->backend_->bindUuid(revision_uuid));
-        members.addBindValue(this->backend_->bindUuid(network_uuid));
-        if (!members.exec())
+        else
         {
-            assignError(error, members.lastError().text());
-            return std::nullopt;
+            QSqlQuery members(this->database_);
+            if (!members.prepare(QStringLiteral(
+                    "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
+                    "FROM hydraulic_network_members m JOIN revision_objects o "
+                    "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
+                    "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+            {
+                assignError(error, members.lastError().text());
+                return std::nullopt;
+            }
+            members.addBindValue(this->backend_->bindUuid(revision_uuid));
+            members.addBindValue(this->backend_->bindUuid(network_uuid));
+            if (!members.exec())
+            {
+                assignError(error, members.lastError().text());
+                return std::nullopt;
+            }
+            while (members.next())
+            {
+                const QUuid uuid = this->backend_->readUuid(members.value(0));
+                if (!references.contains(uuid))
+                    continue; // Root changed, membership index not committed yet.
+                rows.insert(uuid, ModelObject{uuid, members.value(1).toString(),
+                            members.value(2).toByteArray(), members.value(3).toLongLong(),
+                            members.value(4).toBool()});
+            }
+            members.finish();
         }
-        while (members.next())
-        {
-            const QUuid uuid = this->backend_->readUuid(members.value(0));
-            if (!references.contains(uuid))
-                continue; // Root changed, membership index not committed yet.
-            rows.insert(uuid, ModelObject{uuid, members.value(1).toString(),
-                        members.value(2).toByteArray(), members.value(3).toLongLong(),
-                        members.value(4).toBool()});
-        }
-        members.finish();
+        indexed_count = indexed_direct ? 0 : rows.size();
+        direct_lookup_count = indexed_direct ? rows.size() : 0;
+        if (profile_load)
+            members_ms = load_clock.elapsed() - root_ms;
         // An incomplete ownership index is expected immediately after a
         // branch is materialized. Fetch missing UUIDs in bounded batches so
         // creating a large branch does not issue one query per pipe/junction.
@@ -1702,10 +1747,13 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
         for (QHash<QUuid, ModelObject>::const_iterator item = rows.cbegin();
              item != rows.cend(); ++item)
             missing.remove(item.key());
+        fallback_count = missing.size();
         if (!missing.isEmpty() &&
             !fetchObjectsForNetworkSave(*this->backend_, this->database_,
                                         revision_uuid, missing, rows, error))
             return std::nullopt;
+        if (profile_load)
+            fallback_ms = load_clock.elapsed() - root_ms - members_ms;
         if (rows.size() != references.size())
         {
             assignError(error, QStringLiteral("Missing referenced hydraulic entity"));
@@ -1750,6 +1798,23 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
                      rows, seen, error)) return std::nullopt;
     if (!restoreList(result.map_labels, index->map_labels, QStringLiteral("hydraulic.map_label"),
                      rows, seen, error)) return std::nullopt;
+    if (profile_load)
+    {
+        const qint64 total_ms = load_clock.elapsed();
+        qInfo().noquote().nospace()
+            << "aowis_network_load_profile"
+            << " backend=" << this->database_.driverName()
+            << " finalized=" << (revision->finalized ? 1 : 0)
+            << " referenced=" << referenced_count
+            << " indexed=" << indexed_count
+            << " direct_lookup=" << direct_lookup_count
+            << " fallback=" << fallback_count
+            << " root_ms=" << root_ms
+            << " member_scan_ms=" << members_ms
+            << " fallback_ms=" << fallback_ms
+            << " decode_ms=" << (total_ms - root_ms - members_ms - fallback_ms)
+            << " total_ms=" << total_ms;
+    }
     return result;
 }
 

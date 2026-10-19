@@ -382,7 +382,10 @@ measures storage, network load, single-entity edits, finalization and branch
 creation at selected network sizes. PostgreSQL can be benchmarked using
 `./tools/benchmark_network_postgres.sh 10000`, which starts and removes an
 isolated Docker test instance. Both modes run separately from CTest, so large
-workloads never slow the normal regression suite.
+workloads never slow the normal regression suite. For 100,000-pipe stress runs,
+pass `--memory` to record Linux process RSS checkpoints and `--deep-verify` to
+replay the history journal against immutable Merkle snapshots; see
+[stress-testing instructions](docs/performance.md#large-network-stress-and-peak-memory-linux-opt-in).
 
 The bulk first-seal path uses insert-returned identities to avoid rereading
 fresh immutable content, while independently verifying reused content and

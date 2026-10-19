@@ -566,22 +566,46 @@ BEGIN
 END
 $aowis$)SQL",
     R"SQL(CREATE TRIGGER immutable_revision_identity BEFORE UPDATE ON revisions FOR EACH ROW EXECUTE FUNCTION aowis_guard_immutable_revision_identity())SQL",
-    // The application validates a complete new hydraulic network before
-    // entering this function. It does not bypass the normal row triggers:
-    // revision generation and each immutable journal event still advance
-    // together, one object at a time. A JSON array merely amortizes QPSQL
-    // client/server round trips; all writes share the caller's transaction.
+    // The application validates each fresh hydraulic network before entering
+    // this function. Advance the revision generation once per 128-item batch,
+    // not once per object: PostgreSQL retains each uncommitted UPDATE version
+    // until the transaction ends. Thousands of updates to one revisions row
+    // create pathological visibility chains for later per-row FK checks.
+    // Each immutable event still receives its original consecutive sequence,
+    // and the event trigger independently requires a gap-free journal.
     R"SQL(CREATE FUNCTION aowis_insert_fresh_network_objects(
         p_revision_uuid UUID, p_actor_uuid UUID, p_rows JSONB)
     RETURNS BIGINT LANGUAGE plpgsql AS $aowis$
 DECLARE
     item RECORD;
     content_bytes BYTEA;
-    next_generation BIGINT;
+    first_generation BIGINT;
+    current_generation BIGINT;
     inserted_count BIGINT := 0;
+    batch_count BIGINT;
 BEGIN
     IF jsonb_typeof(p_rows) IS DISTINCT FROM 'array' THEN
         RAISE EXCEPTION 'expected fresh-network JSON array' USING ERRCODE = '22023';
+    END IF;
+    batch_count := jsonb_array_length(p_rows);
+    IF batch_count = 0 THEN
+        RETURN 0;
+    END IF;
+    SELECT generation INTO first_generation FROM revisions
+        WHERE uuid=p_revision_uuid AND state='working' AND object_mode=1 FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'working revision generation conflict' USING ERRCODE = '23514';
+    END IF;
+    -- An already incomplete journal must not be extended by a bulk import.
+    SELECT COALESCE(MAX(sequence), 0) INTO current_generation
+        FROM object_events WHERE revision_uuid=p_revision_uuid;
+    IF current_generation <> first_generation THEN
+        RAISE EXCEPTION 'working revision object journal gap' USING ERRCODE = '23514';
+    END IF;
+    UPDATE revisions SET generation=generation+batch_count
+        WHERE uuid=p_revision_uuid AND state='working';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'working revision generation conflict' USING ERRCODE = '23514';
     END IF;
     FOR item IN
         SELECT value FROM jsonb_array_elements(p_rows) WITH ORDINALITY AS incoming(value, ordinal)
@@ -591,29 +615,32 @@ BEGIN
         INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted)
         VALUES (p_revision_uuid,(item.value->>'object_uuid')::UUID,
                 item.value->>'kind',content_bytes,1,0);
-        UPDATE revisions SET generation=generation+1
-        WHERE uuid=p_revision_uuid AND state='working'
-        RETURNING generation INTO next_generation;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'working revision generation conflict' USING ERRCODE = '23514';
-        END IF;
+        inserted_count := inserted_count+1;
         INSERT INTO object_events(uuid,revision_uuid,object_uuid,actor_uuid,
             sequence,occurred_at_ms,kind,action,before_version,after_version,
             before_content,after_content,before_deleted)
         VALUES ((item.value->>'event_uuid')::UUID,p_revision_uuid,
-                (item.value->>'object_uuid')::UUID,p_actor_uuid,next_generation,
+                (item.value->>'object_uuid')::UUID,p_actor_uuid,
+                first_generation+inserted_count,
                 (item.value->>'occurred_at_ms')::BIGINT,item.value->>'kind',
                 'put',-1,1,NULL,content_bytes,1);
-        inserted_count := inserted_count+1;
     END LOOP;
     RETURN inserted_count;
 END
 $aowis$)SQL",
     R"SQL(CREATE FUNCTION aowis_guard_object_event_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
+    -- A single-object edit increments generation first and then appends its
+    -- event. A fresh import increments generation for its entire batch first.
+    -- In either case each event must extend the contiguous journal by exactly
+    -- one and must never refer to a generation beyond the current head.
     IF NOT EXISTS (SELECT 1 FROM revisions r WHERE r.uuid=NEW.revision_uuid
-               AND r.state='working' AND r.object_mode=1 AND r.generation=NEW.sequence) THEN
-        RAISE EXCEPTION 'object event must match current revision' USING ERRCODE = '23514';
+               AND r.state='working' AND r.object_mode=1
+               AND r.generation>=NEW.sequence)
+       OR NEW.sequence IS DISTINCT FROM
+          (SELECT COALESCE(MAX(e.sequence), 0)+1 FROM object_events e
+           WHERE e.revision_uuid=NEW.revision_uuid) THEN
+        RAISE EXCEPTION 'object event must extend current revision journal' USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END
