@@ -390,69 +390,132 @@ BEGIN
 END
 $aowis$)SQL",
     R"SQL(CREATE TRIGGER finalize_requires_snapshot BEFORE UPDATE OF state ON revisions FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalize_requires_snapshot())SQL",
+    // A statement-level guard checks the complete changed set once. This
+    // retains the finalized-revision invariant without an indexed revision
+    // lookup for every row during large working-state transfers.
     R"SQL(CREATE FUNCTION aowis_guard_finalized_hydraulic_member_delete() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized' THEN
+    IF EXISTS (
+        SELECT 1 FROM old_rows AS affected
+        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
+        WHERE revision.state='finalized'
+    ) THEN
         RAISE EXCEPTION 'finalized network membership is immutable' USING ERRCODE = '23514';
     END IF;
-    RETURN OLD;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER finalized_hydraulic_member_delete BEFORE DELETE ON hydraulic_network_members FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalized_hydraulic_member_delete())SQL",
+    R"SQL(CREATE TRIGGER finalized_hydraulic_member_delete AFTER DELETE ON hydraulic_network_members
+    REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION aowis_guard_finalized_hydraulic_member_delete())SQL",
+    // A statement-level guard checks the complete changed set once. This
+    // retains the finalized-revision invariant without an indexed revision
+    // lookup for every row during large working-state transfers.
     R"SQL(CREATE FUNCTION aowis_guard_finalized_hydraulic_member_insert() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized' THEN
+    IF EXISTS (
+        SELECT 1 FROM new_rows AS affected
+        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
+        WHERE revision.state='finalized'
+    ) THEN
         RAISE EXCEPTION 'finalized network membership is immutable' USING ERRCODE = '23514';
     END IF;
-    RETURN NEW;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER finalized_hydraulic_member_insert BEFORE INSERT ON hydraulic_network_members FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalized_hydraulic_member_insert())SQL",
+    R"SQL(CREATE TRIGGER finalized_hydraulic_member_insert AFTER INSERT ON hydraulic_network_members
+    REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION aowis_guard_finalized_hydraulic_member_insert())SQL",
+    // A statement-level guard checks the complete changed set once. This
+    // retains the finalized-revision invariant without an indexed revision
+    // lookup for every row during large working-state transfers.
     R"SQL(CREATE FUNCTION aowis_guard_finalized_hydraulic_reference_delete() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized' THEN
+    IF EXISTS (
+        SELECT 1 FROM old_rows AS affected
+        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
+        WHERE revision.state='finalized'
+    ) THEN
         RAISE EXCEPTION 'finalized hydraulic references are immutable' USING ERRCODE = '23514';
     END IF;
-    RETURN OLD;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER finalized_hydraulic_reference_delete BEFORE DELETE ON hydraulic_network_references FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalized_hydraulic_reference_delete())SQL",
+    R"SQL(CREATE TRIGGER finalized_hydraulic_reference_delete AFTER DELETE ON hydraulic_network_references
+    REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION aowis_guard_finalized_hydraulic_reference_delete())SQL",
+    // A statement-level guard checks the complete changed set once. This
+    // retains the finalized-revision invariant without an indexed revision
+    // lookup for every row during large working-state transfers.
     R"SQL(CREATE FUNCTION aowis_guard_finalized_hydraulic_reference_insert() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized' THEN
+    IF EXISTS (
+        SELECT 1 FROM new_rows AS affected
+        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
+        WHERE revision.state='finalized'
+    ) THEN
         RAISE EXCEPTION 'finalized hydraulic references are immutable' USING ERRCODE = '23514';
     END IF;
-    RETURN NEW;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER finalized_hydraulic_reference_insert BEFORE INSERT ON hydraulic_network_references FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalized_hydraulic_reference_insert())SQL",
+    R"SQL(CREATE TRIGGER finalized_hydraulic_reference_insert AFTER INSERT ON hydraulic_network_references
+    REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION aowis_guard_finalized_hydraulic_reference_insert())SQL",
+    // A statement-level guard checks the complete changed set once. This
+    // retains the finalized-revision invariant without an indexed revision
+    // lookup for every row during large working-state transfers.
     R"SQL(CREATE FUNCTION aowis_guard_finalized_object_delete() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized' THEN
+    IF EXISTS (
+        SELECT 1 FROM old_rows AS affected
+        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
+        WHERE revision.state='finalized'
+    ) THEN
         RAISE EXCEPTION 'finalized objects are immutable' USING ERRCODE = '23514';
     END IF;
-    RETURN OLD;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER finalized_object_delete BEFORE DELETE ON revision_objects FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalized_object_delete())SQL",
+    R"SQL(CREATE TRIGGER finalized_object_delete AFTER DELETE ON revision_objects
+    REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION aowis_guard_finalized_object_delete())SQL",
+    // A statement-level guard checks the complete changed set once. This
+    // retains the finalized-revision invariant without an indexed revision
+    // lookup for every row during large working-state transfers.
     R"SQL(CREATE FUNCTION aowis_guard_finalized_object_insert() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized' THEN
+    IF EXISTS (
+        SELECT 1 FROM new_rows AS affected
+        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
+        WHERE revision.state='finalized'
+    ) THEN
         RAISE EXCEPTION 'finalized objects are immutable' USING ERRCODE = '23514';
     END IF;
-    RETURN NEW;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER finalized_object_insert BEFORE INSERT ON revision_objects FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalized_object_insert())SQL",
+    R"SQL(CREATE TRIGGER finalized_object_insert AFTER INSERT ON revision_objects
+    REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION aowis_guard_finalized_object_insert())SQL",
+    // A statement-level guard checks the complete changed set once. This
+    // retains the finalized-revision invariant without an indexed revision
+    // lookup for every row during large working-state transfers.
     R"SQL(CREATE FUNCTION aowis_guard_finalized_object_update() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized' THEN
+    IF EXISTS (
+        SELECT 1 FROM old_rows AS affected
+        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
+        WHERE revision.state='finalized'
+    ) THEN
         RAISE EXCEPTION 'finalized objects are immutable' USING ERRCODE = '23514';
     END IF;
-    RETURN NEW;
+    RETURN NULL;
 END
 $aowis$)SQL",
-    R"SQL(CREATE TRIGGER finalized_object_update BEFORE UPDATE ON revision_objects FOR EACH ROW EXECUTE FUNCTION aowis_guard_finalized_object_update())SQL",
+    R"SQL(CREATE TRIGGER finalized_object_update AFTER UPDATE ON revision_objects
+    REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION aowis_guard_finalized_object_update())SQL",
     R"SQL(CREATE FUNCTION aowis_guard_finalized_parents_readonly_insert() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
     IF (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized' THEN

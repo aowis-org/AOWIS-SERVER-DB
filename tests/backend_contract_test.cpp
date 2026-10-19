@@ -344,6 +344,66 @@ int main(int argc, char **argv)
             REQUIRE_SQL(ddl, ddl.exec());
             ddl.finish();
 
+            // Working-state guards must allow legitimate multi-row inserts,
+            // including the exact object and hydraulic tables copied during
+            // finalization. Insert test rows before the revision is sealed.
+            const QUuid network_object_uuid = QUuid::createUuid();
+            const QUuid member_a_uuid = QUuid::createUuid();
+            const QUuid member_b_uuid = QUuid::createUuid();
+            const QUuid orphan_a_uuid = QUuid::createUuid();
+            const QUuid orphan_b_uuid = QUuid::createUuid();
+            const QUuid spare_member_uuid = QUuid::createUuid();
+            const QList<QUuid> working_object_ids{
+                network_object_uuid, member_a_uuid, member_b_uuid,
+                orphan_a_uuid, orphan_b_uuid, spare_member_uuid
+            };
+            {
+                QSqlQuery objects(pg_connection);
+                REQUIRE_SQL(objects, objects.prepare(QStringLiteral(
+                    "INSERT INTO revision_objects"
+                    "(revision_uuid,object_uuid,kind,content,version,deleted) "
+                    "VALUES(?,?,?,?,1,0)")));
+                for (qsizetype index = 0; index < working_object_ids.size(); ++index)
+                {
+                    const QString kind = index == 0 ? QStringLiteral("network")
+                        : ((index == 3 || index == 4) ? QStringLiteral("orphan")
+                                                     : QStringLiteral("entity"));
+                    objects.bindValue(0, postgres_contract.bindUuid(revision_uuid));
+                    objects.bindValue(1, postgres_contract.bindUuid(working_object_ids.at(index)));
+                    objects.bindValue(2, kind);
+                    objects.bindValue(3, QByteArray("test-content"));
+                    REQUIRE_SQL(objects, objects.exec());
+                }
+                objects.finish();
+                QSqlQuery members(pg_connection);
+                REQUIRE_SQL(members, members.prepare(QStringLiteral(
+                    "INSERT INTO hydraulic_network_members"
+                    "(revision_uuid,network_uuid,entity_uuid) VALUES(?,?,?)")));
+                for (const QUuid &member_uuid : {member_a_uuid, member_b_uuid})
+                {
+                    members.bindValue(0, postgres_contract.bindUuid(revision_uuid));
+                    members.bindValue(1, postgres_contract.bindUuid(network_object_uuid));
+                    members.bindValue(2, postgres_contract.bindUuid(member_uuid));
+                    REQUIRE_SQL(members, members.exec());
+                }
+                members.finish();
+                QSqlQuery refs(pg_connection);
+                REQUIRE_SQL(refs, refs.prepare(QStringLiteral(
+                    "INSERT INTO hydraulic_network_references"
+                    "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
+                    "VALUES(?,?,?,?,?)")));
+                for (const QString &field : {QStringLiteral("upstream"), QStringLiteral("downstream")})
+                {
+                    refs.bindValue(0, postgres_contract.bindUuid(revision_uuid));
+                    refs.bindValue(1, postgres_contract.bindUuid(network_object_uuid));
+                    refs.bindValue(2, postgres_contract.bindUuid(member_a_uuid));
+                    refs.bindValue(3, postgres_contract.bindUuid(member_b_uuid));
+                    refs.bindValue(4, field);
+                    REQUIRE_SQL(refs, refs.exec());
+                }
+                refs.finish();
+            }
+
             // Test native UUID scope values and the system-scope SQL NULL.
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "INSERT INTO roles(uuid,key,builtin) VALUES (?,'schema_test.reader',0)")));
@@ -419,6 +479,58 @@ int main(int argc, char **argv)
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT immutable_finalized_snapshot")));
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT immutable_finalized_snapshot")));
 
+            // All seven PostgreSQL statement-level immutability guards must
+            // reject real modifications, not merely no-op statements. A
+            // rejected statement must not partially change any row set.
+            const QString finalized_id = revision_uuid.toString(QUuid::WithoutBraces);
+            const QString network_id = network_object_uuid.toString(QUuid::WithoutBraces);
+            const QString spare_id = spare_member_uuid.toString(QUuid::WithoutBraces);
+            const QString member_a_id = member_a_uuid.toString(QUuid::WithoutBraces);
+            const QString member_b_id = member_b_uuid.toString(QUuid::WithoutBraces);
+            const QString new_object_a = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QString new_object_b = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QStringList blocked_statements{
+                QStringLiteral("UPDATE revision_objects SET content=decode('55','hex') "
+                    "WHERE revision_uuid='%1' AND kind='orphan'").arg(finalized_id),
+                QStringLiteral("DELETE FROM revision_objects "
+                    "WHERE revision_uuid='%1' AND kind='orphan'").arg(finalized_id),
+                QStringLiteral("INSERT INTO revision_objects"
+                    "(revision_uuid,object_uuid,kind,content,version,deleted) VALUES "
+                    "('%1','%2','entity',decode('11','hex'),1,0),"
+                    "('%1','%3','entity',decode('22','hex'),1,0)")
+                    .arg(finalized_id, new_object_a, new_object_b),
+                QStringLiteral("DELETE FROM hydraulic_network_members "
+                    "WHERE revision_uuid='%1'").arg(finalized_id),
+                QStringLiteral("INSERT INTO hydraulic_network_members "
+                    "(revision_uuid,network_uuid,entity_uuid) VALUES "
+                    "('%1','%2','%3')").arg(finalized_id, network_id, spare_id),
+                QStringLiteral("DELETE FROM hydraulic_network_references "
+                    "WHERE revision_uuid='%1'").arg(finalized_id),
+                QStringLiteral("INSERT INTO hydraulic_network_references "
+                    "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES "
+                    "('%1','%2','%3','%4','new-upstream'),"
+                    "('%1','%2','%3','%4','new-downstream')")
+                    .arg(finalized_id, network_id, member_a_id, member_b_id)
+            };
+            for (const QString &blocked_statement : blocked_statements)
+            {
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT immutable_row_set")));
+                REQUIRE_SQL(ddl, !ddl.exec(blocked_statement));
+                REQUIRE(ddl.lastError().text().contains(QStringLiteral("immutable")));
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT immutable_row_set")));
+                REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT immutable_row_set")));
+                ddl.finish();
+            }
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
+                "SELECT (SELECT count(*) FROM revision_objects WHERE revision_uuid='%1')=6 "
+                "AND (SELECT count(*) FROM hydraulic_network_members WHERE revision_uuid='%1')=2 "
+                "AND (SELECT count(*) FROM hydraulic_network_references WHERE revision_uuid='%1')=2")
+                .arg(finalized_id)));
+            REQUIRE_SQL(ddl, ddl.next());
+            REQUIRE(ddl.value(0).toBool());
+            ddl.finish();
+
             // Advance the branch atomically and retain the finalized parent.
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "INSERT INTO revisions(uuid,project_uuid,branch_uuid,number,state,created_at_ms,created_by_uuid) "
@@ -443,6 +555,42 @@ int main(int argc, char **argv)
             ddl.addBindValue(postgres_contract.bindUuid(branch_uuid));
             REQUIRE_SQL(ddl, ddl.exec());
             ddl.finish();
+            // A statement that mixes finalized and working rows must fail
+            // atomically. Valid successor writes must still be accepted.
+            const QString successor_id = successor_uuid.toString(QUuid::WithoutBraces);
+            const QString mixed_old_id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QString mixed_new_id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT mixed_immutable_rows")));
+            REQUIRE_SQL(ddl, !ddl.exec(QStringLiteral(
+                "INSERT INTO revision_objects"
+                "(revision_uuid,object_uuid,kind,content,version,deleted) VALUES "
+                "('%1','%2','entity',decode('01','hex'),1,0),"
+                "('%3','%4','entity',decode('02','hex'),1,0)")
+                .arg(successor_id, mixed_new_id, finalized_id, mixed_old_id)));
+            REQUIRE(ddl.lastError().text().contains(QStringLiteral("immutable")));
+            ddl.finish();
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT mixed_immutable_rows")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT mixed_immutable_rows")));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
+                "SELECT count(*) FROM revision_objects WHERE revision_uuid='%1'")
+                .arg(successor_id)));
+            REQUIRE_SQL(ddl, ddl.next());
+            REQUIRE(ddl.value(0).toInt() == 0);
+            ddl.finish();
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
+                "INSERT INTO revision_objects"
+                "(revision_uuid,object_uuid,kind,content,version,deleted) "
+                "VALUES('%1','%2','entity',decode('01','hex'),1,0)")
+                .arg(successor_id, mixed_new_id)));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
+                "UPDATE revision_objects SET content=decode('ff','hex') "
+                "WHERE revision_uuid='%1' AND object_uuid='%2'")
+                .arg(successor_id, mixed_new_id)));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
+                "DELETE FROM revision_objects "
+                "WHERE revision_uuid='%1' AND object_uuid='%2'")
+                .arg(successor_id, mixed_new_id)));
+
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
                 "SELECT count(*) FROM revisions WHERE branch_uuid=(SELECT uuid FROM branches WHERE name='main')")));
             REQUIRE_SQL(ddl, ddl.next());
