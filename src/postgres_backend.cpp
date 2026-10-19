@@ -23,12 +23,13 @@ bool exec(const QSqlDatabase &database, const QString &statement, QString *error
     return false;
 }
 
-// These two constant keys are reserved for AOWIS DB write transactions.
-// One transaction-wide advisory lock serializes the current read/modify/write
-// domain operations, matching SQLite's BEGIN IMMEDIATE correctness model.
-// All AOWIS PostgreSQL writers must acquire this lock before mutating state.
+// One transaction-wide advisory lock serializes read/modify/write operations
+// within each AOWIS schema, matching SQLite's BEGIN IMMEDIATE semantics.
+// PostgreSQL two-key advisory locks are database-local; the namespace OID is
+// unique among schemas in that database. This preserves single-schema writer
+// serialization without making unrelated schemas wait for one global lock.
+// All cooperating AOWIS writers must use the same namespace and OID rule.
 constexpr qint32 write_lock_namespace = 1096232777; // "AWOI"
-constexpr qint32 write_lock_resource = 1396986417;  // "SDB1"
 }
 
 PostgresBackend::PostgresBackend(const QString &schema_name)
@@ -142,11 +143,40 @@ bool PostgresBackend::beginWrite(const QSqlDatabase &database, QString *error) c
 {
     if (!exec(database, QStringLiteral("BEGIN"), error))
         return false;
+
+    // Resolve the selected schema's exact PostgreSQL namespace OID in the
+    // transaction. Unlike hashing a schema name, the OID cannot collide with
+    // any other live schema in this database. PostgreSQL advisory lock keys
+    // are signed int32: casting the 32-bit OID preserves its bit pattern.
+    // Also fail closed if the connection's search_path was unexpectedly
+    // changed since configure(), rather than locking one schema and writing
+    // into another.
+    QSqlQuery schema(database);
+    if (!schema.prepare(QStringLiteral(
+            "SELECT n.oid::integer FROM pg_catalog.pg_namespace n "
+            "WHERE n.nspname=CAST(? AS name) AND n.nspname=current_schema()")))
+    {
+        setError(error, schema.lastError().text());
+        exec(database, QStringLiteral("ROLLBACK"), nullptr);
+        return false;
+    }
+    schema.addBindValue(this->schema_name_);
+    if (!schema.exec() || !schema.next() || schema.value(0).isNull())
+    {
+        setError(error, schema.lastError().isValid() ? schema.lastError().text() :
+                 QStringLiteral("PostgreSQL selected schema is missing or search_path changed"));
+        schema.finish();
+        exec(database, QStringLiteral("ROLLBACK"), nullptr);
+        return false;
+    }
+    const qint32 schema_resource = schema.value(0).toInt();
+    schema.finish();
+
     QSqlQuery lock(database);
     if (lock.prepare(QStringLiteral("SELECT pg_advisory_xact_lock(?, ?)")))
     {
         lock.addBindValue(write_lock_namespace);
-        lock.addBindValue(write_lock_resource);
+        lock.addBindValue(schema_resource);
         if (lock.exec())
         {
             lock.finish();
@@ -154,6 +184,7 @@ bool PostgresBackend::beginWrite(const QSqlDatabase &database, QString *error) c
         }
     }
     setError(error, lock.lastError().text());
+    lock.finish();
     exec(database, QStringLiteral("ROLLBACK"), nullptr);
     return false;
 }

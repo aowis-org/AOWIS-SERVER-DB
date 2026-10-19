@@ -30,6 +30,18 @@ backend. PostgreSQL stores UUIDs natively; `StorageBackend::bindUuid()` and
 is a UUID value, not SQL NULL**. PostgreSQL uses libpq connection settings
 and an explicitly selected schema, which must exist before connecting.
 
+PostgreSQL write transactions acquire a transaction-scoped two-key advisory
+lock: a fixed AOWIS namespace and the selected schema's PostgreSQL namespace
+OID. Writers accessing **the same schema** are serialized, while writers
+accessing distinct schemas in the same PostgreSQL database can proceed
+independently. The backend checks that the configured schema still matches
+`current_schema()` when acquiring the lock; a changed or missing schema fails
+closed. The lock releases on transaction commit or rollback, including failed
+writes. Schema OIDs are exact database identities, not truncated text hashes;
+the PostgreSQL advisory-lock key space is database-local. The live backend
+contract test holds simultaneous transactions against two schemas and verifies
+same-schema contention and rollback release.
+
 Both backends initialize one current schema, without a historical SQL migration
 framework. Schema changes during pre-production development require refreshing
 *disposable* databases, not rewriting valuable data.

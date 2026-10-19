@@ -964,6 +964,99 @@ int main(int argc, char **argv)
             }
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(core_schema)));
 
+            // PostgreSQL writer locks are scoped to the explicitly selected
+            // schema. Independent AOWIS schemas in one database must not
+            // block one another, while two sessions for the same schema must
+            // still serialize read/modify/write transactions. These are real
+            // concurrent PostgreSQL connections, not a mocked lock function.
+            const QString lock_schema_a = QStringLiteral("aowis_lock_a_") +
+                QUuid::createUuid().toString(QUuid::Id128);
+            const QString lock_schema_b = QStringLiteral("aowis_lock_b_") +
+                QUuid::createUuid().toString(QUuid::Id128);
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("CREATE SCHEMA %1").arg(lock_schema_a)));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("CREATE SCHEMA %1").arg(lock_schema_b)));
+            const QString writer_a_name = QStringLiteral("pg-lock-writer-a");
+            const QString writer_b_name = QStringLiteral("pg-lock-writer-b");
+            const QString writer_again_name = QStringLiteral("pg-lock-writer-again");
+            aowis::db::PostgresBackend writer_a_backend(lock_schema_a);
+            aowis::db::PostgresBackend writer_b_backend(lock_schema_b);
+            {
+                QSqlDatabase writer_a;
+                QSqlDatabase writer_b;
+                QSqlDatabase writer_again;
+                REQUIRE(writer_a_backend.open(writer_a, writer_a_name,
+                                              QString::fromUtf8(pg_database_name), &error));
+                REQUIRE(writer_b_backend.open(writer_b, writer_b_name,
+                                              QString::fromUtf8(pg_database_name), &error));
+                REQUIRE(writer_a_backend.open(writer_again, writer_again_name,
+                                              QString::fromUtf8(pg_database_name), &error));
+                REQUIRE(writer_a_backend.configure(writer_a, &error));
+                REQUIRE(writer_b_backend.configure(writer_b, &error));
+                REQUIRE(writer_a_backend.configure(writer_again, &error));
+                REQUIRE(writer_a_backend.beginWrite(writer_a, &error));
+                // This would time out on the previous cluster-wide fixed
+                // advisory key. No tables need to exist in either schema.
+                REQUIRE(writer_b_backend.beginWrite(writer_b, &error));
+                QSqlQuery write_a(writer_a);
+                QSqlQuery write_b(writer_b);
+                REQUIRE_SQL(write_a, write_a.exec(QStringLiteral(
+                    "CREATE TABLE scoped_lock_probe (value integer)")));
+                REQUIRE_SQL(write_b, write_b.exec(QStringLiteral(
+                    "CREATE TABLE scoped_lock_probe (value integer)")));
+                write_a.finish();
+                write_b.finish();
+
+                // An independent connection for schema A must be rejected
+                // while A's first writer holds its transaction-scoped lock.
+                QSqlQuery short_timeout(writer_again);
+                REQUIRE_SQL(short_timeout, short_timeout.exec(QStringLiteral(
+                    "SET lock_timeout='150ms'")));
+                short_timeout.finish();
+                error.clear();
+                REQUIRE(!writer_a_backend.beginWrite(writer_again, &error));
+                REQUIRE(!error.isEmpty());
+                error.clear();
+
+                // Moving search_path away from the backend's configured
+                // schema must fail closed, not silently acquire the wrong
+                // advisory key. This is independent of lock contention.
+                QSqlQuery changed_path(writer_again);
+                REQUIRE_SQL(changed_path, changed_path.exec(QStringLiteral(
+                    "SET search_path TO %1").arg(lock_schema_b)));
+                REQUIRE(!writer_a_backend.beginWrite(writer_again, &error));
+                REQUIRE(error.contains(QStringLiteral("search_path")));
+                error.clear();
+                REQUIRE_SQL(changed_path, changed_path.exec(QStringLiteral(
+                    "SET search_path TO %1").arg(lock_schema_a)));
+                changed_path.finish();
+
+                // Rollback releases A's lock immediately, independently of
+                // B's still-open transaction. C can now write schema A.
+                writer_a_backend.rollback(writer_a);
+                REQUIRE(writer_a_backend.beginWrite(writer_again, &error));
+                QSqlQuery rolled_back(writer_again);
+                REQUIRE_SQL(rolled_back, rolled_back.exec(QStringLiteral(
+                    "SELECT to_regclass('scoped_lock_probe') IS NULL")));
+                REQUIRE_SQL(rolled_back, rolled_back.next());
+                REQUIRE(rolled_back.value(0).toBool());
+                rolled_back.finish();
+                REQUIRE(writer_b_backend.commit(writer_b, &error));
+                REQUIRE(writer_a_backend.commit(writer_again, &error));
+                writer_a.close();
+                writer_b.close();
+                writer_again.close();
+            }
+            QSqlDatabase::removeDatabase(writer_a_name);
+            QSqlDatabase::removeDatabase(writer_b_name);
+            QSqlDatabase::removeDatabase(writer_again_name);
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
+                "SELECT to_regclass('%1.scoped_lock_probe') IS NOT NULL").arg(lock_schema_b)));
+            REQUIRE_SQL(ddl, ddl.next());
+            REQUIRE(ddl.value(0).toBool());
+            ddl.finish();
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(lock_schema_a)));
+            REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("DROP SCHEMA %1 CASCADE").arg(lock_schema_b)));
+
             pg_connection.close();
             pg_connection = QSqlDatabase();
         }

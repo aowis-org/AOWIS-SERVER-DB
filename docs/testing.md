@@ -23,9 +23,13 @@ PostgreSQL instance, wait for readiness, expose it only on a random localhost
 port, execute the normal test suite and remove the container/volumes. The
 backend-contract, operator CLI, and HTTP server CLI tests detect
 `AOWIS_DB_TEST_PG_DB` and run their PostgreSQL integration scenarios in
-independent temporary schemas. The server test launches the real
-`aowis-server-db` executable, checks unauthenticated and authenticated REST
-requests, creates a project over HTTP and verifies it persists in PostgreSQL.
+independent temporary schemas. The backend-contract test also opens three
+real PostgreSQL connections to check that advisory write locks serialize
+same-schema writers without blocking writers on separate schemas, that
+rollback releases those locks, and that a changed `search_path` fails closed.
+The server test launches the real `aowis-server-db` executable, checks
+unauthenticated and authenticated REST requests, creates a project over HTTP
+and verifies it persists in PostgreSQL.
 A skipped PostgreSQL scenario is not evidence of PostgreSQL compatibility.
 
 | Environment | Behavior |

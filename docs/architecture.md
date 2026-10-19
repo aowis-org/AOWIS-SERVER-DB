@@ -39,7 +39,9 @@ The SQLite backend enables foreign keys and uses write transactions to keep
 snapshots, object rows and history journal entries consistent. The PostgreSQL
 backend provides the equivalent transaction and lock behavior. The core
 uses optimistic generations for working revisions, plus per-object expected
-versions for granular object editing. A stale mutation must fail rather than
+versions for granular object editing. PostgreSQL advisory write locks are
+scoped to the selected schema's namespace OID, so independent schemas do not
+serialize through a single global lock. A stale mutation must fail rather than
 silently overwrite another user's edit. Cross-object structure validation
 protects hydraulic references, not just individual object fields.
 
