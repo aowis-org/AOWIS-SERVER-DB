@@ -138,6 +138,7 @@ int main(int argc, char **argv)
     REQUIRE(db.objectGroupsForRevision(root, target, &error).size() == 1);
     REQUIRE(db.objectHistoryForRevision(root, target, &error).size() == 2);
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
+    REQUIRE(db.verifyProjectJournal(root, project->project_uuid).valid);
     const std::optional<aowis::db::RevisionComparison> ancestry = db.compareRevisions(
         root, left_final->finalized_revision_uuid, merged->finalized_revision_uuid, &error);
     REQUIRE(ancestry && ancestry->left_is_ancestor_of_right);
@@ -196,6 +197,7 @@ int main(int argc, char **argv)
     REQUIRE(db.objectHistoryForRevision(root, no_changes->finalized_revision_uuid, &error).isEmpty());
     REQUIRE(db.object(root, no_changes->finalized_revision_uuid, shared, &error)->content == QByteArray("same"));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
+    REQUIRE(db.verifyProjectJournal(root, project->project_uuid).valid);
     db.close();
     REQUIRE(db.openSqlite(path, &error));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);

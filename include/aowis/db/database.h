@@ -483,6 +483,12 @@ public:
                                          qint64 expected_generation, const QString &title,
                                          const QString &message, QString *error = nullptr);
     IntegrityReport verifyProject(const OperationContext &actor, const QUuid &project_uuid) const;
+    // Explicit, potentially expensive forensic check. First verifies the
+    // existing cryptographic integrity contract, then independently replays
+    // object events against each finalized first-parent Merkle snapshot.
+    // No stored data is modified, and regular finalization remains fast.
+    IntegrityReport verifyProjectJournal(const OperationContext &actor,
+                                        const QUuid &project_uuid) const;
 
     // Atomic, generation-checked complete network synchronization. Each changed
     // object produces an immutable object-history event. Network root

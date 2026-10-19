@@ -961,6 +961,80 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
     return result;
 }
 
+IntegrityReport Database::verifyProjectJournal(const OperationContext &actor,
+                                               const QUuid &project_uuid) const
+{
+    if (!requirePermission(actor, QStringLiteral("project.read"),
+                           AccessScope::project(project_uuid), nullptr))
+        return {false, 0, {}, QStringLiteral("Permission denied")};
+
+    // Verify the existing Merkle tree, immutable manifests, ancestry and
+    // chain hashes first. Journal replay is additional semantic validation,
+    // not a replacement for the normal integrity checker.
+    IntegrityReport report = verifyProjectUnchecked(project_uuid);
+    if (!report.valid)
+        return report;
+    QString error;
+    QSqlQuery revisions(this->database_);
+    if (!prepare(revisions, QStringLiteral(
+            "SELECT uuid,object_root_sha256 FROM revisions "
+            "WHERE project_uuid=? AND state='finalized' AND object_mode=1 "
+            "ORDER BY finalized_at_ms,uuid"), &error))
+    {
+        report.valid = false;
+        report.error = error;
+        return report;
+    }
+    revisions.addBindValue(this->backend_->bindUuid(project_uuid));
+    if (!run(revisions, &error))
+    {
+        report.valid = false;
+        report.error = error;
+        return report;
+    }
+    while (revisions.next())
+    {
+        const QUuid revision_uuid = this->backend_->readUuid(revisions.value(0));
+        report.failed_revision_uuid = revision_uuid;
+        const QByteArray root = revisions.value(1).toByteArray();
+        const std::optional<RevisionInfo> revision = revisionUnchecked(revision_uuid, &error);
+        if (!revision)
+        {
+            report.valid = false;
+            report.error = error;
+            return report;
+        }
+        QByteArray first_parent_root;
+        if (!revision->parent_revision_uuids.isEmpty())
+        {
+            const std::optional<RevisionInfo> parent =
+                revisionUnchecked(revision->parent_revision_uuids.first(), &error);
+            if (!parent || !parent->finalized || parent->object_root_sha256.size() != 32)
+            {
+                report.valid = false;
+                report.error = QStringLiteral("Journal replay requires an object-mode first parent");
+                return report;
+            }
+            first_parent_root = parent->object_root_sha256;
+        }
+        if (!verifyRevisionJournalReplay(this->database_, *this->backend_, revision_uuid,
+                                         first_parent_root, root, &error))
+        {
+            report.valid = false;
+            report.error = QStringLiteral("Journal-to-Merkle consistency failure: %1").arg(error);
+            return report;
+        }
+    }
+    if (revisions.lastError().isValid())
+    {
+        report.valid = false;
+        report.error = revisions.lastError().text();
+        return report;
+    }
+    report.failed_revision_uuid = QUuid();
+    return report;
+}
+
 IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) const
 {
     IntegrityReport report;

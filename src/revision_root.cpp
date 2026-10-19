@@ -360,6 +360,135 @@ std::optional<QVector<MerkleObjectRecord>> readRevisionObjectsSelected(
     return result;
 }
 
+bool verifyRevisionJournalReplay(const QSqlDatabase &database,
+    const StorageBackend &backend, const QUuid &revision_uuid,
+    const QByteArray &first_parent_root, const QByteArray &sealed_root,
+    QString *error)
+{
+    if (error != nullptr)
+        error->clear();
+    if (revision_uuid.isNull() || sealed_root.size() != 32 ||
+        (!first_parent_root.isEmpty() && first_parent_root.size() != 32))
+    {
+        setError(error, QStringLiteral("Invalid journal replay revision or Merkle root"));
+        return false;
+    }
+
+    // These are complete *logical* snapshots; replay is an explicitly
+    // requested forensic operation, not part of ordinary finalize/verify.
+    QHash<QUuid, MerkleObjectRecord> replayed;
+    if (!first_parent_root.isEmpty())
+    {
+        const std::optional<QVector<MerkleObjectRecord>> baseline =
+            readRevisionObjects(database, first_parent_root, error);
+        if (!baseline)
+            return false;
+        replayed.reserve(baseline->size());
+        for (const MerkleObjectRecord &record : *baseline)
+            replayed.insert(record.uuid, record);
+    }
+
+    QSqlQuery events(database);
+    if (!events.prepare(QStringLiteral(
+            "SELECT object_uuid,kind,action,before_version,after_version,"
+            "before_content,after_content,before_deleted,sequence "
+            "FROM object_events WHERE revision_uuid=? ORDER BY sequence")))
+    {
+        setError(error, events.lastError().text());
+        return false;
+    }
+    events.addBindValue(backend.bindUuid(revision_uuid));
+    if (!events.exec())
+    {
+        setError(error, events.lastError().text());
+        return false;
+    }
+    qint64 last_sequence = 0;
+    while (events.next())
+    {
+        const QUuid key = backend.readUuid(events.value(0));
+        const QString kind = events.value(1).toString();
+        const QString action = events.value(2).toString();
+        const qint64 before_version = events.value(3).toLongLong();
+        const qint64 after_version = events.value(4).toLongLong();
+        const QVariant before_bytes = events.value(5);
+        const QVariant after_bytes = events.value(6);
+        const bool before_deleted = events.value(7).toBool();
+        const qint64 sequence = events.value(8).toLongLong();
+        if (key.isNull() || sequence <= last_sequence ||
+            (action != QStringLiteral("put") && action != QStringLiteral("delete")))
+        {
+            setError(error, QStringLiteral("Journal replay contains invalid event identity, order or action"));
+            return false;
+        }
+        last_sequence = sequence;
+        const QHash<QUuid, MerkleObjectRecord>::const_iterator old = replayed.constFind(key);
+        const bool existed = old != replayed.cend();
+        const qint64 expected_before_version = existed ? old->version : -1;
+        const bool expected_before_deleted = !existed || old->deleted;
+        const bool before_content_matches = expected_before_deleted
+            ? before_bytes.isNull()
+            : !before_bytes.isNull() && before_bytes.toByteArray() == old->content;
+        const bool version_overflow = existed && old->version == std::numeric_limits<qint64>::max();
+        const qint64 expected_after_version = !existed || version_overflow ? 1 : old->version + 1;
+        if (before_version != expected_before_version ||
+            before_deleted != expected_before_deleted || !before_content_matches ||
+            (existed && kind != old->kind) || version_overflow ||
+            after_version != expected_after_version ||
+            (action == QStringLiteral("put") ? after_bytes.isNull() : !after_bytes.isNull()))
+        {
+            setError(error, QStringLiteral("Journal replay before-state/version/kind mismatch at object %1")
+                .arg(key.toString(QUuid::WithoutBraces)));
+            return false;
+        }
+        MerkleObjectRecord updated;
+        updated.uuid = key;
+        updated.kind = kind;
+        updated.version = after_version;
+        updated.deleted = action == QStringLiteral("delete");
+        if (updated.deleted)
+        {
+            if (!existed || old->deleted)
+            {
+                setError(error, QStringLiteral("Journal replay deletes a missing or deleted object"));
+                return false;
+            }
+        }
+        else
+            updated.content = after_bytes.toByteArray();
+        replayed.insert(key, updated);
+    }
+    if (events.lastError().isValid())
+    {
+        setError(error, events.lastError().text());
+        return false;
+    }
+    events.finish();
+
+    const std::optional<QVector<MerkleObjectRecord>> sealed =
+        readRevisionObjects(database, sealed_root, error);
+    if (!sealed)
+        return false;
+    if (replayed.size() != sealed->size())
+    {
+        setError(error, QStringLiteral("Journal replay object count differs from sealed Merkle model"));
+        return false;
+    }
+    for (const MerkleObjectRecord &record : *sealed)
+    {
+        const QHash<QUuid, MerkleObjectRecord>::const_iterator actual = replayed.constFind(record.uuid);
+        if (actual == replayed.cend() || actual->kind != record.kind ||
+            actual->version != record.version || actual->deleted != record.deleted ||
+            (!record.deleted && actual->content != record.content))
+        {
+            setError(error, QStringLiteral("Journal replay differs from sealed Merkle model at object %1")
+                .arg(record.uuid.toString(QUuid::WithoutBraces)));
+            return false;
+        }
+    }
+    return true;
+}
+
 bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
                                        const StorageBackend &backend,
                                        const QUuid &working_revision_uuid,

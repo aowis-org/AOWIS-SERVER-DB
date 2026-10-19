@@ -65,6 +65,16 @@ std::optional<QVector<MerkleObjectRecord>> readRevisionObjectsSelected(
     const QSqlDatabase &database, const QByteArray &root,
     const QSet<QUuid> &requested, QString *error = nullptr);
 
+// Slow, read-only forensic verifier: replay immutable per-object events from
+// the first finalized parent (or an empty genesis model) and compare EVERY
+// resulting object against the finalized Merkle snapshot. For merge revisions
+// the second parent describes ancestry; edits are relative to the first.
+// No SQL rows or Merkle nodes are written. Ordinary finalization does not use it.
+bool verifyRevisionJournalReplay(const QSqlDatabase &database,
+    const StorageBackend &backend, const QUuid &revision_uuid,
+    const QByteArray &first_parent_root, const QByteArray &sealed_root,
+    QString *error = nullptr);
+
 // Materialize one NEW editable revision from an immutable finalized root.
 // This is a transient working-head index, not historical authoritative data.
 // Includes deleted identities and versions; validates each source hash.

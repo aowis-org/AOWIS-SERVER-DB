@@ -124,6 +124,15 @@ Merkle-tree construction, content hashing, database inserts and transaction
 commits; this instrumentation is disabled during normal operation. See
 [docs/performance.md](docs/performance.md#profile-first-seal-and-branch-phases-opt-in).
 
+For forensic integrity audits, the library also exposes
+`Database::verifyProjectJournal(actor, project_uuid)`. Unlike normal
+`verifyProject()`, it independently replays the complete ordered object-event
+journal from each first-parent snapshot and checks its result against the
+sealed Merkle model. This is deliberately expensive and opt-in, not part of
+ordinary finalization or the HTTP API. It includes two-parent merges (their
+edits are relative to the first parent). See
+[docs/git-inspired-storage.md](docs/git-inspired-storage.md#deep-journal-to-merkle-consistency-verification).
+
 The content store is an internal primitive, not a new public REST endpoint.
 
 Technical contract, full migration roadmap, and tradeoffs:

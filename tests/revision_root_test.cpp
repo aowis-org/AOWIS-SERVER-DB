@@ -193,6 +193,17 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     REQUIRE(root2 && *root1 != *root2);
     REQUIRE(aowis::db::buildRevisionRoot(database, backend, revision, *root1, &error) == root2);
     REQUIRE(aowis::db::verifyWorkingObjectsAgainstRoot(database, backend, revision, *root2, &error));
+    // Independent semantic replay: the one pipe event transforms root1 into
+    // root2. The untouched junction is inherited from the first-parent root.
+    REQUIRE(aowis::db::verifyRevisionJournalReplay(
+        database, backend, revision, *root1, *root2, &error));
+    // The same event cannot explain the initial two-object snapshot, nor can
+    // it produce the old state again. This detects omitted journal changes.
+    REQUIRE(!aowis::db::verifyRevisionJournalReplay(
+        database, backend, revision, QByteArray(), *root1, &error));
+    REQUIRE(error.contains(QStringLiteral("before-state")) ||
+            error.contains(QStringLiteral("count")));
+    error.clear();
     REQUIRE(tree::lookup(database, *root1, pipe, &error) == old_pipe);
     REQUIRE(aowis::db::readRevisionObject(database, *root1, pipe, &error)->content == QByteArray("old pipe"));
     REQUIRE(aowis::db::readRevisionObject(database, *root2, pipe, &error)->content == QByteArray("new pipe"));
@@ -215,6 +226,31 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
         aowis::db::readRevisionObject(database, *root3, pipe, &error);
     REQUIRE(tombstone && tombstone->deleted && tombstone->version == 3 &&
             tombstone->content.isEmpty());
+    // The second state change is not yet journaled: a fast SQL-only update
+    // must not pass the independent historical replay verifier.
+    REQUIRE(!aowis::db::verifyRevisionJournalReplay(
+        database, backend, revision, *root1, *root3, &error));
+    REQUIRE(error.contains(QStringLiteral("differs")));
+    error.clear();
+    REQUIRE(query.prepare(QStringLiteral(
+        "UPDATE revisions SET generation=2 WHERE uuid=?")));
+    query.addBindValue(backend.bindUuid(revision));
+    REQUIRE(execute(query, error));
+    query.finish();
+    REQUIRE(query.prepare(QStringLiteral(
+        "INSERT INTO object_events(uuid,revision_uuid,object_uuid,actor_uuid,sequence,occurred_at_ms,"
+        "kind,action,before_version,after_version,before_content,after_content,before_deleted) "
+        "VALUES (?,?,?,?,2,?,'hydraulic.pipe','delete',2,3,?,NULL,0)")));
+    query.addBindValue(backend.bindUuid(QUuid::createUuid()));
+    query.addBindValue(backend.bindUuid(revision));
+    query.addBindValue(backend.bindUuid(pipe));
+    query.addBindValue(backend.bindUuid(actor));
+    query.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    query.addBindValue(QByteArray("new pipe"));
+    REQUIRE(execute(query, error));
+    query.finish();
+    REQUIRE(aowis::db::verifyRevisionJournalReplay(
+        database, backend, revision, *root1, *root3, &error));
     const std::optional<QVector<aowis::db::MerkleObjectRecord>> selected_tombstone =
         aowis::db::readRevisionObjectsSelected(database, *root3,
                                                QSet<QUuid>{pipe, junction}, &error);
@@ -267,6 +303,32 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     REQUIRE(aowis::db::materializeWorkingObjectsFromRoot(
         database, backend, fork_revision, *root3, &error));
     REQUIRE(aowis::db::verifyWorkingObjectsAgainstRoot(database, backend, fork_revision, *root3, &error));
+    // Deliberately forge a journaled resurrection with no corresponding
+    // final model update in a separate working revision.
+    // Object-event rows themselves are immutable by trigger; corruption is
+    // injected on initial INSERT, not by updating already-journaled events.
+    REQUIRE(query.prepare(QStringLiteral(
+        "UPDATE revisions SET generation=1 WHERE uuid=?")));
+    query.addBindValue(backend.bindUuid(fork_revision));
+    REQUIRE(execute(query, error));
+    query.finish();
+    REQUIRE(query.prepare(QStringLiteral(
+        "INSERT INTO object_events(uuid,revision_uuid,object_uuid,actor_uuid,sequence,occurred_at_ms,"
+        "kind,action,before_version,after_version,before_content,after_content,before_deleted) "
+        "VALUES (?,?,?,?,1,?,'hydraulic.pipe','put',3,4,?,?,1)")));
+    query.addBindValue(backend.bindUuid(QUuid::createUuid()));
+    query.addBindValue(backend.bindUuid(fork_revision));
+    query.addBindValue(backend.bindUuid(pipe));
+    query.addBindValue(backend.bindUuid(actor));
+    query.addBindValue(QDateTime::currentMSecsSinceEpoch());
+    query.addBindValue(QByteArray("forged-before"));
+    query.addBindValue(QByteArray("resurrected"));
+    REQUIRE(execute(query, error));
+    query.finish();
+    REQUIRE(!aowis::db::verifyRevisionJournalReplay(
+        database, backend, fork_revision, *root3, *root3, &error));
+    REQUIRE(error.contains(QStringLiteral("before-state")));
+    error.clear();
     REQUIRE(!aowis::db::materializeWorkingObjectsFromRoot(
         database, backend, fork_revision, *root3, &error));
     REQUIRE(error.contains(QStringLiteral("not empty")));

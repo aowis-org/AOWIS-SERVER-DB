@@ -649,6 +649,7 @@ int main(int argc, char **argv)
                 REQUIRE(object_finalized->snapshot_sha256 == QCryptographicHash::hash(
                     *manifest, QCryptographicHash::Sha256));
                 REQUIRE(reopened.verifyProject(actor, object_project->project_uuid).valid);
+                REQUIRE(reopened.verifyProjectJournal(actor, object_project->project_uuid).valid);
                 REQUIRE(reopened.snapshot(actor, working, &error) == manifest);
                 REQUIRE(reopened.object(actor, object_finalized->new_working_revision_uuid,
                                         pipe, &error)->content == changed_pipe);
@@ -798,6 +799,7 @@ int main(int argc, char **argv)
                 REQUIRE(model_seal->snapshot_sha256 == QCryptographicHash::hash(
                     *model_manifest, QCryptographicHash::Sha256));
                 REQUIRE(reopened.verifyProject(actor, hydraulic_project->project_uuid).valid);
+                REQUIRE(reopened.verifyProjectJournal(actor, hydraulic_project->project_uuid).valid);
                 // Finalized models exist ONLY as immutable Merkle roots; no
                 // revision-wide SQL copies survive finalization. The new
                 // working head retains fast editable SQL rows and indexes.

@@ -92,6 +92,8 @@ int main(int argc, char **argv)
     REQUIRE(finalized->snapshot_sha256 == QCryptographicHash::hash(
         *working_manifest, QCryptographicHash::Sha256));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
+    REQUIRE(db.verifyProjectJournal(root, project->project_uuid).valid);
+    REQUIRE(!db.verifyProjectJournal(unauthorized, project->project_uuid).valid);
     REQUIRE(db.snapshot(root, rev1, &error) == working_manifest);
     REQUIRE(db.objectHistoryForRevision(root, rev1, &error).size() == 5);
     REQUIRE(db.object(root, finalized->new_working_revision_uuid, pipe, &error)->version == 4);
@@ -108,6 +110,7 @@ int main(int argc, char **argv)
     REQUIRE(db.object(root, rev1, pipe, &error)->content == first);
     REQUIRE(db.finalize(root, alt->uuid, 1, QStringLiteral("alt"), {}, &error));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);
+    REQUIRE(db.verifyProjectJournal(root, project->project_uuid).valid);
     db.close();
     REQUIRE(db.openSqlite(path, &error));
     REQUIRE(db.verifyProject(root, project->project_uuid).valid);

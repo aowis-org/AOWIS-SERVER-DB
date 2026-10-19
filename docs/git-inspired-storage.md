@@ -95,6 +95,33 @@ hidden by long-lived verification state. This reduces repeated physical reads
 of unchanged, structurally shared content. The working-head materialization
 and derived hydraulic-index rebuild remain further optimization candidates.
 
+## Deep journal-to-Merkle consistency verification
+
+`Database::verifyProject()` remains the normal, read-only cryptographic
+integrity check: it verifies finalized immutable nodes and blobs, stored
+history manifests, revision parent links and chain hashes. It does **not**
+claim to prove that an independently recorded edit journal logically produces
+the final model.
+
+`Database::verifyProjectJournal()` is the opt-in **forensic** check. It first
+runs the normal integrity verification, then for each finalized object-mode
+revision loads its *first* parent's complete immutable model (empty for a
+first revision), replays every ordered `object_events` entry, and compares
+**all** reconstructed UUID records against the revision's sealed Merkle model.
+It validates old bytes, deletion state, kind, per-object version transitions,
+creation, resurrection and tombstones. In a two-parent merge, the second
+parent is part of ancestry and the merge journal is applied relative to the
+**first (left) parent**, exactly as in the merge implementation.
+
+This intentionally reconstructs full logical models, potentially more than
+once across a long history. It is intended for auditing and diagnostics, not
+an extra synchronous pass on every edit/finalization. It does not modify any
+SQL record, immutable content object, schema, hash format, or branch head.
+It detects history/model inconsistencies that could otherwise pass separate
+cryptographic checks on consistently rewritten records. It does **not**
+protect against a privileged administrator rewriting the whole history and
+rehashing it; that is outside AOWIS's current threat model.
+
 ## Stage 1: content store contract
 
 The internal table `content_objects` has three columns:

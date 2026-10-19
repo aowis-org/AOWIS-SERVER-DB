@@ -236,6 +236,7 @@ int main(int argc, char **argv)
         actor, project->main_branch_uuid, final_generation, QStringLiteral("Typed Model"), QStringLiteral("all fields"), &error);
     REQUIRE(finalized.has_value());
     REQUIRE(database.verifyProject(actor, project->project_uuid).valid);
+    REQUIRE(database.verifyProjectJournal(actor, project->project_uuid).valid);
     REQUIRE(database.loadHydraulicNetwork(actor, project->working_revision_uuid, network.uuid, &error)->nodes_junctions[0].elevation_m == updated.elevation_m);
     REQUIRE(database.loadHydraulicNetwork(actor, finalized->new_working_revision_uuid, network.uuid, &error).has_value());
     const std::optional<aowis::db::BranchInfo> alternative = database.createBranch(
