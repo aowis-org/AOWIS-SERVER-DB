@@ -634,7 +634,7 @@ bool collectBatchReachable(BatchState &state, const QByteArray &hash,
 // The path and root status are validated independently for every reference.
 bool scanBatched(const QSqlDatabase &database, const QByteArray &root,
                  QVector<Entry> &out, QHash<QByteArray, QByteArray> *verified_nodes,
-                 QString *error)
+                 QString *error, QVector<QByteArray> *tree_hashes = nullptr)
 {
     struct Pending
     {
@@ -673,6 +673,8 @@ bool scanBatched(const QSqlDatabase &database, const QByteArray &root,
                 bytes, item.leading.size(), item.is_root, error);
             if (!node)
                 return false;
+            if (tree_hashes != nullptr)
+                tree_hashes->append(item.digest);
             const QByteArray path = item.leading + node->prefix;
             if (node->value)
             {
@@ -1165,6 +1167,51 @@ std::optional<QVector<Entry>> entries(const QSqlDatabase &database,
     if (!scanBatched(database, root, result, nullptr, error))
         return std::nullopt;
     return result;
+}
+
+std::optional<ContentInventory> contentInventory(const QSqlDatabase &database,
+    const QByteArray &root, QString *error)
+{
+    if (error != nullptr)
+        error->clear();
+    if (root.size() != hash_bytes)
+    {
+        setError(error, QStringLiteral("Invalid Merkle inventory root digest length"));
+        return std::nullopt;
+    }
+    QVector<Entry> entries;
+    ContentInventory inventory;
+    if (!scanBatched(database, root, entries, nullptr, error,
+                     &inventory.tree_sha256))
+        return std::nullopt;
+
+    // The same immutable payload can be used at multiple UUIDs. Deduplicate
+    // by content hash rather than by UUID, and use a stable bytewise order
+    // independent of the SQL backend or Merkle traversal order.
+    inventory.blob_sha256.reserve(entries.size());
+    for (const Entry &entry : entries)
+        inventory.blob_sha256.append(entry.blob_sha256);
+    std::sort(inventory.tree_sha256.begin(), inventory.tree_sha256.end());
+    inventory.tree_sha256.erase(std::unique(inventory.tree_sha256.begin(),
+        inventory.tree_sha256.end()), inventory.tree_sha256.end());
+    std::sort(inventory.blob_sha256.begin(), inventory.blob_sha256.end());
+    inventory.blob_sha256.erase(std::unique(inventory.blob_sha256.begin(),
+        inventory.blob_sha256.end()), inventory.blob_sha256.end());
+
+    // Verify that EVERY referenced payload exists and hashes correctly.
+    // Process bounded chunks so verification does not materialize all
+    // serialized model objects in memory at once.
+    constexpr qsizetype verify_batch = 256;
+    for (qsizetype start = 0; start < inventory.blob_sha256.size();
+         start += verify_batch)
+    {
+        const QVector<QByteArray> slice = inventory.blob_sha256.mid(
+            start, verify_batch);
+        if (!content_store::getMany(database, content_store::Kind::Blob,
+                                    slice, error))
+            return std::nullopt;
+    }
+    return inventory;
 }
 
 std::optional<QVector<Entry>> entriesCached(const QSqlDatabase &database,

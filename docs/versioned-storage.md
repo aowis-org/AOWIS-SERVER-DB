@@ -8,6 +8,10 @@ replication remains a separate [planned capability](distributed-repositories.md)
 
 ## Storage model
 
+- **Repository identity:** an immutable UUIDv7 stored once in the
+  `repository_identity` singleton table, unique to each independent local
+  database/schema. It is not part of a revision's content or chain digest and
+  must not be copied to another repository during replication.
 - **Model object identity:** a stable 128-bit UUID, generated using
   `createUuidV7()` for new model entities. The UUID survives edits.
 - **Content identity:** a SHA-256 digest of an immutable, canonical record.

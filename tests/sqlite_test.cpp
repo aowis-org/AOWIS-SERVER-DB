@@ -28,7 +28,11 @@ int main(int argc, char **argv)
     REQUIRE((static_cast<unsigned char>(uuid.toRfc4122().at(6)) >> 4) == 7);
 
     Database db;
+    REQUIRE(!db.repositoryUuid(&error)); // Closed database has no identity.
     REQUIRE(db.openSqlite(path, &error));
+    const std::optional<QUuid> original_repository_uuid = db.repositoryUuid(&error);
+    REQUIRE(original_repository_uuid.has_value() && !original_repository_uuid->isNull());
+    REQUIRE((static_cast<unsigned char>(original_repository_uuid->toRfc4122().at(6)) >> 4) == 7);
     const OperationContext nobody{createUuidV7()};
     REQUIRE(!db.createProject(nobody, QStringLiteral("Unauthenticated"), &error));
     REQUIRE(db.projects(nobody, &error).isEmpty());
@@ -158,6 +162,7 @@ int main(int argc, char **argv)
 
     db.close();
     REQUIRE(db.openSqlite(path, &error));
+    REQUIRE(db.repositoryUuid(&error) == original_repository_uuid);
     REQUIRE(db.verifyProject(root, p1->project_uuid).valid);
     REQUIRE(!db.bootstrapAdministrator(QStringLiteral("another"), &error));
     REQUIRE(db.hasPermission(worker, QStringLiteral("project.model.write"), AccessScope::project(p1->project_uuid)));

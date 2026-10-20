@@ -30,6 +30,8 @@ int main(int argc, char **argv)
         QStringLiteral("DROP INDEX revision_objects_by_kind"),
         QStringLiteral("DROP TRIGGER finalized_object_update"),
         QStringLiteral("DROP TRIGGER branch_working_storage_readonly"),
+        QStringLiteral("DROP TRIGGER repository_identity_no_update"),
+        QStringLiteral("DROP TABLE repository_identity"),
         QStringLiteral("ALTER TABLE snapshots ADD COLUMN unexpected INTEGER"),
         QStringLiteral("DROP TRIGGER security_audit_readonly_update"),
     };
@@ -38,6 +40,8 @@ int main(int argc, char **argv)
         QStringLiteral("revision_objects_by_kind"),
         QStringLiteral("finalized_object_update"),
         QStringLiteral("branch_working_storage_readonly"),
+        QStringLiteral("repository_identity_no_update"),
+        QStringLiteral("repository_identity"),
         QStringLiteral("snapshots"),
         QStringLiteral("security_audit_readonly_update"),
     };

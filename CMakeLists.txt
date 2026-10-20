@@ -74,6 +74,8 @@ add_library(aowis-db-core STATIC
     src/content_store.cpp
     src/merkle_tree.h
     src/merkle_tree.cpp
+    include/aowis/db/revision_manifest.h
+    src/revision_manifest.cpp
     src/revision_root.h
     src/revision_root.cpp
     src/working_storage.cpp
@@ -182,6 +184,7 @@ if(BUILD_TESTING)
     aowis_add_db_test(aowis-db-object-merge-tags-tests aowis-db-object-merge-tags tests/object_merge_tags_test.cpp)
     aowis_add_db_test(aowis-db-content-store-tests aowis-db-content-store tests/content_store_test.cpp)
     aowis_add_db_test(aowis-db-merkle-tree-tests aowis-db-merkle-tree tests/merkle_tree_test.cpp)
+    aowis_add_db_test(aowis-db-revision-manifest-tests aowis-db-revision-manifest tests/revision_manifest_test.cpp)
     aowis_add_db_test(aowis-db-revision-root-tests aowis-db-revision-root tests/revision_root_test.cpp)
     aowis_add_db_test(aowis-db-objects-tests aowis-db-objects tests/objects_test.cpp)
     aowis_add_db_test(aowis-db-model-tests aowis-db-model tests/model_persistence_test.cpp)

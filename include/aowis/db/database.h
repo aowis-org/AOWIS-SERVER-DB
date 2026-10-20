@@ -137,6 +137,18 @@ struct RevisionComparison
     QVector<QUuid> merge_base_revision_uuids;
 };
 
+// Read-only dependency inventory for one finalized object-mode model root.
+// Hashes are SHA-256 content-store identities, sorted and unique. This is
+// not a complete revision bundle: journals, parents, authorization and
+// opaque snapshots require separate transport and validation.
+struct RevisionContentInventory
+{
+    QUuid revision_uuid;
+    QByteArray object_root_sha256;
+    QVector<QByteArray> tree_sha256;
+    QVector<QByteArray> blob_sha256;
+};
+
 struct Finalization
 {
     QUuid finalized_revision_uuid;
@@ -311,6 +323,11 @@ public:
                       QString *error = nullptr);
     void close();
     bool isOpen() const;
+    // Stable identity of this local repository instance (not of its projects
+    // or revisions). Generated once during schema creation, never copied when
+    // cloning history into a different repository. Local-only introspection;
+    // no remote HTTP endpoint or authorization semantics are implied.
+    std::optional<QUuid> repositoryUuid(QString *error = nullptr) const;
 
     // Explicit local-only one-time bootstrap. An HTTP route must never call
     // this method. Refuses any subsequent call, even by an administrator.
@@ -442,6 +459,30 @@ public:
                                            QString *error = nullptr);
     std::optional<BranchInfo> branch(const OperationContext &actor, const QUuid &branch_uuid, QString *error = nullptr) const;
     std::optional<RevisionInfo> revision(const OperationContext &actor, const QUuid &revision_uuid, QString *error = nullptr) const;
+    // Export one finalized revision's canonical portable metadata. This is
+    // not a clone bundle and does not authorize or perform import/push.
+    // Requires project.read on the revision's branch.
+    std::optional<QByteArray> exportRevisionManifest(const OperationContext &actor,
+        const QUuid &revision_uuid, QString *error = nullptr) const;
+    // Identify and verify all Merkle nodes and object blobs reachable from
+    // one finalized object-mode revision. Requires project.read; rejects
+    // working and opaque revisions. No SQL history or references are changed.
+    std::optional<RevisionContentInventory> exportRevisionContentInventory(
+        const OperationContext &actor, const QUuid &revision_uuid,
+        QString *error = nullptr) const;
+    // Return each immediate finalized parent manifest in DAG order. Read
+    // permission is checked independently on every parent branch; missing
+    // parents, incorrect chain hashes and inaccessible parents fail closed.
+    std::optional<QVector<QByteArray>> exportRevisionParentManifests(
+        const OperationContext &actor, const QUuid &revision_uuid,
+        QString *error = nullptr) const;
+    // Export the exact AOWIS-OPERATIONS-V1 bytes committed by the sealed
+    // operation-history SHA-256. Contains historical snapshot payloads:
+    // requires BOTH project.read and project.history.read. Does not include
+    // the independent object-event/group journal or the model snapshot.
+    std::optional<QByteArray> exportRevisionOperationJournal(
+        const OperationContext &actor, const QUuid &revision_uuid,
+        QString *error = nullptr) const;
     // Compare two revisions in one project (working heads are allowed).
     // Requires project.read on BOTH source branches. Returns all maximal
     // FINALIZED common ancestors, not an arbitrary single merge base.
@@ -608,6 +649,8 @@ private:
                                 const std::optional<QByteArray> &new_snapshot,
                                 const QString &kind, const QUuid &target_uuid,
                                 QString *error);
+    std::optional<QByteArray> operationJournalBytes(const QUuid &revision_uuid,
+                                                QString *error) const;
     std::optional<QByteArray> historyDigest(const QUuid &revision_uuid,
                                              QString *error) const;
     bool requirePermission(const OperationContext &actor, const QString &key,

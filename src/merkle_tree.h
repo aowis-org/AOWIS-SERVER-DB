@@ -114,6 +114,22 @@ std::optional<QByteArray> buildFromInsertedBlobs(
 std::optional<QVector<Entry>> entries(const QSqlDatabase &database,
                                       const QByteArray &root, QString *error = nullptr);
 
+// Full read-only inventory of immutable content reachable from one Merkle root.
+// Both arrays are sorted, unique SHA-256 digests, including the root node.
+// Every traversed tree node and referenced model blob is checked against its
+// content-addressed bytes. This covers model content ONLY: it does not include
+// SQL operation journals, opaque snapshot bytes or parent revisions. This
+// operation intentionally materializes its hash inventory in memory; the
+// eventual network transfer protocol will paginate large inventories.
+struct ContentInventory
+{
+    QVector<QByteArray> tree_sha256;
+    QVector<QByteArray> blob_sha256;
+};
+
+std::optional<ContentInventory> contentInventory(const QSqlDatabase &database,
+    const QByteArray &root, QString *error = nullptr);
+
 // Internal full-history verification helper. The cache belongs to ONE
 // verification request, never to the database connection or process. Immutable
 // node payloads already SHA-256-checked in this request can be reused across

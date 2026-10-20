@@ -1,4 +1,5 @@
 #include "sqlite_backend.h"
+#include <aowis/model/uuid.h>
 
 #include <QSqlError>
 #include <QSqlQuery>
@@ -132,6 +133,10 @@ static const char *const statements[] = {
             created_at_ms INTEGER NOT NULL,
             archived_at_ms INTEGER
         , created_by_uuid BLOB REFERENCES users(uuid)))SQL",
+        R"SQL(CREATE TABLE repository_identity (
+            slot INTEGER PRIMARY KEY NOT NULL CHECK(slot=1),
+            uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16)
+        ))SQL",
         R"SQL(CREATE TABLE revision_objects (
             storage_uuid BLOB NOT NULL REFERENCES branches(working_storage_uuid) ON DELETE RESTRICT,
             object_uuid BLOB NOT NULL CHECK(length(object_uuid)=16),
@@ -262,6 +267,10 @@ static const char *const statements[] = {
         ON role_permissions(role_uuid,permission_uuid) WHERE revoked_at_ms IS NULL)SQL",
         R"SQL(CREATE INDEX security_audit_by_actor ON security_audit_events(actor_uuid,sequence))SQL",
         R"SQL(CREATE INDEX user_sessions_by_user ON user_sessions(user_uuid))SQL",
+        R"SQL(CREATE TRIGGER repository_identity_no_update BEFORE UPDATE ON repository_identity
+            BEGIN SELECT RAISE(ABORT,'repository identity is immutable'); END)SQL",
+        R"SQL(CREATE TRIGGER repository_identity_no_delete BEFORE DELETE ON repository_identity
+            BEGIN SELECT RAISE(ABORT,'repository identity is immutable'); END)SQL",
         R"SQL(CREATE TRIGGER content_objects_no_update BEFORE UPDATE ON content_objects
             BEGIN SELECT RAISE(ABORT, 'content objects are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER content_objects_no_delete BEFORE DELETE ON content_objects
@@ -493,6 +502,20 @@ bool SqliteBackend::createSchema(const QSqlDatabase &database, QString *error) c
             return false;
         }
     }
+    QSqlQuery identity(database);
+    if (!identity.prepare(QStringLiteral("INSERT INTO repository_identity(slot,uuid) VALUES (1,?)")))
+    {
+        if (error != nullptr)
+            *error = identity.lastError().text();
+        return false;
+    }
+    identity.addBindValue(bindUuid(createUuidV7()));
+    if (!identity.exec())
+    {
+        if (error != nullptr)
+            *error = identity.lastError().text();
+        return false;
+    }
     return true;
 }
 
@@ -535,6 +558,14 @@ bool SqliteBackend::verifySchema(const QSqlDatabase &database, QString *error) c
             return false;
         }
         query.finish();
+    }
+    QSqlQuery identity(database);
+    if (!identity.exec(QStringLiteral("SELECT uuid FROM repository_identity WHERE slot=1")) ||
+        !identity.next() || readUuid(identity.value(0)).isNull())
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("SQLite repository identity is missing or invalid");
+        return false;
     }
     return true;
 }

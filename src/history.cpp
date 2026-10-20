@@ -2,6 +2,7 @@
 #include <aowis/model/uuid.h>
 
 #include "storage_backend.h"
+#include <aowis/db/revision_manifest.h>
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -235,7 +236,7 @@ bool Database::applySnapshotOperation(const RevisionInfo &revision, const QUuid 
     return ok;
 }
 
-std::optional<QByteArray> Database::historyDigest(const QUuid &revision_uuid, QString *error) const
+std::optional<QByteArray> Database::operationJournalBytes(const QUuid &revision_uuid, QString *error) const
 {
     const std::optional<QVector<HistoryRow>> rows = loadRows(this->database_, *this->backend_, revision_uuid, error);
     if (!rows)
@@ -258,7 +259,35 @@ std::optional<QByteArray> Database::historyDigest(const QUuid &revision_uuid, QS
         if (row.after_present)
             appendField(bytes, row.after);
     }
-    return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
+    return bytes;
+}
+
+std::optional<QByteArray> Database::historyDigest(const QUuid &revision_uuid,
+                                                   QString *error) const
+{
+    const std::optional<QByteArray> bytes = operationJournalBytes(revision_uuid, error);
+    if (!bytes)
+        return std::nullopt;
+    return QCryptographicHash::hash(*bytes, QCryptographicHash::Sha256);
+}
+
+std::optional<QByteArray> Database::exportRevisionOperationJournal(
+    const OperationContext &actor, const QUuid &revision_uuid, QString *error) const
+{
+    const std::optional<QByteArray> encoded = exportRevisionManifest(
+        actor, revision_uuid, error);
+    if (!encoded)
+        return std::nullopt;
+    const std::optional<RevisionManifest> manifest =
+        decodeRevisionManifest(*encoded, error);
+    if (!manifest || !requirePermission(actor, QStringLiteral("project.history.read"),
+                                       AccessScope::branch(manifest->branch_uuid), error))
+        return std::nullopt;
+    const std::optional<QByteArray> bytes = operationJournalBytes(revision_uuid, error);
+    if (!bytes || !verifyRevisionOperationJournal(*bytes, revision_uuid,
+                                                   manifest->operation_history_sha256, error))
+        return std::nullopt;
+    return bytes;
 }
 
 QVector<HistoryEvent> Database::history(const OperationContext &actor,

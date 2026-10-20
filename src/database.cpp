@@ -4,6 +4,8 @@
 #include "sqlite_backend.h"
 #include "postgres_backend.h"
 #include "revision_root.h"
+#include "merkle_tree.h"
+#include <aowis/db/revision_manifest.h>
 #include "working_storage.h"
 #include "performance_profile.h"
 
@@ -20,11 +22,6 @@ namespace
 {
 
 constexpr int digest_length = 32;
-
-QByteArray uuidBytes(const QUuid &uuid)
-{
-    return uuid.toRfc4122();
-}
 
 void setError(QString *error, const QString &message)
 {
@@ -46,61 +43,6 @@ bool prepare(QSqlQuery &query, const QString &statement, QString *error)
         return true;
     setError(error, query.lastError().text());
     return false;
-}
-
-void appendInt64(QByteArray &bytes, quint64 value)
-{
-    for (int shift = 56; shift >= 0; shift -= 8)
-        bytes.append(static_cast<char>((value >> shift) & 0xffU));
-}
-
-void appendField(QByteArray &bytes, const QByteArray &field)
-{
-    appendInt64(bytes, static_cast<quint64>(field.size()));
-    bytes.append(field);
-}
-
-// One pre-release chain format. The exact bytes are deterministic and include
-// the complete model snapshot, operation history, authors and ordered parents.
-QByteArray chainDigest(const QUuid &project_uuid,
-                       const QUuid &branch_uuid,
-                       const QUuid &revision_uuid,
-                       const QVector<QPair<QUuid, QByteArray>> &parents,
-                       qint64 number,
-                       qint64 created_at_ms,
-                       qint64 finalized_at_ms,
-                       const QString &title,
-                       const QString &message,
-                       const QByteArray &snapshot_hash,
-                       const QUuid &creator_uuid,
-                       const QUuid &finalizer_uuid,
-                       const QByteArray &history_hash,
-                       const QByteArray &object_root)
-{
-    if (snapshot_hash.size() != digest_length || history_hash.size() != digest_length ||
-        object_root.size() != digest_length)
-        return {};
-    QByteArray bytes("AOWIS-REVISION-DAG-V1\0", 22);
-    bytes.append(uuidBytes(project_uuid));
-    bytes.append(uuidBytes(branch_uuid));
-    bytes.append(uuidBytes(revision_uuid));
-    bytes.append(uuidBytes(creator_uuid));
-    bytes.append(uuidBytes(finalizer_uuid));
-    appendInt64(bytes, static_cast<quint64>(created_at_ms));
-    appendInt64(bytes, static_cast<quint64>(number));
-    appendInt64(bytes, static_cast<quint64>(finalized_at_ms));
-    appendField(bytes, title.toUtf8());
-    appendField(bytes, message.toUtf8());
-    bytes.append(snapshot_hash);
-    bytes.append(history_hash);
-    bytes.append(object_root);
-    appendInt64(bytes, static_cast<quint64>(parents.size()));
-    for (const QPair<QUuid, QByteArray> &parent : parents)
-    {
-        bytes.append(uuidBytes(parent.first));
-        bytes.append(parent.second);
-    }
-    return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
 }
 
 bool isValidName(const QString &name)
@@ -169,6 +111,30 @@ void Database::close()
 bool Database::isOpen() const
 {
     return this->database_.isOpen();
+}
+
+std::optional<QUuid> Database::repositoryUuid(QString *error) const
+{
+    if (!isOpen() || !this->backend_)
+    {
+        setError(error, QStringLiteral("Database is not open"));
+        return std::nullopt;
+    }
+    QSqlQuery query(this->database_);
+    if (!query.exec(QStringLiteral("SELECT uuid FROM repository_identity WHERE slot=1")) ||
+        !query.next())
+    {
+        setError(error, query.lastError().isValid() ? query.lastError().text() :
+                 QStringLiteral("Repository identity is missing"));
+        return std::nullopt;
+    }
+    const QUuid uuid = this->backend_->readUuid(query.value(0));
+    if (uuid.isNull())
+    {
+        setError(error, QStringLiteral("Repository identity is invalid"));
+        return std::nullopt;
+    }
+    return uuid;
 }
 
 bool Database::exec(const QString &sql, QString *error) const
@@ -452,6 +418,140 @@ std::optional<RevisionInfo> Database::revisionUnchecked(const QUuid &revision_uu
         return std::nullopt;
     while (parents.next())
         result.parent_revision_uuids.append(this->backend_->readUuid(parents.value(0)));
+    return result;
+}
+
+std::optional<QByteArray> Database::exportRevisionManifest(const OperationContext &actor,
+    const QUuid &revision_uuid, QString *error) const
+{
+    const std::optional<RevisionInfo> revision = revisionUnchecked(revision_uuid, error);
+    if (!revision)
+        return std::nullopt;
+    if (!requirePermission(actor, QStringLiteral("project.read"),
+                           AccessScope::branch(revision->branch_uuid), error))
+        return std::nullopt;
+    if (!revision->finalized)
+    {
+        setError(error, QStringLiteral("Cannot export a non-finalized revision manifest"));
+        return std::nullopt;
+    }
+
+    QSqlQuery metadata(this->database_);
+    if (!prepare(metadata, QStringLiteral(
+            "SELECT finalized_at_ms,title,message,operation_history_sha256,object_mode "
+            "FROM revisions WHERE uuid=? AND state='finalized'"), error))
+        return std::nullopt;
+    metadata.addBindValue(this->backend_->bindUuid(revision_uuid));
+    if (!run(metadata, error) || !metadata.next())
+    {
+        setError(error, QStringLiteral("Finalized revision metadata missing"));
+        return std::nullopt;
+    }
+    RevisionManifest manifest;
+    manifest.project_uuid = revision->project_uuid;
+    manifest.branch_uuid = revision->branch_uuid;
+    manifest.revision_uuid = revision->uuid;
+    manifest.created_by_uuid = revision->created_by_uuid;
+    manifest.finalized_by_uuid = revision->finalized_by_uuid;
+    manifest.created_at_ms = revision->created_at_ms;
+    manifest.number = revision->number;
+    manifest.finalized_at_ms = metadata.value(0).toLongLong();
+    manifest.title = metadata.value(1).toString();
+    manifest.message = metadata.value(2).toString();
+    manifest.operation_history_sha256 = metadata.value(3).toByteArray();
+    manifest.object_mode = metadata.value(4).toInt() == 1;
+    manifest.snapshot_sha256 = revision->snapshot_sha256;
+    manifest.chain_sha256 = revision->chain_sha256;
+    if (manifest.object_mode)
+        manifest.object_root_sha256 = revision->object_root_sha256;
+    metadata.finish();
+
+    QSqlQuery parents(this->database_);
+    if (!prepare(parents, QStringLiteral(
+            "SELECT p.parent_position,p.parent_revision_uuid,r.chain_sha256,r.project_uuid,r.state "
+            "FROM revision_parents p LEFT JOIN revisions r ON r.uuid=p.parent_revision_uuid "
+            "WHERE p.revision_uuid=? ORDER BY p.parent_position"), error))
+        return std::nullopt;
+    parents.addBindValue(this->backend_->bindUuid(revision_uuid));
+    if (!run(parents, error))
+        return std::nullopt;
+    while (parents.next())
+    {
+        if (parents.value(0).toLongLong() != manifest.parents.size() ||
+            parents.value(4).toString() != QStringLiteral("finalized") ||
+            this->backend_->readUuid(parents.value(3)) != revision->project_uuid)
+        {
+            setError(error, QStringLiteral("Invalid portable revision parent ancestry"));
+            return std::nullopt;
+        }
+        manifest.parents.append(qMakePair(this->backend_->readUuid(parents.value(1)),
+                                          parents.value(2).toByteArray()));
+    }
+    return encodeRevisionManifest(manifest, error);
+}
+
+std::optional<QVector<QByteArray>> Database::exportRevisionParentManifests(
+    const OperationContext &actor, const QUuid &revision_uuid, QString *error) const
+{
+    const std::optional<QByteArray> encoded = exportRevisionManifest(
+        actor, revision_uuid, error);
+    if (!encoded)
+        return std::nullopt;
+    const std::optional<RevisionManifest> manifest =
+        decodeRevisionManifest(*encoded, error);
+    if (!manifest)
+        return std::nullopt;
+    QVector<QByteArray> result;
+    for (const QPair<QUuid, QByteArray> &parent : manifest->parents)
+    {
+        const std::optional<QByteArray> bytes = exportRevisionManifest(
+            actor, parent.first, error);
+        if (!bytes)
+            return std::nullopt;
+        const std::optional<RevisionManifest> parent_manifest =
+            decodeRevisionManifest(*bytes, error);
+        if (!parent_manifest || parent_manifest->project_uuid != manifest->project_uuid ||
+            parent_manifest->revision_uuid != parent.first ||
+            parent_manifest->chain_sha256 != parent.second)
+        {
+            setError(error, QStringLiteral("Portable parent revision hash or project mismatch"));
+            return std::nullopt;
+        }
+        result.append(*bytes);
+    }
+    return result;
+}
+
+std::optional<RevisionContentInventory> Database::exportRevisionContentInventory(
+    const OperationContext &actor, const QUuid &revision_uuid,
+    QString *error) const
+{
+    // Reuse the authoritative manifest export for revision state, scope
+    // authorization, ancestry verification and chain-hash validation.
+    const std::optional<QByteArray> encoded = exportRevisionManifest(
+        actor, revision_uuid, error);
+    if (!encoded)
+        return std::nullopt;
+    const std::optional<RevisionManifest> manifest =
+        decodeRevisionManifest(*encoded, error);
+    if (!manifest)
+        return std::nullopt;
+    if (!manifest->object_mode)
+    {
+        setError(error, QStringLiteral(
+            "Content inventory is only available for finalized object-mode revisions"));
+        return std::nullopt;
+    }
+    const std::optional<merkle_tree::ContentInventory> content =
+        merkle_tree::contentInventory(this->database_,
+                                      manifest->object_root_sha256, error);
+    if (!content)
+        return std::nullopt;
+    RevisionContentInventory result;
+    result.revision_uuid = manifest->revision_uuid;
+    result.object_root_sha256 = manifest->object_root_sha256;
+    result.tree_sha256 = content->tree_sha256;
+    result.blob_sha256 = content->blob_sha256;
     return result;
 }
 
@@ -787,7 +887,7 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
     Finalization result;
     result.finalized_revision_uuid = r->uuid;
     result.snapshot_sha256 = QCryptographicHash::hash(*body, QCryptographicHash::Sha256);
-    result.chain_sha256 = chainDigest(r->project_uuid, r->branch_uuid, r->uuid,
+    result.chain_sha256 = revisionManifestChainHash(r->project_uuid, r->branch_uuid, r->uuid,
                                      parent_hashes, r->number, r->created_at_ms, now,
                                      title, message, result.snapshot_sha256,
                                      r->created_by_uuid, actor_uuid, *operation_digest, object_root);
@@ -1119,7 +1219,7 @@ IntegrityReport Database::verifyProjectUnchecked(const QUuid &project_uuid) cons
             }
             parent_hashes.append(qMakePair(parent_uuid, parent->chain_sha256));
         }
-        if (chainDigest(project_uuid, branch_uuid, current_uuid, parent_hashes,
+        if (revisionManifestChainHash(project_uuid, branch_uuid, current_uuid, parent_hashes,
                         number, created_at_ms, when, title, message, recorded_snapshot_hash,
                         creator_uuid, finalizer_uuid, expected_history_hash,
                         *mode == 1 ? stored_root : QByteArray(digest_length, '\0')) != recorded_chain_hash)

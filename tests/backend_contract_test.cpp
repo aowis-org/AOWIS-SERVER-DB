@@ -63,6 +63,20 @@ int main(int argc, char **argv)
     REQUIRE(contract.commit(connection, &error));
     REQUIRE(contract.hasSchema(connection, &error) == true);
     REQUIRE(contract.verifySchema(connection, &error));
+    REQUIRE(contract.hasColumn(connection, QStringLiteral("repository_identity"),
+                               QStringLiteral("uuid"), &error) == true);
+    {
+        QSqlQuery identity(connection);
+        REQUIRE_SQL(identity, identity.exec(QStringLiteral("SELECT uuid FROM repository_identity")));
+        REQUIRE_SQL(identity, identity.next());
+        const QUuid repository_uuid = contract.readUuid(identity.value(0));
+        REQUIRE(!repository_uuid.isNull());
+        REQUIRE((static_cast<unsigned char>(repository_uuid.toRfc4122().at(6)) >> 4) == 7);
+        REQUIRE_SQL(identity, !identity.next());
+        identity.finish();
+        REQUIRE_SQL(identity, !identity.exec(QStringLiteral("UPDATE repository_identity SET uuid=uuid")));
+        REQUIRE_SQL(identity, !identity.exec(QStringLiteral("DELETE FROM repository_identity")));
+    }
     REQUIRE(contract.hasColumn(connection, QStringLiteral("branches"),
                                QStringLiteral("working_storage_uuid"), &error) == true);
     REQUIRE(contract.hasColumn(connection, QStringLiteral("revisions"),
@@ -101,6 +115,8 @@ int main(int argc, char **argv)
     Database db;
     REQUIRE(db.openSqlite(file, &error));
     REQUIRE(db.isOpen());
+    const std::optional<QUuid> reopened_repository_uuid = db.repositoryUuid(&error);
+    REQUIRE(reopened_repository_uuid.has_value() && !reopened_repository_uuid->isNull());
     REQUIRE(db.bootstrapAdministrator(QStringLiteral("second"), &error).has_value() == false);
     db.close();
 
@@ -122,6 +138,8 @@ int main(int argc, char **argv)
     // Fresh empty-file creation is independent of previously damaged files.
     const QString fresh_file = temp.filePath(QStringLiteral("new.sqlite"));
     REQUIRE(db.openSqlite(fresh_file, &error));
+    REQUIRE(db.repositoryUuid(&error).has_value());
+    REQUIRE(db.repositoryUuid(&error) != reopened_repository_uuid);
     const std::optional<aowis::db::UserInfo> administrator =
         db.bootstrapAdministrator(QStringLiteral("operator"), &error);
     REQUIRE(administrator.has_value());
@@ -242,6 +260,24 @@ int main(int argc, char **argv)
             REQUIRE(postgres_contract.createSchema(pg_connection, &error));
             REQUIRE(postgres_contract.hasSchema(pg_connection, &error) == true);
             REQUIRE(postgres_contract.verifySchema(pg_connection, &error));
+            {
+                QSqlQuery identity(pg_connection);
+                REQUIRE_SQL(identity, identity.exec(QStringLiteral("SELECT uuid FROM repository_identity")));
+                REQUIRE_SQL(identity, identity.next());
+                const QUuid repository_uuid = postgres_contract.readUuid(identity.value(0));
+                REQUIRE(!repository_uuid.isNull());
+                REQUIRE((static_cast<unsigned char>(repository_uuid.toRfc4122().at(6)) >> 4) == 7);
+                REQUIRE_SQL(identity, !identity.next());
+                identity.finish();
+                REQUIRE_SQL(identity, identity.exec(QStringLiteral("SAVEPOINT repository_identity_guard")));
+                REQUIRE_SQL(identity, !identity.exec(QStringLiteral("UPDATE repository_identity SET uuid=uuid")));
+                REQUIRE_SQL(identity, identity.exec(QStringLiteral("ROLLBACK TO SAVEPOINT repository_identity_guard")));
+                REQUIRE_SQL(identity, identity.exec(QStringLiteral("RELEASE SAVEPOINT repository_identity_guard")));
+                REQUIRE_SQL(identity, identity.exec(QStringLiteral("SAVEPOINT repository_identity_guard")));
+                REQUIRE_SQL(identity, !identity.exec(QStringLiteral("DELETE FROM repository_identity")));
+                REQUIRE_SQL(identity, identity.exec(QStringLiteral("ROLLBACK TO SAVEPOINT repository_identity_guard")));
+                REQUIRE_SQL(identity, identity.exec(QStringLiteral("RELEASE SAVEPOINT repository_identity_guard")));
+            }
             REQUIRE(postgres_contract.hasColumn(pg_connection, QStringLiteral("branches"),
                                                 QStringLiteral("working_storage_uuid"), &error) == true);
             REQUIRE(postgres_contract.hasColumn(pg_connection, QStringLiteral("revisions"),

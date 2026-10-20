@@ -1,4 +1,5 @@
 #include "postgres_backend.h"
+#include <aowis/model/uuid.h>
 
 #include <QSqlError>
 #include <QSqlQuery>
@@ -155,6 +156,10 @@ const char *const statements[] = {
     created_at_ms BIGINT NOT NULL,
     archived_at_ms BIGINT,
     created_by_uuid UUID
+))SQL",
+    R"SQL(CREATE TABLE repository_identity (
+    slot SMALLINT PRIMARY KEY NOT NULL CHECK(slot=1),
+    uuid UUID NOT NULL UNIQUE
 ))SQL",
     R"SQL(CREATE TABLE revision_objects (
     storage_uuid UUID NOT NULL,
@@ -336,6 +341,13 @@ const char *const statements[] = {
     R"SQL(CREATE INDEX user_sessions_by_user ON user_sessions(user_uuid))SQL",
     R"SQL(CREATE UNIQUE INDEX users_username_nocase_unique ON users(lower(username)))SQL",
     R"SQL(CREATE UNIQUE INDEX groups_name_nocase_unique ON groups(lower(name)))SQL",
+    R"SQL(CREATE FUNCTION aowis_guard_repository_identity_immutable() RETURNS trigger LANGUAGE plpgsql AS $aowis$
+BEGIN
+    RAISE EXCEPTION 'repository identity is immutable' USING ERRCODE = '23514';
+END
+$aowis$)SQL",
+    R"SQL(CREATE TRIGGER repository_identity_no_update BEFORE UPDATE ON repository_identity FOR EACH ROW EXECUTE FUNCTION aowis_guard_repository_identity_immutable())SQL",
+    R"SQL(CREATE TRIGGER repository_identity_no_delete BEFORE DELETE ON repository_identity FOR EACH ROW EXECUTE FUNCTION aowis_guard_repository_identity_immutable())SQL",
     R"SQL(CREATE FUNCTION aowis_guard_content_objects_immutable() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
     RAISE EXCEPTION 'content objects are immutable' USING ERRCODE = '23514';
@@ -1029,6 +1041,20 @@ bool PostgresBackend::createSchema(const QSqlDatabase &database, QString *error)
         if (!run(database, QString::fromUtf8(statement), error))
             return false;
     }
+    QSqlQuery identity(database);
+    if (!identity.prepare(QStringLiteral("INSERT INTO repository_identity(slot,uuid) VALUES (1,?)")))
+    {
+        if (error != nullptr)
+            *error = identity.lastError().text();
+        return false;
+    }
+    identity.addBindValue(bindUuid(createUuidV7()));
+    if (!identity.exec())
+    {
+        if (error != nullptr)
+            *error = identity.lastError().text();
+        return false;
+    }
     return true;
 }
 
@@ -1048,6 +1074,7 @@ bool PostgresBackend::verifySchema(const QSqlDatabase &database, QString *error)
         QStringLiteral("password_recovery_tokens"),
         QStringLiteral("permissions"),
         QStringLiteral("projects"),
+        QStringLiteral("repository_identity"),
         QStringLiteral("revision_objects"),
         QStringLiteral("revision_parents"),
         QStringLiteral("revisions"),
@@ -1130,6 +1157,8 @@ bool PostgresBackend::verifySchema(const QSqlDatabase &database, QString *error)
         QStringLiteral("branch_working_storage_readonly"),
         QStringLiteral("content_objects_no_update"),
         QStringLiteral("content_objects_no_delete"),
+        QStringLiteral("repository_identity_no_update"),
+        QStringLiteral("repository_identity_no_delete"),
         QStringLiteral("finalize_actor_required"),
         QStringLiteral("finalize_requires_history_hash"),
         QStringLiteral("finalize_requires_snapshot"),
@@ -1181,6 +1210,14 @@ bool PostgresBackend::verifySchema(const QSqlDatabase &database, QString *error)
         QStringLiteral("user_sessions_immutable_delete"),
         QStringLiteral("user_sessions_immutable_identity")
     };
+    QSqlQuery identity(database);
+    if (!identity.exec(QStringLiteral("SELECT uuid FROM repository_identity WHERE slot=1")) ||
+        !identity.next() || readUuid(identity.value(0)).isNull())
+    {
+        if (error != nullptr)
+            *error = QStringLiteral("PostgreSQL repository identity is missing or invalid");
+        return false;
+    }
     // Check every expected name, not merely the aggregate count: a damaged
     // database must not silently lose a security or immutability guard.
     return checkObjects(database, QStringLiteral(

@@ -20,10 +20,34 @@ clients to a single database without copying a repository's history.
 
 ## Required invariants
 
+- **Repository identity.** Each independently initialized SQLite database or
+  PostgreSQL AOWIS schema has one persistent, write-protected UUIDv7, exposed
+  by the local `Database::repositoryUuid()` API. Reopening a repository preserves
+  this identifier. A future clone must receive a **fresh repository UUID** while
+  retaining the transferred project/branch/revision UUIDs. This identifies a
+  storage replica, not a user or an authentication credential. Remote-tracking
+  reference names and trust negotiation remain to be specified.
 - **Global identities.** Project, branch, revision and model-object UUIDs must
   retain their identities across replica boundaries. Revision numbers are
-  branch-local, not global identities. Repository identity and names for
-  remote-tracking refs still need a specification.
+  branch-local, not global identities.
+- **Portable revision manifests.** Finalized revisions can now be exported
+  as canonical, backend-independent `AOWIS-REVISION-MANIFEST-V1` binary
+  frames using `Database::exportRevisionManifest()`. The frame includes
+  original project/branch/revision and author UUIDs; branch-local revision
+  number; creation/finalization timestamps; title/message; snapshot and
+  operation-history digests; the optional object Merkle root; ordered parent
+  UUIDs AND parent chain digests; object-mode discriminator; and the exact
+  existing revision-chain SHA-256. The transport codec validates all fields,
+  rejects noncanonical framing, and recomputes the original
+  `AOWIS-REVISION-DAG-V1` hash. It does **not** transfer snapshot bytes,
+  events, Merkle nodes, author credentials or mutable SQL rows. It does not
+  prove remote parent availability or underlying content integrity, and
+  importing/publishing revisions is not implemented yet.
+- **Read-only dependency discovery.** `Database::exportRevisionContentInventory()`
+  can enumerate and verify all content-store tree and blob dependencies of a
+  finalized **object-mode** revision, using sorted unique hashes. This does
+  not cover opaque snapshot bytes, journals or ancestor revisions, and no
+  import/transfer operation exists yet.
 - **Immutable transfer.** Revisions point to immutable, content-addressed
   records and snapshot roots; identical content hashes must name identical
   verified bytes on SQLite and PostgreSQL.
@@ -73,6 +97,7 @@ replication system**. In particular, local merge correctness is not a
 substitute for validating externally supplied revisions, authentication,
 ref-update races and partial-transfer recovery.
 
-See [Versioned storage](versioned-storage.md),
+See [Canonical revision manifests](revision-manifests.md),
+[Versioned storage](versioned-storage.md),
 [Architecture](architecture.md), [History and merges](history-and-merges.md)
 and [Identity and access](identity-and-access.md).

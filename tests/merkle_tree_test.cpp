@@ -115,6 +115,15 @@ bool exercise(const QSqlDatabase &database, QString &error)
     REQUIRE(tree::emptyRoot(database, &error) == empty);
     const std::optional<QVector<tree::Entry>> nothing = tree::entries(database, *empty, &error);
     REQUIRE(nothing && nothing->isEmpty());
+    const std::optional<tree::ContentInventory> empty_inventory =
+        tree::contentInventory(database, *empty, &error);
+    REQUIRE(empty_inventory.has_value());
+    REQUIRE(empty_inventory->tree_sha256.size() == 1);
+    REQUIRE(empty_inventory->tree_sha256.first() == *empty);
+    REQUIRE(empty_inventory->blob_sha256.isEmpty());
+    REQUIRE(!tree::contentInventory(database, QByteArray(31, 'x'), &error));
+    REQUIRE(!error.isEmpty());
+    error.clear();
     REQUIRE(!tree::lookup(database, *empty, a, &error) && error.isEmpty());
     REQUIRE(tree::update(database, *empty, tree::Change{a, std::nullopt}, &error) == empty);
 
@@ -137,6 +146,22 @@ bool exercise(const QSqlDatabase &database, QString &error)
         database, *root_abc, tree::Change{d, *y}, &error);
     REQUIRE(root_abcd && *root_abcd != *root_abc);
     REQUIRE(tree::lookup(database, *root_abcd, d, &error) == y);
+    const std::optional<tree::ContentInventory> inventory =
+        tree::contentInventory(database, *root_abcd, &error);
+    REQUIRE(inventory.has_value());
+    REQUIRE(inventory->tree_sha256.size() >= 5);
+    REQUIRE(std::is_sorted(inventory->tree_sha256.cbegin(), inventory->tree_sha256.cend()));
+    REQUIRE(std::adjacent_find(inventory->tree_sha256.cbegin(),
+                               inventory->tree_sha256.cend()) == inventory->tree_sha256.cend());
+    REQUIRE(std::find(inventory->tree_sha256.cbegin(), inventory->tree_sha256.cend(),
+                      *root_abcd) != inventory->tree_sha256.cend());
+    QVector<QByteArray> expected_blobs{*x, *y};
+    std::sort(expected_blobs.begin(), expected_blobs.end());
+    REQUIRE(inventory->blob_sha256 == expected_blobs);
+    const std::optional<tree::ContentInventory> repeated_inventory =
+        tree::contentInventory(database, *root_abcd, &error);
+    REQUIRE(repeated_inventory.has_value());
+    REQUIRE(repeated_inventory->tree_sha256 == inventory->tree_sha256);
     REQUIRE(tree::lookup(database, *root_abcd, b, &error) == x);
     REQUIRE(tree::lookup(database, *root_abcd, absent, &error) == std::nullopt);
     REQUIRE(error.isEmpty());
