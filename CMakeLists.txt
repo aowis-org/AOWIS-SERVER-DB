@@ -76,6 +76,7 @@ add_library(aowis-db-core STATIC
     src/merkle_tree.cpp
     src/revision_root.h
     src/revision_root.cpp
+    src/working_storage.cpp
     src/object_groups.cpp
     src/model_codec.cpp
     src/model_persistence.cpp

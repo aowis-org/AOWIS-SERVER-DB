@@ -36,6 +36,66 @@ std::optional<QByteArray> blob(const QSqlDatabase &database, const QByteArray &b
     return content::put(database, content::Kind::Blob, bytes, &error);
 }
 
+// Independent oracle: enumerate each snapshot completely, then merge their
+// sorted UUID listings. The native diff must produce precisely that sequence.
+bool compareDiffWithFullScan(const QSqlDatabase &database,
+                             const QByteArray &before_root,
+                             const QByteArray &after_root,
+                             QString &error, tree::DiffStats *statistics = nullptr)
+{
+    const std::optional<QVector<tree::Entry>> before =
+        tree::entries(database, before_root, &error);
+    REQUIRE(before.has_value());
+    const std::optional<QVector<tree::Entry>> after =
+        tree::entries(database, after_root, &error);
+    REQUIRE(after.has_value());
+    QVector<tree::Difference> expected;
+    qsizetype left = 0;
+    qsizetype right = 0;
+    while (left < before->size() || right < after->size())
+    {
+        if (right == after->size() ||
+            (left < before->size() &&
+             before->at(left).key.toRfc4122() < after->at(right).key.toRfc4122()))
+        {
+            expected.append(tree::Difference{before->at(left).key, before->at(left).blob_sha256, std::nullopt});
+            ++left;
+        }
+        else if (left == before->size() ||
+                 after->at(right).key.toRfc4122() < before->at(left).key.toRfc4122())
+        {
+            expected.append(tree::Difference{after->at(right).key, std::nullopt, after->at(right).blob_sha256});
+            ++right;
+        }
+        else
+        {
+            if (before->at(left).blob_sha256 != after->at(right).blob_sha256)
+                expected.append(tree::Difference{before->at(left).key, before->at(left).blob_sha256,
+                                                 after->at(right).blob_sha256});
+            ++left;
+            ++right;
+        }
+    }
+    QVector<tree::Difference> actual;
+    tree::DiffStats local_statistics;
+    REQUIRE(tree::diff(database, before_root, after_root,
+        [&actual](const tree::Difference &item) {
+            actual.append(item);
+            return true;
+        }, &error, &local_statistics));
+    REQUIRE(actual.size() == expected.size());
+    for (qsizetype index = 0; index < expected.size(); ++index)
+    {
+        REQUIRE(actual.at(index).key == expected.at(index).key);
+        REQUIRE(actual.at(index).before_sha256 == expected.at(index).before_sha256);
+        REQUIRE(actual.at(index).after_sha256 == expected.at(index).after_sha256);
+    }
+    REQUIRE(local_statistics.differences_emitted == static_cast<quint64>(actual.size()));
+    if (statistics != nullptr)
+        *statistics = local_statistics;
+    return true;
+}
+
 bool exercise(const QSqlDatabase &database, QString &error)
 {
     const QUuid a = keyFromHex("0102030405060708090a0b0c0d0e0f10");
@@ -109,6 +169,40 @@ bool exercise(const QSqlDatabase &database, QString &error)
         database, *changed, tree::Change{a, *x}, &error);
     REQUIRE(restored == root_abcd); // Deterministic content-addressed roots.
 
+    // The native Merkle diff must agree with a full ordered listing even
+    // when prefix compression changes the shape of either side.
+    REQUIRE(compareDiffWithFullScan(database, *empty, *empty, error));
+    REQUIRE(compareDiffWithFullScan(database, *empty, *root_a, error));
+    REQUIRE(compareDiffWithFullScan(database, *root_a, *empty, error));
+    REQUIRE(compareDiffWithFullScan(database, *root_a, *root_abcd, error));
+    REQUIRE(compareDiffWithFullScan(database, *root_abcd, *root_a, error));
+    REQUIRE(compareDiffWithFullScan(database, *root_abcd, *changed, error));
+    REQUIRE(compareDiffWithFullScan(database, *changed, *root_abcd, error));
+    REQUIRE(compareDiffWithFullScan(database, *changed, *restored, error));
+    REQUIRE(compareDiffWithFullScan(database, *root_abcd, *root_abcd, error));
+    tree::DiffStats identical_statistics;
+    REQUIRE(tree::diff(database, *root_abcd, *root_abcd,
+        [](const tree::Difference &) { return false; },
+        &error, &identical_statistics));
+    REQUIRE(identical_statistics.tree_nodes_loaded == 1);
+    REQUIRE(identical_statistics.shared_subtrees_skipped == 1);
+    REQUIRE(identical_statistics.differences_emitted == 0);
+    REQUIRE(!tree::diff(database, *root_abcd, *changed,
+        [](const tree::Difference &) { return false; }, &error));
+    REQUIRE(error.contains(QStringLiteral("visitor stopped")));
+    error.clear();
+    REQUIRE(!tree::diff(database, *root_abcd, *changed, {}, &error));
+    REQUIRE(error.contains(QStringLiteral("requires a visitor")));
+    error.clear();
+    REQUIRE(!tree::diff(database, QByteArray(31, 'z'), *changed,
+        [](const tree::Difference &) { return true; }, &error));
+    REQUIRE(error.contains(QStringLiteral("root digest length")));
+    error.clear();
+    REQUIRE(!tree::diff(database, QByteArray(32, 'z'), *changed,
+        [](const tree::Difference &) { return true; }, &error));
+    REQUIRE(!error.isEmpty());
+    error.clear();
+
     // Deletions collapse compressed paths into canonical trees: insertion
     // history does not affect the root for the same logical UUID->hash map.
     const std::optional<QByteArray> remove_d = tree::update(
@@ -163,6 +257,10 @@ bool exercise(const QSqlDatabase &database, QString &error)
     REQUIRE(!tree::entries(database, *malformed, &error));
     REQUIRE(error.contains(QStringLiteral("magic")));
     error.clear();
+    REQUIRE(!tree::diff(database, *malformed, *root_abcd,
+        [](const tree::Difference &) { return true; }, &error));
+    REQUIRE(error.contains(QStringLiteral("magic")));
+    error.clear();
 
     const std::optional<QVector<tree::Entry>> list = tree::entries(database, *root_abcd, &error);
     REQUIRE(list && list->size() == 4);
@@ -191,6 +289,25 @@ bool exercise(const QSqlDatabase &database, QString &error)
     REQUIRE(many_list && many_list->size() == many.size());
     for (const tree::Change &change : many)
         REQUIRE(tree::lookup(database, *many_root, change.key, &error) == change.blob_sha256);
+    // Compare two large, structurally shared trees using three sparse edits:
+    // one deletion, one modification, and one addition. Only the changed
+    // regions should require reads; shared subtrees must be skipped.
+    const std::optional<QByteArray> sparse_changes_root = tree::apply(
+        database, *many_root,
+        {{many.at(100).key, std::nullopt},
+         {many.at(127).key, *x},
+         {absent, *y}}, &error);
+    REQUIRE(sparse_changes_root.has_value());
+    tree::DiffStats sparse_statistics;
+    REQUIRE(compareDiffWithFullScan(database, *many_root,
+                                    *sparse_changes_root, error,
+                                    &sparse_statistics));
+    REQUIRE(compareDiffWithFullScan(database, *sparse_changes_root,
+                                    *many_root, error));
+    REQUIRE(sparse_statistics.differences_emitted == 3);
+    REQUIRE(sparse_statistics.shared_subtrees_skipped > 0);
+    REQUIRE(sparse_statistics.tree_nodes_loaded < static_cast<quint64>(many.size()));
+
     // More than one 256-hash read batch, including many keys with a shared
     // prefix, must return exactly the same values as individual lookups.
     QSet<QUuid> bulk_selection;
@@ -206,6 +323,107 @@ bool exercise(const QSqlDatabase &database, QString &error)
     REQUIRE(tree::lookup(database, *root_abcd, a, &error) == x);
     const std::optional<QVector<tree::Entry>> still_empty = tree::entries(database, *empty, &error);
     REQUIRE(still_empty && still_empty->isEmpty());
+
+    // Batch modification must be identical to the independent point-update
+    // oracle. Exercise shared prefixes, distant forks, missing deletions,
+    // modified leaves, collapsed paths and whole-subtree removal. Vary the
+    // order within batches; neither canonical roots nor stored history may
+    // depend on the order in which callers supplied unique UUIDs.
+    QVector<QUuid> batch_keys;
+    for (int index = 0; index < 240; ++index)
+    {
+        QByteArray bytes = a.toRfc4122();
+        bytes[0] = static_cast<char>(index % 5 == 0 ? 0xf1 : 0x01);
+        bytes[1] = static_cast<char>((index / 5) & 0xff);
+        bytes[13] = static_cast<char>((index * 7) & 0xff);
+        bytes[14] = static_cast<char>((index * 11) & 0xff);
+        bytes[15] = static_cast<char>((index * 19) & 0xff);
+        batch_keys.append(QUuid::fromRfc4122(bytes));
+    }
+    QByteArray iterative_root = *empty;
+    QByteArray batched_root = *empty;
+    for (int round = 0; round < 24; ++round)
+    {
+        QVector<tree::Change> modifications;
+        for (int item = 0; item < 19; ++item)
+        {
+            const int key_index = (round * 47 + item * 13) % batch_keys.size();
+            const std::optional<QByteArray> value = ((round + item) % 5 == 0)
+                ? std::nullopt
+                : std::optional<QByteArray>(((round + item) % 2 == 0) ? *x : *y);
+            modifications.append(tree::Change{batch_keys.at(key_index), value});
+        }
+        const std::optional<QByteArray> batched = tree::apply(
+            database, batched_root, modifications, &error);
+        REQUIRE(batched.has_value());
+        std::sort(modifications.begin(), modifications.end(),
+                  [](const tree::Change &left, const tree::Change &right) {
+                      return left.key.toRfc4122() < right.key.toRfc4122();
+                  });
+        for (const tree::Change &change : modifications)
+        {
+            const std::optional<QByteArray> next = tree::update(
+                database, iterative_root, change, &error);
+            REQUIRE(next.has_value());
+            iterative_root = *next;
+        }
+        batched_root = *batched;
+        REQUIRE(batched_root == iterative_root);
+        REQUIRE(compareDiffWithFullScan(database, batched_root, iterative_root, error));
+        const std::optional<QByteArray> again = tree::apply(
+            database, batched_root, modifications, &error);
+        REQUIRE(again == batched_root);
+    }
+    // Remove everything with one grouped update; canonical empty root must
+    // be produced without persisting a sequence of partial intermediate trees.
+    const std::optional<QVector<tree::Entry>> surviving = tree::entries(
+        database, batched_root, &error);
+    REQUIRE(surviving.has_value());
+    QVector<tree::Change> clear_batch;
+    for (const tree::Entry &entry : *surviving)
+        clear_batch.append(tree::Change{entry.key, std::nullopt});
+    REQUIRE(tree::apply(database, batched_root, clear_batch, &error) == empty);
+    REQUIRE(tree::apply(database, *empty, clear_batch, &error) == empty);
+    REQUIRE(tree::apply(database, *empty, {}, &error) == empty);
+    REQUIRE(!tree::apply(database, QByteArray(32, 'z'), {}, &error));
+    REQUIRE(!error.isEmpty());
+    error.clear();
+    REQUIRE(!tree::apply(database, *empty, {{a, QByteArray(32, 'z')}}, &error));
+    REQUIRE(error.contains(QStringLiteral("not found")));
+    error.clear();
+
+    // A fresh bulk apply must persist only canonical reachable nodes. A
+    // compressed radix tree of N unique keys has N leaves and at most N-1
+    // branching nodes. Intermediate per-key roots would violate this bound.
+    QVector<tree::Change> fresh_batch;
+    for (int index = 0; index < 320; ++index)
+    {
+        QByteArray bytes = a.toRfc4122();
+        bytes[0] = static_cast<char>(0xee);
+        bytes[13] = static_cast<char>((index >> 8) & 0xff);
+        bytes[14] = static_cast<char>(index & 0xff);
+        bytes[15] = static_cast<char>(index ^ 0x63);
+        fresh_batch.append(tree::Change{QUuid::fromRfc4122(bytes), *x});
+    }
+    QSqlQuery fresh_count(database);
+    REQUIRE(fresh_count.exec(QStringLiteral(
+        "SELECT COUNT(*) FROM content_objects WHERE kind='tree'")));
+    REQUIRE(fresh_count.next());
+    const qint64 initial_tree_count = fresh_count.value(0).toLongLong();
+    fresh_count.finish();
+    const std::optional<QByteArray> fresh_root = tree::apply(
+        database, *empty, fresh_batch, &error);
+    REQUIRE(fresh_root.has_value());
+    REQUIRE(tree::build(database, fresh_batch, &error) == fresh_root);
+    const std::optional<QVector<tree::Entry>> fresh_entries = tree::entries(
+        database, *fresh_root, &error);
+    REQUIRE(fresh_entries && fresh_entries->size() == fresh_batch.size());
+    REQUIRE(fresh_count.exec(QStringLiteral(
+        "SELECT COUNT(*) FROM content_objects WHERE kind='tree'")));
+    REQUIRE(fresh_count.next());
+    const qint64 new_tree_count = fresh_count.value(0).toLongLong() - initial_tree_count;
+    REQUIRE(new_tree_count >= 1 && new_tree_count <= 2 * fresh_batch.size() - 1);
+    fresh_count.finish();
 
     // A one-object modification must write only the affected search path,
     // not hundreds of copied leaf records (or rows for every older revision).
@@ -272,11 +490,15 @@ int main(int argc, char **argv)
         const QString name = QStringLiteral("merkle-postgres");
         {
             QSqlDatabase connection;
+            // Each test owns a unique, transaction-local schema, so a regular
+            // SQL transaction avoids contention on the public-schema
+            // advisory lock. beginWrite() is covered in backend_contract_test.
             if (!postgres.open(connection, name, QString::fromUtf8(pg_database_name), &error) ||
                 !postgres.configure(connection, &error) ||
-                !postgres.beginWrite(connection, &error))
+                !connection.transaction())
             {
-                qCritical().noquote() << "PostgreSQL Merkle setup failed:" << error;
+                qCritical().noquote() << "PostgreSQL Merkle setup failed:" << error
+                                       << connection.lastError().text();
                 return 1;
             }
             const QString schema = QStringLiteral("aowis_merkle_probe_") +
@@ -290,11 +512,11 @@ int main(int argc, char **argv)
             {
                 qCritical().noquote() << "PostgreSQL Merkle test failed:" << error
                                        << query.lastError().text();
-                postgres.rollback(connection);
+                connection.rollback();
                 return 1;
             }
             query = QSqlQuery();
-            postgres.rollback(connection); // transaction-local disposable schema
+            connection.rollback(); // transaction-local disposable schema
             connection.close();
         }
         QSqlDatabase::removeDatabase(name);

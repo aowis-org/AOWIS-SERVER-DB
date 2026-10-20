@@ -258,7 +258,7 @@ int main(int argc, char **argv)
         REQUIRE(inspector.open());
         QSqlQuery query(inspector);
         REQUIRE(query.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+            "SELECT COUNT(*) FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working')")));
         query.addBindValue(project->working_revision_uuid.toRfc4122());
         REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 0);
         query.finish();

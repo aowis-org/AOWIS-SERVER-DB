@@ -28,6 +28,78 @@ namespace
 // The environment variable deliberately identifies a dedicated *test*
 // database, never AOWIS's configured operational database. Only the new,
 // randomly named benchmark schema is created and dropped.
+struct StorageCounts
+{
+    qint64 working_objects = -1;
+    qint64 network_members = -1;
+    qint64 network_references = -1;
+    qint64 object_events = -1;
+    qint64 revision_rows = -1;
+    qint64 content_blobs = -1;
+    qint64 content_tree_nodes = -1;
+    qint64 content_payload_bytes = -1;
+};
+
+// Read-only measurements, deliberately outside timed model operations.
+// Relation and column names are static; only the internally generated,
+// validated temporary PostgreSQL schema name becomes part of a query.
+std::optional<StorageCounts> collectStorageCounts(QSqlDatabase &connection,
+    const QString &table_prefix, bool postgres, QString *error)
+{
+    StorageCounts result;
+    const auto count = [&connection, &table_prefix, error](const QString &table,
+                                                            qint64 *value) -> bool {
+        QSqlQuery query(connection);
+        if (!query.exec(QStringLiteral("SELECT COUNT(*) FROM %1%2")
+                            .arg(table_prefix, table)) || !query.next())
+        {
+            *error = query.lastError().text();
+            return false;
+        }
+        *value = query.value(0).toLongLong();
+        return true;
+    };
+    if (!count(QStringLiteral("revision_objects"), &result.working_objects) ||
+        !count(QStringLiteral("hydraulic_network_members"), &result.network_members) ||
+        !count(QStringLiteral("hydraulic_network_references"), &result.network_references) ||
+        !count(QStringLiteral("object_events"), &result.object_events) ||
+        !count(QStringLiteral("revisions"), &result.revision_rows))
+        return std::nullopt;
+    QSqlQuery content(connection);
+    const QString length_function = postgres
+        ? QStringLiteral("OCTET_LENGTH") : QStringLiteral("LENGTH");
+    if (!content.exec(QStringLiteral(
+            "SELECT kind, COUNT(*), COALESCE(SUM(%1(payload)), 0) "
+            "FROM %2content_objects GROUP BY kind").arg(length_function, table_prefix)))
+    {
+        *error = content.lastError().text();
+        return std::nullopt;
+    }
+    result.content_blobs = 0;
+    result.content_tree_nodes = 0;
+    result.content_payload_bytes = 0;
+    while (content.next())
+    {
+        const QString kind = content.value(0).toString();
+        if (kind == QStringLiteral("blob"))
+            result.content_blobs = content.value(1).toLongLong();
+        else if (kind == QStringLiteral("tree"))
+            result.content_tree_nodes = content.value(1).toLongLong();
+        else
+        {
+            *error = QStringLiteral("Unexpected content kind: %1").arg(kind);
+            return std::nullopt;
+        }
+        result.content_payload_bytes += content.value(2).toLongLong();
+    }
+    if (content.lastError().isValid())
+    {
+        *error = content.lastError().text();
+        return std::nullopt;
+    }
+    return result;
+}
+
 class TemporaryPostgresSchema final
 {
 public:
@@ -91,16 +163,10 @@ public:
     QString databaseName() const { return this->database_name_; }
     QString schemaName() const { return this->schema_name_; }
 
-    std::optional<qint64> objectRows(QString *error) const
+    std::optional<StorageCounts> storageCounts(QString *error)
     {
-        QSqlQuery rows(this->connection_);
-        if (!rows.exec(QStringLiteral("SELECT COUNT(*) FROM %1.revision_objects").arg(this->schema_name_)) ||
-            !rows.next())
-        {
-            *error = rows.lastError().text();
-            return std::nullopt;
-        }
-        return rows.value(0).toLongLong();
+        return collectStorageCounts(this->connection_, this->schema_name_ + QLatin1Char('.'),
+                                    true, error);
     }
 
     std::optional<qint64> storageBytes(QString *error) const
@@ -131,29 +197,21 @@ private:
     bool created_ = false;
 };
 
-std::optional<qint64> sqliteObjectRows(const QString &path, QString *error)
+std::optional<StorageCounts> sqliteStorageCounts(const QString &path, QString *error)
 {
     const QString connection_name = QStringLiteral("aowis-benchmark-count-") +
         createUuidV7().toString(QUuid::Id128);
-    qint64 result = -1;
+    std::optional<StorageCounts> result;
     {
         QSqlDatabase connection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection_name);
         connection.setDatabaseName(path);
         if (!connection.open())
             *error = connection.lastError().text();
         else
-        {
-            QSqlQuery rows(connection);
-            if (rows.exec(QStringLiteral("SELECT COUNT(*) FROM revision_objects")) && rows.next())
-                result = rows.value(0).toLongLong();
-            else
-                *error = rows.lastError().text();
-        }
+            result = collectStorageCounts(connection, QString(), false, error);
         connection.close();
     }
     QSqlDatabase::removeDatabase(connection_name);
-    if (result < 0)
-        return std::nullopt;
     return result;
 }
 }
@@ -231,6 +289,9 @@ int main(int argc, char **argv)
     bool measure_memory = false;
     bool deep_verify = false;
     bool has_count = false;
+    bool compare_branches = false;
+    bool edits_option_seen = false;
+    int changes_per_revision = 1;
     int count = 1000;
     int revision_count = 1;
     bool revisions_option_seen = false;
@@ -239,10 +300,12 @@ int main(int argc, char **argv)
         const QString argument = arguments.at(index);
         if (argument == QStringLiteral("--help"))
         {
-            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile] [--memory] [--deep-verify]\n"
+            output << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--edits N] [--compare] [--postgres] [--profile] [--memory] [--deep-verify]\n"
                       "Default PIPE_COUNT: 1000; allowed range: 1..100000.\n"
                       "Default revisions: 1; allowed range: 1..100 finalized revisions.\n"
-                      "Each additional revision changes one junction and finalizes.\n"
+                      "--edits N changes N distinct junctions in each revision (default: 1).\n"
+                      "--compare creates a divergent finalized branch, compares ancestry,\n"
+                      "and measures a read-only three-way merge preview.\n"
                       "SQLite uses a temporary file. PostgreSQL requires a dedicated\n"
                       "AOWIS_DB_TEST_PG_DB and libpq PG* connection settings;\n"
                       "a random temporary schema is created and deleted.\n"
@@ -250,6 +313,24 @@ int main(int argc, char **argv)
                       "--memory prints current and peak process RSS at workload checkpoints.\n"
                       "--deep-verify also replays object journals against Merkle revisions.\n";
             return 0;
+        }
+        if (argument == QStringLiteral("--compare") && !compare_branches)
+        {
+            compare_branches = true;
+            continue;
+        }
+        if (argument == QStringLiteral("--edits") && !edits_option_seen)
+        {
+            edits_option_seen = true;
+            bool edits_ok = false;
+            if (index + 1 < arguments.size())
+                changes_per_revision = arguments.at(++index).toInt(&edits_ok);
+            if (!edits_ok || changes_per_revision < 1 || changes_per_revision > 100000)
+            {
+                errors << "--edits requires an integer between 1 and 100000.\n";
+                return 2;
+            }
+            continue;
         }
         if (argument == QStringLiteral("--profile") && !profile_phases)
         {
@@ -288,12 +369,23 @@ int main(int argc, char **argv)
         const int parsed_count = argument.toInt(&number_ok);
         if (has_count || !number_ok || parsed_count < 1 || parsed_count > 100000)
         {
-            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--postgres] [--profile] [--memory] [--deep-verify]\n"
+            errors << "Usage: aowis-db-network-benchmark [PIPE_COUNT] [--revisions N] [--edits N] [--compare] [--postgres] [--profile] [--memory] [--deep-verify]\n"
                       "PIPE_COUNT must be an integer between 1 and 100000.\n";
             return 2;
         }
         has_count = true;
         count = parsed_count;
+    }
+
+    if (changes_per_revision > count)
+    {
+        errors << "--edits cannot exceed PIPE_COUNT.\n";
+        return 2;
+    }
+    if (compare_branches && (revision_count < 2 || count < 2))
+    {
+        errors << "--compare requires --revisions 2 or greater and PIPE_COUNT 2 or greater.\n";
+        return 2;
     }
 
     // This benchmark is single-process and uses disposable databases. Enable
@@ -432,6 +524,7 @@ int main(int argc, char **argv)
     const qint64 unchanged_save_ms = timer.elapsed();
     checkpoint("unchanged_save");
 
+    const double first_junction_initial_elevation = network.nodes_junctions.first().elevation_m;
     HydraulicNodeJunction updated_junction = network.nodes_junctions.first();
     updated_junction.elevation_m += 1.0;
     timer.restart();
@@ -439,6 +532,18 @@ int main(int argc, char **argv)
                                       updated_junction, 1, &error))
         return fail(QStringLiteral("Edit one junction"));
     const qint64 single_edit_ms = timer.elapsed();
+    qint64 first_edit_total_ms = single_edit_ms;
+    network.nodes_junctions[0].elevation_m = updated_junction.elevation_m;
+    for (int index = 1; index < changes_per_revision; ++index)
+    {
+        HydraulicNodeJunction &junction = network.nodes_junctions[index];
+        junction.elevation_m += 1.0;
+        timer.restart();
+        if (!aowis::db::putHydraulicEntity(database, actor, project->main_branch_uuid,
+                                          junction, 1, &error))
+            return fail(QStringLiteral("Edit junction in first batch"));
+        first_edit_total_ms += timer.elapsed();
+    }
 
     const std::optional<aowis::db::RevisionInfo> edited = database.revision(
         actor, project->working_revision_uuid, &error);
@@ -454,27 +559,34 @@ int main(int argc, char **argv)
     checkpoint("first_finalize");
 
     // Revision-growth workload: every successive working revision inherits all
-    // existing objects. Change only one junction before each finalization so
+    // existing objects. Change only the selected junctions before finalization so
     // the measurements expose the cost of copying largely unchanged models.
     // All data lives in a disposable database/schema; this is NOT a CTest.
     QUuid current_working_revision = finalization->new_working_revision_uuid;
+    QUuid latest_finalized_revision = finalization->finalized_revision_uuid;
     qint64 total_repeated_edit_ms = 0;
     qint64 total_repeated_finalize_ms = 0;
     qint64 max_repeated_finalize_ms = 0;
     QStringList revision_samples;
-    revision_samples.append(QStringLiteral("1:%1:%2").arg(single_edit_ms).arg(finalize_ms));
+    revision_samples.append(QStringLiteral("1:%1:%2").arg(first_edit_total_ms).arg(finalize_ms));
     for (int revision_number = 2; revision_number <= revision_count; ++revision_number)
     {
-        const std::optional<aowis::db::ModelObject> current_entity = database.object(
-            actor, current_working_revision, updated_junction.uuid, &error);
-        if (!current_entity || current_entity->deleted)
-            return fail(QStringLiteral("Find junction for repeated edit"));
-        updated_junction.elevation_m += 1.0;
-        timer.restart();
-        if (!aowis::db::putHydraulicEntity(database, actor, project->main_branch_uuid,
-                                          updated_junction, current_entity->version, &error))
-            return fail(QStringLiteral("Edit junction in next revision"));
-        const qint64 edit_ms = timer.elapsed();
+        qint64 edit_ms = 0;
+        for (int index = 0; index < changes_per_revision; ++index)
+        {
+            HydraulicNodeJunction &junction = network.nodes_junctions[index];
+            const std::optional<aowis::db::ModelObject> current_entity = database.object(
+                actor, current_working_revision, junction.uuid, &error);
+            if (!current_entity || current_entity->deleted)
+                return fail(QStringLiteral("Find junction for repeated edit"));
+            junction.elevation_m += 1.0;
+            timer.restart();
+            if (!aowis::db::putHydraulicEntity(database, actor, project->main_branch_uuid,
+                                              junction, current_entity->version, &error))
+                return fail(QStringLiteral("Edit junction in next revision"));
+            edit_ms += timer.elapsed();
+        }
+        updated_junction = network.nodes_junctions.first();
         const std::optional<aowis::db::RevisionInfo> working = database.revision(
             actor, current_working_revision, &error);
         if (!working || working->finalized)
@@ -487,6 +599,7 @@ int main(int argc, char **argv)
             return fail(QStringLiteral("Finalize next revision"));
         const qint64 next_finalize_ms = timer.elapsed();
         current_working_revision = next->new_working_revision_uuid;
+        latest_finalized_revision = next->finalized_revision_uuid;
         total_repeated_edit_ms += edit_ms;
         total_repeated_finalize_ms += next_finalize_ms;
         if (next_finalize_ms > max_repeated_finalize_ms)
@@ -544,7 +657,7 @@ int main(int argc, char **argv)
         for (const HydraulicNodeJunction &junction : branch_model->nodes_junctions)
         {
             if (junction.uuid == updated_junction.uuid &&
-                junction.elevation_m == network.nodes_junctions.first().elevation_m + 1.0)
+                junction.elevation_m == first_junction_initial_elevation + 1.0)
                 preserved_baseline = true;
         }
         if (!preserved_baseline)
@@ -557,10 +670,81 @@ int main(int argc, char **argv)
     }
     checkpoint("branch_load_released");
 
+    qint64 ancestry_comparison_ms = -1;
+    qint64 merge_preview_ms = -1;
+    qint64 merge_preview_changes = -1;
+    qint64 merge_preview_conflicts = -1;
+    qint64 merge_preview_merkle_candidates = -1;
+    qint64 merge_preview_merkle_nodes_loaded = -1;
+    qint64 merge_preview_shared_subtrees_skipped = -1;
+    bool merge_preview_merkle_used = false;
+    qint64 divergent_branch_finalize_ms = -1;
+    if (compare_branches)
+    {
+        // Edit a different junction on a branch forked from revision 1.
+        // The main line has continued since revision 1; both tips have
+        // the same finalized merge base and contain disjoint changes when
+        // --edits is smaller than PIPE_COUNT.
+        HydraulicNodeJunction branch_junction = network.nodes_junctions.at(count - 1);
+        branch_junction.elevation_m =
+            100.0 + static_cast<double>((count - 1) % 100) + 2.0;
+        const std::optional<aowis::db::ModelObject> branch_entity = database.object(
+            actor, branch->head_revision_uuid, branch_junction.uuid, &error);
+        if (!branch_entity || branch_entity->deleted)
+            return fail(QStringLiteral("Find divergent branch junction"));
+        if (!aowis::db::putHydraulicEntity(database, actor, branch->uuid,
+                                          branch_junction, branch_entity->version, &error))
+            return fail(QStringLiteral("Edit divergent branch junction"));
+        const std::optional<aowis::db::RevisionInfo> branch_working = database.revision(
+            actor, branch->head_revision_uuid, &error);
+        if (!branch_working)
+            return fail(QStringLiteral("Read divergent branch working revision"));
+        timer.restart();
+        const std::optional<aowis::db::Finalization> branch_finalization = database.finalize(
+            actor, branch->uuid, branch_working->generation,
+            QStringLiteral("Benchmark divergent branch"), {}, &error);
+        if (!branch_finalization)
+            return fail(QStringLiteral("Finalize divergent branch"));
+        divergent_branch_finalize_ms = timer.elapsed();
+        checkpoint("divergent_branch_finalize");
+
+        timer.restart();
+        const std::optional<aowis::db::RevisionComparison> comparison = database.compareRevisions(
+            actor, latest_finalized_revision, branch_finalization->finalized_revision_uuid, &error);
+        if (!comparison || comparison->left_is_ancestor_of_right ||
+            comparison->right_is_ancestor_of_left ||
+            comparison->merge_base_revision_uuids.size() != 1 ||
+            comparison->merge_base_revision_uuids.first() != finalization->finalized_revision_uuid)
+        {
+            if (error.isEmpty())
+                error = QStringLiteral("Divergent branches do not have the expected common ancestor");
+            return fail(QStringLiteral("Compare divergent revision ancestry"));
+        }
+        ancestry_comparison_ms = timer.elapsed();
+        timer.restart();
+        const std::optional<aowis::db::ObjectMergePreview> preview = database.previewObjectMerge(
+            actor, latest_finalized_revision, branch_finalization->finalized_revision_uuid, &error);
+        if (!preview || preview->changes.isEmpty())
+        {
+            if (error.isEmpty())
+                error = QStringLiteral("Three-way preview produced no changes");
+            return fail(QStringLiteral("Preview divergent branches"));
+        }
+        merge_preview_ms = timer.elapsed();
+        merge_preview_changes = preview->changes.size();
+        merge_preview_conflicts = preview->conflict_count;
+        merge_preview_merkle_used = preview->merkle_candidate_scan_used;
+        merge_preview_merkle_candidates = static_cast<qint64>(preview->merkle_candidate_keys);
+        merge_preview_merkle_nodes_loaded = static_cast<qint64>(preview->merkle_tree_nodes_loaded);
+        merge_preview_shared_subtrees_skipped =
+            static_cast<qint64>(preview->merkle_shared_subtrees_skipped);
+        checkpoint("merge_preview");
+    }
+
     timer.restart();
     const aowis::db::IntegrityReport report = database.verifyProject(
         actor, project->project_uuid);
-    if (!report.valid || report.checked_revisions != revision_count)
+    if (!report.valid || report.checked_revisions != revision_count + (compare_branches ? 1 : 0))
     {
         error = report.error;
         return fail(QStringLiteral("Verify finalized history"));
@@ -574,7 +758,7 @@ int main(int argc, char **argv)
         timer.restart();
         const aowis::db::IntegrityReport deep_report = database.verifyProjectJournal(
             actor, project->project_uuid);
-        if (!deep_report.valid || deep_report.checked_revisions != revision_count)
+        if (!deep_report.valid || deep_report.checked_revisions != revision_count + (compare_branches ? 1 : 0))
         {
             error = deep_report.error;
             return fail(QStringLiteral("Verify journal/Merkle consistency"));
@@ -585,13 +769,10 @@ int main(int argc, char **argv)
 
     database.close();
     checkpoint("database_closed");
-    std::optional<qint64> object_rows;
-    if (postgres)
-        object_rows = postgres_schema.objectRows(&error);
-    else
-        object_rows = sqliteObjectRows(db_path, &error);
-    if (!object_rows)
-        return fail(QStringLiteral("Count stored revision objects"));
+    const std::optional<StorageCounts> counts = postgres
+        ? postgres_schema.storageCounts(&error) : sqliteStorageCounts(db_path, &error);
+    if (!counts)
+        return fail(QStringLiteral("Measure SQL row and content storage"));
     std::optional<qint64> postgres_bytes;
     if (postgres)
     {
@@ -603,7 +784,17 @@ int main(int argc, char **argv)
            << "pipes=" << count << "\n"
            << "junctions=" << count << "\n"
            << "finalized_revisions=" << revision_count << "\n"
-           << "revision_object_rows=" << *object_rows << "\n"
+           << "revision_object_rows=" << counts->working_objects << "\n"
+           << "hydraulic_network_member_rows=" << counts->network_members << "\n"
+           << "hydraulic_network_reference_rows=" << counts->network_references << "\n"
+           << "object_event_rows=" << counts->object_events << "\n"
+           << "revision_rows=" << counts->revision_rows << "\n"
+           << "content_blob_rows=" << counts->content_blobs << "\n"
+           << "content_tree_node_rows=" << counts->content_tree_nodes << "\n"
+           << "content_payload_bytes=" << counts->content_payload_bytes << "\n"
+           << "changes_per_revision=" << changes_per_revision << "\n"
+           << "comparison_enabled=" << (compare_branches ? 1 : 0) << "\n"
+           << "first_revision_edit_total_ms=" << first_edit_total_ms << "\n"
            << "initial_save_ms=" << initial_save_ms << "\n"
            << "load_ms=" << load_ms << "\n"
            << "unchanged_save_ms=" << unchanged_save_ms << "\n"
@@ -616,6 +807,16 @@ int main(int argc, char **argv)
            << "repeat_finalize_max_ms=" << max_repeated_finalize_ms << "\n"
            << "repeat_edit_total_ms=" << total_repeated_edit_ms << "\n"
            << "revision_samples_number_edit_ms_finalize_ms=" << revision_samples.join(QLatin1Char(';')) << "\n";
+    if (compare_branches)
+        output << "divergent_branch_finalize_ms=" << divergent_branch_finalize_ms << "\n"
+               << "ancestry_comparison_ms=" << ancestry_comparison_ms << "\n"
+               << "merge_preview_ms=" << merge_preview_ms << "\n"
+               << "merge_preview_changes=" << merge_preview_changes << "\n"
+               << "merge_preview_conflicts=" << merge_preview_conflicts << "\n"
+               << "merge_preview_merkle_used=" << (merge_preview_merkle_used ? 1 : 0) << "\n"
+               << "merge_preview_merkle_candidates=" << merge_preview_merkle_candidates << "\n"
+               << "merge_preview_merkle_nodes_loaded=" << merge_preview_merkle_nodes_loaded << "\n"
+               << "merge_preview_shared_subtrees_skipped=" << merge_preview_shared_subtrees_skipped << "\n";
     if (deep_verify)
         output << "verify_journal_ms=" << deep_verify_ms << "\n";
     if (measure_memory)

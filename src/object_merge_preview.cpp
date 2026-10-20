@@ -1,6 +1,7 @@
 #include <aowis/db/database.h>
 #include "object_merge_state.h"
 #include "model_field_merge.h"
+#include "content_store.h"
 #include "revision_root.h"
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 
 #include <QByteArrayView>
 #include <QCryptographicHash>
+#include <QSet>
 
 #include <QSqlError>
 #include <QSqlQuery>
@@ -48,7 +50,7 @@ struct LiveObjectCursor
     }
 
     bool open(const QUuid &revision_uuid, bool finalized, const QByteArray &root,
-              QString *error)
+              const QSet<QUuid> *selected, QString *error)
     {
         this->sealed_ = finalized;
         if (finalized)
@@ -58,16 +60,40 @@ struct LiveObjectCursor
                 setError(error, QStringLiteral("Finalized merge revision has no valid Merkle root"));
                 return false;
             }
-            const std::optional<QVector<merkle_tree::Entry>> listed =
-                merkle_tree::entries(this->database_, root, error);
-            if (!listed)
-                return false;
-            this->entries_ = *listed;
+            if (selected != nullptr)
+            {
+                // Both merge tips are finalized. The union of the two Merkle
+                // differences against the base is a complete candidate set.
+                // No unchanged blob payloads need to be loaded for this cursor.
+                const std::optional<QHash<QUuid, QByteArray>> hashes =
+                    merkle_tree::lookupMany(this->database_, root, *selected, error);
+                if (!hashes)
+                    return false;
+                this->entries_.reserve(hashes->size());
+                for (QHash<QUuid, QByteArray>::const_iterator it = hashes->cbegin();
+                     it != hashes->cend(); ++it)
+                    this->entries_.append(merkle_tree::Entry{it.key(), it.value()});
+                std::sort(this->entries_.begin(), this->entries_.end(),
+                    [](const merkle_tree::Entry &left, const merkle_tree::Entry &right) {
+                        return left.key.toRfc4122() < right.key.toRfc4122();
+                    });
+            }
+            else
+            {
+                // Editable tips still need a complete SQL cursor, so the
+                // original full-scan behavior remains available for them.
+                const std::optional<QVector<merkle_tree::Entry>> listed =
+                    merkle_tree::entries(this->database_, root, error);
+                if (!listed)
+                    return false;
+                this->entries_ = *listed;
+            }
             return advance(error);
         }
         if (!this->query.prepare(QStringLiteral(
-                "SELECT object_uuid,kind,content,version FROM revision_objects "
-                "WHERE revision_uuid=? AND deleted=0 ORDER BY object_uuid")))
+                "SELECT object_uuid,kind,content,version FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND deleted=0 ORDER BY object_uuid")))
         {
             setError(error, this->query.lastError().text());
             return false;
@@ -174,34 +200,29 @@ std::optional<QByteArray> mergePhysicalObjectDigest(const QSqlDatabase &database
     };
     if (!sealed_root.isEmpty())
     {
-        // Same digest format as physical working rows, but derived from the
-        // authoritative immutable root. Includes tombstones and versions.
-        const std::optional<QVector<merkle_tree::Entry>> entries =
-            merkle_tree::entries(database, sealed_root, error);
-        if (!entries)
-            return std::nullopt;
-        for (qsizetype start = 0; start < entries->size(); start += 256)
+        // A finalized left tip is immutable and cannot be a merge-commit
+        // target. Its content-addressed root commits to all object records,
+        // versions and tombstones, so a domain-separated root fingerprint is
+        // sufficient for the transient preview token. Verify the stored root
+        // node itself; candidate lookups verify every traversed descendant.
+        // A complete audit of *all* descendants remains verifyProject()'s job.
+        if (sealed_root.size() != 32 ||
+            !content_store::get(database, content_store::Kind::Tree, sealed_root, error))
         {
-            const QVector<merkle_tree::Entry> portion = entries->mid(start, 256);
-            const std::optional<QVector<MerkleObjectRecord>> records =
-                readRevisionObjectEntries(database, portion, error);
-            if (!records)
-                return std::nullopt;
-            for (const MerkleObjectRecord &record : *records)
-            {
-                addField(record.uuid.toRfc4122());
-                addField(record.kind.toUtf8());
-                addField(record.content);
-                addField(QByteArray::number(record.version));
-                addField(QByteArray::number(record.deleted ? 1 : 0));
-            }
+            if (sealed_root.size() != 32)
+                setError(error, QStringLiteral("Invalid finalized merge root digest"));
+            return std::nullopt;
         }
-        return hash.result();
+        QByteArray preimage("AOWIS-MERGE-SEALED-ROOT-V1");
+        preimage.append('\0');
+        preimage.append(sealed_root);
+        return QCryptographicHash::hash(preimage, QCryptographicHash::Sha256);
     }
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
-            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
-            "WHERE revision_uuid=? ORDER BY object_uuid")))
+            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') ORDER BY object_uuid")))
     {
         setError(error, query.lastError().text());
         return std::nullopt;
@@ -303,6 +324,60 @@ std::optional<ObjectMergePreview> Database::previewObjectMergeBounded(const Oper
         return fail();
     }
 
+    // Immutable tips support a cheaper three-way candidate scan: a content
+    // hash change relative to the base is a superset of all logical changes
+    // (version-only changes and tombstones can also differ). Bounded HTTP
+    // previews can use it too, but must not accumulate an unbounded set of
+    // UUIDs. If there are too many candidates, discard the partial set and
+    // use the original bounded-memory full cursors. That fallback matters:
+    // there may be more *physical* candidates than logical merge changes.
+    // The unchanged payload and changed-entity limits still apply below.
+    const bool finalized_tips = left_revision->finalized && right_revision->finalized;
+    const bool bounded_preview =
+        max_changes != std::numeric_limits<qsizetype>::max() ||
+        max_changed_payload_bytes != std::numeric_limits<qsizetype>::max();
+    const qsizetype candidate_limit = bounded_preview ?
+        qMin(max_changes, qsizetype(4096)) : std::numeric_limits<qsizetype>::max();
+    bool use_merkle_candidates = finalized_tips;
+    QSet<QUuid> candidates;
+    merkle_tree::DiffStats left_diff_stats;
+    merkle_tree::DiffStats right_diff_stats;
+    if (use_merkle_candidates)
+    {
+        bool candidate_overflow = false;
+        const merkle_tree::DifferenceVisitor collect = [&candidates, &candidate_overflow,
+                                                         candidate_limit](
+            const merkle_tree::Difference &difference) {
+            if (candidates.contains(difference.key))
+                return true;
+            if (candidates.size() >= candidate_limit)
+            {
+                candidate_overflow = true;
+                return false;
+            }
+            candidates.insert(difference.key);
+            return true;
+        };
+        // Use a private error string: stopping at the candidate cap is an
+        // expected fallback, not a corrupt-tree or user-visible error.
+        QString diff_error;
+        if (!merkle_tree::diff(this->database_, base->object_root_sha256,
+                               left_revision->object_root_sha256, collect,
+                               &diff_error, &left_diff_stats) ||
+            !merkle_tree::diff(this->database_, base->object_root_sha256,
+                               right_revision->object_root_sha256, collect,
+                               &diff_error, &right_diff_stats))
+        {
+            if (!candidate_overflow)
+            {
+                setError(error, diff_error);
+                return fail();
+            }
+            use_merkle_candidates = false;
+            candidates.clear();
+        }
+    }
+    const QSet<QUuid> *selected = use_merkle_candidates ? &candidates : nullptr;
     LiveObjectCursor base_cursor(this->database_, *this->backend_);
     LiveObjectCursor left_cursor(this->database_, *this->backend_);
     LiveObjectCursor right_cursor(this->database_, *this->backend_);
@@ -312,16 +387,18 @@ std::optional<ObjectMergePreview> Database::previewObjectMergeBounded(const Oper
         right_cursor.finish();
         return fail();
     };
-    if (!base_cursor.open(base_uuid, true, base->object_root_sha256, error) ||
+    if (!base_cursor.open(base_uuid, true, base->object_root_sha256, selected, error) ||
         !left_cursor.open(left_revision_uuid, left_revision->finalized,
-                          left_revision->object_root_sha256, error) ||
+                          left_revision->object_root_sha256, selected, error) ||
         !right_cursor.open(right_revision_uuid, right_revision->finalized,
-                           right_revision->object_root_sha256, error))
+                           right_revision->object_root_sha256, selected, error))
         return failScan();
 
-    // Captured inside the same read transaction as the three-way comparison:
-    // an unjournaled update cannot silently alter the working head between
-    // this preview and a subsequent write transaction.
+    // For editable tips this scans all physical SQL rows in the same read
+    // transaction as the preview. The merge commit rechecks those exact rows
+    // under the write lock, catching even unjournaled modifications. Sealed
+    // tips instead use an immutable Merkle-root fingerprint (no SQL state can
+    // be merged into a finalized revision).
     const std::optional<QByteArray> physical = mergePhysicalObjectDigest(
         this->database_, *this->backend_, left_revision_uuid,
         left_revision->finalized ? left_revision->object_root_sha256 : QByteArray(), error);
@@ -336,6 +413,15 @@ std::optional<ObjectMergePreview> Database::previewObjectMergeBounded(const Oper
     result.right_revision_uuid = right_revision_uuid;
     result.left_generation = left_revision->generation;
     result.right_generation = right_revision->generation;
+    result.merkle_candidate_scan_used = use_merkle_candidates;
+    if (use_merkle_candidates)
+    {
+        result.merkle_candidate_keys = static_cast<quint64>(candidates.size());
+        result.merkle_tree_nodes_loaded = left_diff_stats.tree_nodes_loaded +
+                                          right_diff_stats.tree_nodes_loaded;
+        result.merkle_shared_subtrees_skipped = left_diff_stats.shared_subtrees_skipped +
+                                                right_diff_stats.shared_subtrees_skipped;
+    }
     qsizetype retained_payload_bytes = 0;
     while (base_cursor.current || left_cursor.current || right_cursor.current)
     {

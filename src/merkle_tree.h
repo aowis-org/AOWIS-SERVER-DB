@@ -1,6 +1,7 @@
 #ifndef AOWIS_DB_MERKLE_TREE_H
 #define AOWIS_DB_MERKLE_TREE_H
 
+#include <functional>
 #include <optional>
 
 #include <QByteArray>
@@ -50,13 +51,45 @@ std::optional<QHash<QUuid, QByteArray>> lookupMany(
     const QSqlDatabase &database, const QByteArray &root,
     const QSet<QUuid> &requested, QString *error = nullptr);
 
+// A read-only, UUID-ordered difference between two immutable snapshots.
+// Missing values signify additions/deletions; two present, unequal values
+// signify a modification. Blob payloads are never fetched by this operation.
+struct Difference
+{
+    QUuid key;
+    std::optional<QByteArray> before_sha256;
+    std::optional<QByteArray> after_sha256;
+};
+
+struct DiffStats
+{
+    quint64 tree_nodes_loaded = 0;
+    quint64 shared_subtrees_skipped = 0;
+    quint64 differences_emitted = 0;
+};
+
+using DifferenceVisitor = std::function<bool(const Difference &)>;
+
+// Traverses only differing Merkle subtrees, including when compressed paths
+// have different shapes. A visitor returning false stops the scan and causes
+// diff() to fail with an error; results emitted earlier are not retracted.
+// This is a comparison, NOT a full integrity audit: equal subtrees are skipped
+// without reading their descendants. Roots and traversed nodes are verified.
+// No SQL transactions or writes are performed; callers must ensure both
+// snapshots remain readable throughout the scan.
+bool diff(const QSqlDatabase &database, const QByteArray &before_root,
+          const QByteArray &after_root, const DifferenceVisitor &visitor,
+          QString *error = nullptr, DiffStats *stats = nullptr);
+
 // Replaces or removes a single key, returning the new root. Identical writes
 // and missing-key deletions return the original root without new nodes.
 std::optional<QByteArray> update(const QSqlDatabase &database, const QByteArray &root,
                                   const Change &change, QString *error = nullptr);
 
-// A deterministic batch. Duplicate keys are rejected. Every intermediate
-// root is private to the calling transaction; only the returned root is used.
+// A deterministic batch. Duplicate keys are rejected. Changes with shared
+// UUID prefixes are rewritten together; generated tree nodes are staged in
+// memory and only nodes reachable from the final root are stored. The old
+// immutable roots remain readable and the caller owns the transaction.
 std::optional<QByteArray> apply(const QSqlDatabase &database, const QByteArray &root,
                                  const QVector<Change> &changes, QString *error = nullptr);
 

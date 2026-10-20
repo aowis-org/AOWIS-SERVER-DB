@@ -207,8 +207,9 @@ std::optional<ModelObject> Database::object(const OperationContext &actor, const
     }
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral(
-            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
-            "WHERE revision_uuid=? AND object_uuid=?"), error))
+            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND object_uuid=?"), error))
         return std::nullopt;
     query.addBindValue(this->backend_->bindUuid(revision_uuid));
     query.addBindValue(this->backend_->bindUuid(object_uuid));
@@ -259,8 +260,9 @@ QVector<ModelObject> Database::objects(const OperationContext &actor, const QUui
     // Working revisions remain SQL-backed until the write/index migration.
     QSqlQuery query(this->database_);
     if (!prepare(query, QStringLiteral(
-            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
-            "WHERE revision_uuid=? AND deleted=0 ORDER BY object_uuid"), error))
+            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND deleted=0 ORDER BY object_uuid"), error))
         return result;
     query.addBindValue(this->backend_->bindUuid(revision_uuid));
     if (!run(query, error))
@@ -401,7 +403,7 @@ bool Database::modifyObjectInTransaction(const OperationContext &actor, const QU
     }
     QSqlQuery current(this->database_);
     if (!prepare(current, QStringLiteral(
-            "SELECT kind,content,version,deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?"), error))
+            "SELECT kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT " "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND " "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND object_uuid=?"), error))
     {
         return false;
     }
@@ -431,8 +433,9 @@ bool Database::modifyObjectInTransaction(const OperationContext &actor, const QU
     if (!existed)
     {
         ok = prepare(query, QStringLiteral(
-            "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-            "VALUES (?,?,?,?,1,0)"), error);
+            "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES ((SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,1,0)"), error);
         if (ok)
         {
             query.addBindValue(this->backend_->bindUuid(revision->uuid));
@@ -445,7 +448,7 @@ bool Database::modifyObjectInTransaction(const OperationContext &actor, const QU
     else
     {
         ok = prepare(query, QStringLiteral(
-            "UPDATE revision_objects SET content=?,version=?,deleted=? WHERE revision_uuid=? AND object_uuid=?"), error);
+            "UPDATE revision_objects SET content=?,version=?,deleted=? WHERE storage_uuid=(SELECT " "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND " "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND object_uuid=?"), error);
         if (ok)
         {
             query.addBindValue(bytes ? QVariant(*bytes) : QVariant());

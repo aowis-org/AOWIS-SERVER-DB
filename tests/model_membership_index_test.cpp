@@ -50,7 +50,7 @@ int membershipCount(QSqlDatabase &inspection, const QUuid &revision_uuid,
 {
     QSqlQuery query(inspection);
     if (!query.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")))
+            "SELECT COUNT(*) FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid FROM " "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? " "AND r.state='working') AND network_uuid=?")))
         return -1;
     query.addBindValue(revision_uuid.toRfc4122());
     query.addBindValue(network_uuid.toRfc4122());
@@ -65,17 +65,26 @@ bool membershipUuidStorage(QSqlDatabase &inspection, const QUuid &revision_uuid,
 {
     QSqlQuery query(inspection);
     if (!query.prepare(QStringLiteral(
-            "SELECT typeof(revision_uuid),revision_uuid,typeof(network_uuid),network_uuid,"
-            "typeof(entity_uuid),entity_uuid FROM hydraulic_network_members "
-            "WHERE revision_uuid=? AND network_uuid=? AND entity_uuid=?")))
+            "SELECT typeof(storage_uuid),storage_uuid,typeof(network_uuid),network_uuid,typeof(entity_uuid),entity_uu"
+            "id FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches b "
+            "JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND "
+            "r.state='working') AND network_uuid=? AND entity_uuid=?")))
         return false;
     query.addBindValue(revision_uuid.toRfc4122());
     query.addBindValue(network_uuid.toRfc4122());
     query.addBindValue(entity_uuid.toRfc4122());
     if (!query.exec() || !query.next())
         return false;
+    QSqlQuery storage(inspection);
+    if (!storage.prepare(QStringLiteral(
+            "SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'")))
+        return false;
+    storage.addBindValue(revision_uuid.toRfc4122());
+    if (!storage.exec() || !storage.next())
+        return false;
     return query.value(0).toString() == QStringLiteral("blob") &&
-           query.value(1).toByteArray() == revision_uuid.toRfc4122() &&
+           query.value(1).toByteArray() == storage.value(0).toByteArray() &&
            query.value(2).toString() == QStringLiteral("blob") &&
            query.value(3).toByteArray() == network_uuid.toRfc4122() &&
            query.value(4).toString() == QStringLiteral("blob") &&
@@ -185,7 +194,7 @@ int main(int argc, char **argv)
         REQUIRE(membershipCount(inspection, project->working_revision_uuid, second.uuid) == 0);
         QSqlQuery count(inspection);
         REQUIRE(count.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM hydraulic_network_references WHERE revision_uuid=?")));
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid " "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE " "r.uuid=? AND r.state='working')")));
         count.addBindValue(project->working_revision_uuid.toRfc4122());
         REQUIRE(count.exec() && count.next() && count.value(0).toInt() == 0);
         inspection.close();
@@ -209,7 +218,7 @@ int main(int argc, char **argv)
         REQUIRE(membershipCount(inspection, reconstructed->head_revision_uuid, second.uuid) == 3);
         QSqlQuery count(inspection);
         REQUIRE(count.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM hydraulic_network_references WHERE revision_uuid=?")));
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid " "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE " "r.uuid=? AND r.state='working')")));
         count.addBindValue(reconstructed->head_revision_uuid.toRfc4122());
         REQUIRE(count.exec() && count.next() && count.value(0).toInt() > 0);
         inspection.close();

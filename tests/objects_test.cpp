@@ -1,3 +1,5 @@
+#include "../src/working_storage.h"
+#include "../src/sqlite_backend.h"
 #include <aowis/db/database.h>
 #include <aowis/model/uuid.h>
 
@@ -39,6 +41,29 @@ int main(int argc, char **argv)
     REQUIRE(project.has_value());
     const QUuid branch = project->main_branch_uuid;
     const QUuid rev1 = project->working_revision_uuid;
+    QByteArray initial_storage;
+    {
+        QSqlDatabase initial = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+            QStringLiteral("initial-storage-inspector"));
+        initial.setDatabaseName(path);
+        REQUIRE(initial.open());
+        QSqlQuery storage(initial);
+        REQUIRE(storage.prepare(QStringLiteral(
+            "SELECT working_storage_uuid FROM branches WHERE uuid=?")));
+        storage.addBindValue(branch.toRfc4122());
+        REQUIRE(storage.exec() && storage.next());
+        initial_storage = storage.value(0).toByteArray();
+        REQUIRE(initial_storage.size() == 16);
+        const aowis::db::SqliteBackend backend;
+        const std::optional<QUuid> resolved = aowis::db::resolveWorkingStorageUuid(
+            initial, backend, rev1, &error);
+        REQUIRE(resolved && resolved->toRfc4122() == initial_storage);
+        storage.finish();
+        storage = QSqlQuery();
+        initial.close();
+        initial = QSqlDatabase();
+    }
+    QSqlDatabase::removeDatabase(QStringLiteral("initial-storage-inspector"));
     const QUuid pipe = createUuidV7();
     const QUuid junction = createUuidV7();
     const QByteArray first("\0\1\xff", 3);
@@ -120,14 +145,75 @@ int main(int argc, char **argv)
         inspector.setDatabaseName(path);
         REQUIRE(inspector.open());
         QSqlQuery query(inspector);
+        // Branches have stable working-storage identities, separate from
+        // their revision UUIDs. They survive finalization and remain unique
+        // even when branches share the same historical model root.
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT working_storage_uuid FROM branches WHERE uuid=?")));
+        query.addBindValue(branch.toRfc4122());
+        REQUIRE(query.exec() && query.next());
+        const QByteArray main_storage = query.value(0).toByteArray();
+        REQUIRE(main_storage == initial_storage);
+        const aowis::db::SqliteBackend backend;
+        REQUIRE(!aowis::db::resolveWorkingStorageUuid(inspector, backend, rev1, nullptr));
+        const std::optional<QUuid> active_storage = aowis::db::resolveWorkingStorageUuid(
+            inspector, backend, finalized->new_working_revision_uuid, &error);
+        REQUIRE(active_storage && active_storage->toRfc4122() == main_storage);
+        REQUIRE(main_storage.size() == 16 && main_storage != branch.toRfc4122());
+        REQUIRE(main_storage != rev1.toRfc4122());
+        REQUIRE(main_storage != finalized->new_working_revision_uuid.toRfc4122());
+        query.finish();
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT working_storage_uuid FROM branches WHERE uuid=?")));
+        query.addBindValue(alt->uuid.toRfc4122());
+        REQUIRE(query.exec() && query.next());
+        const QByteArray alt_storage = query.value(0).toByteArray();
+        REQUIRE(alt_storage.size() == 16 && alt_storage != main_storage);
+        REQUIRE(alt_storage != alt->head_revision_uuid.toRfc4122());
+        query.finish();
+        // Both finalized branches retain their *independent* mutable SQL
+        // rows under stable storage keys; previous revision IDs are never
+        // physical owners and finalized reads still use the Merkle roots.
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT COUNT(*) FROM revision_objects WHERE storage_uuid=?")));
+        query.addBindValue(main_storage);
+        REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 2);
+        query.finish();
+        query.bindValue(0, alt_storage);
+        REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 2);
+        query.finish();
+        REQUIRE(query.prepare(QStringLiteral(
+            "SELECT content,version FROM revision_objects "
+            "WHERE storage_uuid=? AND object_uuid=?")));
+        query.addBindValue(main_storage);
+        query.addBindValue(pipe.toRfc4122());
+        REQUIRE(query.exec() && query.next());
+        REQUIRE(query.value(0).toByteArray() == next && query.value(1).toLongLong() == 5);
+        query.finish();
+        query.bindValue(0, alt_storage);
+        REQUIRE(query.exec() && query.next());
+        REQUIRE(query.value(0).toByteArray() == QByteArray("alt") && query.value(1).toLongLong() == 5);
+        query.finish();
+        // The identifier is not mutable, including through direct SQL.
+        REQUIRE(query.prepare(QStringLiteral(
+            "UPDATE branches SET working_storage_uuid=? WHERE uuid=?")));
+        query.addBindValue(QUuid::createUuid().toRfc4122());
+        query.addBindValue(branch.toRfc4122());
+        REQUIRE(!query.exec());
+        query.finish();
+        // The different branches must be the only owners of their keys.
+        REQUIRE(query.exec(QStringLiteral(
+            "SELECT COUNT(*),COUNT(DISTINCT working_storage_uuid) FROM branches")));
+        REQUIRE(query.next() && query.value(0).toInt() == 2 && query.value(1).toInt() == 2);
+        query.finish();
         // Finalized revisions have no per-revision physical object rows.
         REQUIRE(query.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+            "SELECT COUNT(*) FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working')")));
         query.addBindValue(rev1.toRfc4122());
         REQUIRE(query.exec() && query.next() && query.value(0).toInt() == 0);
         query.finish();
         REQUIRE(query.prepare(QStringLiteral(
-            "SELECT object_uuid FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")));
+            "SELECT object_uuid FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM " "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? " "AND r.state='working') AND object_uuid=?")));
         query.addBindValue(finalized->new_working_revision_uuid.toRfc4122());
         query.addBindValue(pipe.toRfc4122());
         REQUIRE(query.exec() && query.next());

@@ -15,6 +15,7 @@ static const char *const statements[] = {
             uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
             project_uuid BLOB NOT NULL REFERENCES projects(uuid) ON DELETE RESTRICT,
             name TEXT NOT NULL,
+            working_storage_uuid BLOB NOT NULL UNIQUE CHECK(length(working_storage_uuid)=16),
             head_revision_uuid BLOB REFERENCES revisions(uuid) DEFERRABLE INITIALLY DEFERRED, created_by_uuid BLOB REFERENCES users(uuid),
             UNIQUE(project_uuid, name),
             UNIQUE(uuid, project_uuid)
@@ -41,8 +42,8 @@ static const char *const statements[] = {
             created_at_ms INTEGER NOT NULL,
             disabled_at_ms INTEGER
         ))SQL",
-        R"SQL(CREATE TABLE hydraulic_network_members (revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,network_uuid BLOB NOT NULL,entity_uuid BLOB NOT NULL,PRIMARY KEY(revision_uuid,entity_uuid),FOREIGN KEY(revision_uuid,network_uuid) REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT,FOREIGN KEY(revision_uuid,entity_uuid) REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT) WITHOUT ROWID)SQL",
-        R"SQL(CREATE TABLE hydraulic_network_references (revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,network_uuid BLOB NOT NULL,source_uuid BLOB NOT NULL CHECK(length(source_uuid)=16),target_uuid BLOB NOT NULL CHECK(length(target_uuid)=16),field TEXT NOT NULL,PRIMARY KEY(revision_uuid,network_uuid,source_uuid,target_uuid,field),FOREIGN KEY(revision_uuid,network_uuid) REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT) WITHOUT ROWID)SQL",
+        R"SQL(CREATE TABLE hydraulic_network_members (storage_uuid BLOB NOT NULL REFERENCES branches(working_storage_uuid) ON DELETE RESTRICT,network_uuid BLOB NOT NULL,entity_uuid BLOB NOT NULL,PRIMARY KEY(storage_uuid,entity_uuid),FOREIGN KEY(storage_uuid,network_uuid) REFERENCES revision_objects(storage_uuid,object_uuid) ON DELETE RESTRICT,FOREIGN KEY(storage_uuid,entity_uuid) REFERENCES revision_objects(storage_uuid,object_uuid) ON DELETE RESTRICT) WITHOUT ROWID)SQL",
+        R"SQL(CREATE TABLE hydraulic_network_references (storage_uuid BLOB NOT NULL REFERENCES branches(working_storage_uuid) ON DELETE RESTRICT,network_uuid BLOB NOT NULL,source_uuid BLOB NOT NULL CHECK(length(source_uuid)=16),target_uuid BLOB NOT NULL CHECK(length(target_uuid)=16),field TEXT NOT NULL,PRIMARY KEY(storage_uuid,network_uuid,source_uuid,target_uuid,field),FOREIGN KEY(storage_uuid,network_uuid) REFERENCES revision_objects(storage_uuid,object_uuid) ON DELETE RESTRICT) WITHOUT ROWID)SQL",
         R"SQL(CREATE TABLE object_events (
             uuid BLOB PRIMARY KEY NOT NULL CHECK(length(uuid)=16),
             revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,
@@ -132,13 +133,13 @@ static const char *const statements[] = {
             archived_at_ms INTEGER
         , created_by_uuid BLOB REFERENCES users(uuid)))SQL",
         R"SQL(CREATE TABLE revision_objects (
-            revision_uuid BLOB NOT NULL REFERENCES revisions(uuid) ON DELETE RESTRICT,
+            storage_uuid BLOB NOT NULL REFERENCES branches(working_storage_uuid) ON DELETE RESTRICT,
             object_uuid BLOB NOT NULL CHECK(length(object_uuid)=16),
             kind TEXT NOT NULL CHECK(length(kind)>0 AND length(kind)<=128),
             content BLOB,
             version INTEGER NOT NULL CHECK(version>=1),
             deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
-            PRIMARY KEY(revision_uuid,object_uuid),
+            PRIMARY KEY(storage_uuid,object_uuid),
             CHECK((deleted=1 AND content IS NULL) OR (deleted=0 AND content IS NOT NULL))
         ))SQL",
         R"SQL(CREATE TABLE revision_parents (
@@ -243,8 +244,8 @@ static const char *const statements[] = {
         ))SQL",
         R"SQL(CREATE UNIQUE INDEX group_membership_active_unique
         ON group_memberships(group_uuid,user_uuid) WHERE revoked_at_ms IS NULL)SQL",
-        R"SQL(CREATE INDEX hydraulic_members_by_network ON hydraulic_network_members(revision_uuid,network_uuid))SQL",
-        R"SQL(CREATE INDEX hydraulic_references_by_target ON hydraulic_network_references(revision_uuid,target_uuid))SQL",
+        R"SQL(CREATE INDEX hydraulic_members_by_network ON hydraulic_network_members(storage_uuid,network_uuid))SQL",
+        R"SQL(CREATE INDEX hydraulic_references_by_target ON hydraulic_network_references(storage_uuid,target_uuid))SQL",
         R"SQL(CREATE INDEX object_groups_by_revision
               ON object_groups(revision_uuid,last_sequence))SQL",
         R"SQL(CREATE UNIQUE INDEX one_working_revision_per_branch
@@ -252,7 +253,7 @@ static const char *const statements[] = {
         R"SQL(CREATE INDEX operation_events_by_project ON operation_events(project_uuid,occurred_at_ms))SQL",
         R"SQL(CREATE INDEX recovery_tokens_by_user ON password_recovery_tokens(user_uuid))SQL",
         R"SQL(CREATE INDEX revision_objects_by_kind
-              ON revision_objects(revision_uuid,kind,object_uuid))SQL",
+              ON revision_objects(storage_uuid,kind,object_uuid))SQL",
         R"SQL(CREATE INDEX revisions_by_project ON revisions(project_uuid))SQL",
         R"SQL(CREATE UNIQUE INDEX role_assignment_active_unique ON role_assignments (
         principal_kind,principal_uuid,role_uuid,scope_kind,COALESCE(hex(scope_uuid),''))
@@ -268,6 +269,10 @@ static const char *const statements[] = {
         R"SQL(CREATE TRIGGER branch_creator_required BEFORE INSERT ON branches
             WHEN NEW.created_by_uuid IS NULL OR length(NEW.created_by_uuid)!=16
             BEGIN SELECT RAISE(ABORT,'branch creator required'); END)SQL",
+        R"SQL(CREATE TRIGGER branch_working_storage_readonly
+            BEFORE UPDATE OF working_storage_uuid ON branches
+            WHEN NEW.working_storage_uuid!=OLD.working_storage_uuid
+            BEGIN SELECT RAISE(ABORT,'branch working storage identity is immutable'); END)SQL",
         R"SQL(CREATE TRIGGER branch_head_must_be_working
             BEFORE UPDATE OF head_revision_uuid ON branches
             WHEN NEW.head_revision_uuid IS NOT NULL AND NOT EXISTS (
@@ -285,27 +290,27 @@ static const char *const statements[] = {
             AND NOT EXISTS(SELECT 1 FROM snapshots WHERE revision_uuid=NEW.uuid)
             BEGIN SELECT RAISE(ABORT, 'cannot finalize without a snapshot'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_hydraulic_member_delete BEFORE DELETE ON hydraulic_network_members
-            WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
+            WHEN NOT EXISTS(SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=OLD.storage_uuid AND r.state='working')
             BEGIN SELECT RAISE(ABORT,'finalized network membership is immutable'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_hydraulic_member_insert BEFORE INSERT ON hydraulic_network_members
-            WHEN (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized'
+            WHEN NOT EXISTS(SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=NEW.storage_uuid AND r.state='working')
             BEGIN SELECT RAISE(ABORT,'finalized network membership is immutable'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_hydraulic_reference_delete
             BEFORE DELETE ON hydraulic_network_references
-            WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
+            WHEN NOT EXISTS(SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=OLD.storage_uuid AND r.state='working')
             BEGIN SELECT RAISE(ABORT,'finalized hydraulic references are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_hydraulic_reference_insert
             BEFORE INSERT ON hydraulic_network_references
-            WHEN (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized'
+            WHEN NOT EXISTS(SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=NEW.storage_uuid AND r.state='working')
             BEGIN SELECT RAISE(ABORT,'finalized hydraulic references are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_object_delete BEFORE DELETE ON revision_objects
-             WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
+             WHEN NOT EXISTS(SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=OLD.storage_uuid AND r.state='working')
              BEGIN SELECT RAISE(ABORT,'finalized objects are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_object_insert BEFORE INSERT ON revision_objects
-             WHEN (SELECT state FROM revisions WHERE uuid=NEW.revision_uuid)='finalized'
+             WHEN NOT EXISTS(SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=NEW.storage_uuid AND r.state='working')
              BEGIN SELECT RAISE(ABORT,'finalized objects are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_object_update BEFORE UPDATE ON revision_objects
-             WHEN (SELECT state FROM revisions WHERE uuid=OLD.revision_uuid)='finalized'
+             WHEN NOT EXISTS(SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=OLD.storage_uuid AND r.state='working')
              BEGIN SELECT RAISE(ABORT,'finalized objects are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER finalized_parents_readonly_insert
             BEFORE INSERT ON revision_parents
@@ -380,7 +385,7 @@ static const char *const statements[] = {
         R"SQL(CREATE TRIGGER object_group_update_guard BEFORE UPDATE ON object_groups
               BEGIN SELECT RAISE(ABORT,'object groups are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER object_identity_readonly BEFORE UPDATE ON revision_objects
-             WHEN OLD.revision_uuid!=NEW.revision_uuid OR OLD.object_uuid!=NEW.object_uuid
+             WHEN OLD.storage_uuid!=NEW.storage_uuid OR OLD.object_uuid!=NEW.object_uuid
                  OR OLD.kind!=NEW.kind
              BEGIN SELECT RAISE(ABORT,'object identity and type are immutable'); END)SQL",
         R"SQL(CREATE TRIGGER operation_events_delete_guard BEFORE DELETE ON operation_events

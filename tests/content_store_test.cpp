@@ -299,11 +299,15 @@ int main(int argc, char **argv)
         const QString name = QStringLiteral("content-postgres");
         {
             QSqlDatabase connection;
+            // Each test owns a unique, transaction-local schema, so a regular
+            // SQL transaction avoids contention on the public-schema
+            // advisory lock. beginWrite() is covered in backend_contract_test.
             if (!postgres.open(connection, name, QString::fromUtf8(pg_database_name), &error) ||
                 !postgres.configure(connection, &error) ||
-                !postgres.beginWrite(connection, &error))
+                !connection.transaction())
             {
-                qCritical().noquote() << "PostgreSQL content-store setup failed:" << error;
+                qCritical().noquote() << "PostgreSQL content-store setup failed:" << error
+                                       << connection.lastError().text();
                 return 1;
             }
             const QString schema = QStringLiteral("aowis_content_probe_") +
@@ -316,11 +320,11 @@ int main(int argc, char **argv)
                 !exercise(connection, error))
             {
                 qCritical().noquote() << "PostgreSQL content-store test failed:" << error << sql.lastError().text();
-                postgres.rollback(connection);
+                connection.rollback();
                 return 1;
             }
             sql = QSqlQuery();
-            postgres.rollback(connection); // dispose of the transaction-local schema
+            connection.rollback(); // dispose of the transaction-local schema
             connection.close();
         }
         QSqlDatabase::removeDatabase(name);

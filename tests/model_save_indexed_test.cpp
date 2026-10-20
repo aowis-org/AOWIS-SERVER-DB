@@ -43,7 +43,7 @@ bool indexedObjectLookups(QSqlDatabase &database)
     QSqlQuery objects(database);
     if (!objects.exec(QStringLiteral(
             "EXPLAIN QUERY PLAN SELECT object_uuid,kind,content,version,deleted "
-            "FROM revision_objects WHERE revision_uuid=x'00' AND object_uuid IN (x'01',x'02')")))
+            "FROM revision_objects WHERE storage_uuid=x'00' AND object_uuid IN (x'01',x'02')")))
         return false;
     bool object_indexed = false;
     while (objects.next())
@@ -55,7 +55,7 @@ bool indexedObjectLookups(QSqlDatabase &database)
     QSqlQuery members(database);
     if (!members.exec(QStringLiteral(
             "EXPLAIN QUERY PLAN SELECT network_uuid FROM hydraulic_network_members "
-            "WHERE revision_uuid=x'00' AND entity_uuid IN (x'01',x'02')")))
+            "WHERE storage_uuid=x'00' AND entity_uuid IN (x'01',x'02')")))
         return false;
     bool member_indexed = false;
     while (members.next())
@@ -72,8 +72,8 @@ bool indexedObjectLookups(QSqlDatabase &database)
     if (!joined.exec(QStringLiteral(
             "EXPLAIN QUERY PLAN SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
             "FROM hydraulic_network_members m JOIN revision_objects o "
-            "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
-            "WHERE m.revision_uuid=x'00' AND m.network_uuid=x'01'")))
+            "ON o.storage_uuid=m.storage_uuid AND o.object_uuid=m.entity_uuid "
+            "WHERE m.storage_uuid=x'00' AND m.network_uuid=x'01'")))
         return false;
     bool indexed_members = false;
     bool indexed_objects = false;

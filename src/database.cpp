@@ -4,6 +4,7 @@
 #include "sqlite_backend.h"
 #include "postgres_backend.h"
 #include "revision_root.h"
+#include "working_storage.h"
 #include "performance_profile.h"
 
 #include <QCryptographicHash>
@@ -245,11 +246,13 @@ std::optional<ProjectCreation> Database::createProjectUnchecked(const QUuid &act
     if (ok)
     {
         ok = prepare(query, QStringLiteral(
-            "INSERT INTO branches (uuid,project_uuid,name,created_by_uuid) VALUES (?,?,'main',?)"), error);
+            "INSERT INTO branches (uuid,project_uuid,name,working_storage_uuid,created_by_uuid) "
+            "VALUES (?,?,'main',?,?)"), error);
         if (ok)
         {
             query.addBindValue(this->backend_->bindUuid(result.main_branch_uuid));
             query.addBindValue(this->backend_->bindUuid(result.project_uuid));
+            query.addBindValue(this->backend_->bindUuid(createUuidV7()));
             query.addBindValue(this->backend_->bindUuid(actor_uuid));
             ok = run(query, error);
         }
@@ -491,12 +494,14 @@ std::optional<BranchInfo> Database::createBranchUnchecked(const QUuid &actor_uui
     const BranchInfo result{createUuidV7(), project_uuid, name.trimmed(), createUuidV7(), actor_uuid};
     QSqlQuery query(this->database_);
     bool ok = prepare(query, QStringLiteral(
-        "INSERT INTO branches (uuid,project_uuid,name,created_by_uuid) VALUES (?,?,?,?)"), error);
+        "INSERT INTO branches (uuid,project_uuid,name,working_storage_uuid,created_by_uuid) "
+        "VALUES (?,?,?,?,?)"), error);
     if (ok)
     {
         query.addBindValue(this->backend_->bindUuid(result.uuid));
         query.addBindValue(this->backend_->bindUuid(project_uuid));
         query.addBindValue(result.name);
+        query.addBindValue(this->backend_->bindUuid(createUuidV7()));
         query.addBindValue(this->backend_->bindUuid(actor_uuid));
         ok = run(query, error);
     }
@@ -711,10 +716,16 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
     const std::optional<int> mode = objectMode(r->uuid, error);
     if (!mode)
         return std::nullopt;
+    // Before changing the physical row ownership, assert the exact current
+    // branch-head -> stable-storage mapping under this write transaction.
+    // The same resolver will be used by the table cutover; stale historical
+    // revisions must never resolve to mutable branch storage.
+    if (*mode == 1 && !resolveWorkingStorageUuid(this->database_, *this->backend_, r->uuid, error))
+        return std::nullopt;
     phases.mark("authorize_and_load_working_head");
     // Publish the Merkle root only at finalization, within one transaction.
-    // Temporary working rows are removed after sealing; immutable trees
-    // alone represent finalized model snapshots.
+    // The working SQL rows remain branch-owned across finalization; immutable
+    // Merkle trees alone represent historical model snapshots.
     QByteArray object_root(digest_length, '\0');
     if (*mode == 1)
     {
@@ -788,10 +799,9 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
     // that state directly to the next working head instead of decoding every
     // Merkle blob and rebuilding the hydraulic indexes after finalization.
     //
-    // "sealing" exists only inside this write transaction: it releases the
-    // one-working-revision uniqueness slot while preserving the old SQL rows
-    // long enough for set-based INSERT ... SELECT statements. No committed
-    // revision may remain in that state. On any error the caller rolls back.
+    // "sealing" exists only inside this transaction to release the single
+    // working revision slot before inserting its successor. No committed
+    // revision may remain in this state; failures roll back atomically.
     QSqlQuery query(this->database_);
     bool ok = true;
     if (*mode == 1)
@@ -853,68 +863,14 @@ std::optional<Finalization> Database::finalizeInWriteTransaction(const QUuid &ac
         }
     }
     phases.mark("create_successor_metadata");
-    // Object-mode rows are NOT retained as historical storage. They move from
-    // one temporary editable SQL head to the next and are discarded from the
-    // old revision before its immutable state is published. No root traversal,
-    // payload decoding, or rebuilding of hydraulic indexes is needed here.
+    // Immutable finalized revisions retain their Merkle roots, not SQL model rows.
+    // The branch's permanent working_storage_uuid owns editable objects and
+    // hydraulic indexes. Advancing the working revision does not move or
+    // delete any of these rows: only the branch head and revision metadata
+    // change. All of this remains in the surrounding write transaction.
     if (ok && *mode == 1)
-    {
-        const QStringList transfers{
-            QStringLiteral(
-                "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-                "SELECT ?,object_uuid,kind,content,version,deleted "
-                "FROM revision_objects WHERE revision_uuid=?"),
-            QStringLiteral(
-                "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
-                "SELECT ?,network_uuid,entity_uuid FROM hydraulic_network_members WHERE revision_uuid=?"),
-            QStringLiteral(
-                "INSERT INTO hydraulic_network_references"
-                "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
-                "SELECT ?,network_uuid,source_uuid,target_uuid,field "
-                "FROM hydraulic_network_references WHERE revision_uuid=?")
-        };
-        for (const QString &statement : transfers)
-        {
-            QSqlQuery transfer(this->database_);
-            if (!prepare(transfer, statement, error))
-            {
-                ok = false;
-                break;
-            }
-            transfer.addBindValue(this->backend_->bindUuid(result.new_working_revision_uuid));
-            transfer.addBindValue(this->backend_->bindUuid(r->uuid));
-            if (!run(transfer, error))
-            {
-                ok = false;
-                break;
-            }
-        }
-        phases.mark("copy_working_objects_and_indexes");
-        if (ok)
-        {
-            for (const QString &table : {QStringLiteral("hydraulic_network_references"),
-                                         QStringLiteral("hydraulic_network_members"),
-                                         QStringLiteral("revision_objects")})
-            {
-                QSqlQuery purge(this->database_);
-                if (!prepare(purge, QStringLiteral("DELETE FROM %1 WHERE revision_uuid=?").arg(table), error))
-                {
-                    ok = false;
-                    break;
-                }
-                purge.addBindValue(this->backend_->bindUuid(r->uuid));
-                if (!run(purge, error))
-                {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        phases.mark("remove_old_working_rows");
-        if (ok)
-            ok = sealOldRevision(QStringLiteral("sealing"));
-    }
-
+        ok = sealOldRevision(QStringLiteral("sealing"));
+    phases.mark("retain_branch_working_storage");
     // The sealed manifest belongs only to its finalized predecessor.
     if (ok && *mode == 0)
     {

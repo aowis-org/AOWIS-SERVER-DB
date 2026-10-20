@@ -27,8 +27,9 @@ bool hasReference(const QSqlDatabase &connection, const QUuid &revision_uuid,
 {
     QSqlQuery query(connection);
     if (!query.prepare(QStringLiteral(
-            "SELECT 1 FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND source_uuid=? AND target_uuid=? LIMIT 1")))
+            "SELECT 1 FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid FROM "
+            "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? "
+            "AND r.state='working') AND source_uuid=? AND target_uuid=? LIMIT 1")))
         return false;
     query.addBindValue(revision_uuid.toRfc4122());
     query.addBindValue(source_uuid.toRfc4122());

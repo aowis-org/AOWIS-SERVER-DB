@@ -307,8 +307,9 @@ std::optional<QUuid> Database::compensateObjectGroup(const OperationContext &act
         const StoredEdit &edit = redo ? edits.at(i) : edits.at(edits.size() - 1 - i);
         QSqlQuery current(this->database_);
         if (!prepare(current, QStringLiteral(
-                "SELECT version,deleted,content FROM revision_objects "
-                "WHERE revision_uuid=? AND object_uuid=?"), error))
+                "SELECT version,deleted,content FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND object_uuid=?"), error))
         {
             rollback();
             return std::nullopt;

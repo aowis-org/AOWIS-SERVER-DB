@@ -27,8 +27,9 @@ int referenceCount(QSqlDatabase &inspector, const QUuid &revision, const QUuid &
 {
     QSqlQuery query(inspector);
     if (!query.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND target_uuid=?")))
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND target_uuid=?")))
         return -1;
     query.addBindValue(revision.toRfc4122());
     query.addBindValue(target.toRfc4122());
@@ -40,8 +41,9 @@ bool hasReference(QSqlDatabase &inspector, const QUuid &revision,
 {
     QSqlQuery query(inspector);
     if (!query.prepare(QStringLiteral(
-            "SELECT 1 FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND source_uuid=? AND target_uuid=? LIMIT 1")))
+            "SELECT 1 FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid FROM "
+            "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? "
+            "AND r.state='working') AND source_uuid=? AND target_uuid=? LIMIT 1")))
         return false;
     query.addBindValue(revision.toRfc4122());
     query.addBindValue(source.toRfc4122());
@@ -55,10 +57,11 @@ bool referenceUuidStorage(QSqlDatabase &inspector, const QUuid &revision,
 {
     QSqlQuery query(inspector);
     if (!query.prepare(QStringLiteral(
-            "SELECT typeof(revision_uuid),revision_uuid,typeof(network_uuid),network_uuid,"
-            "typeof(source_uuid),source_uuid,typeof(target_uuid),target_uuid "
-            "FROM hydraulic_network_references WHERE revision_uuid=? AND network_uuid=? "
-            "AND source_uuid=? AND target_uuid=? LIMIT 1")))
+            "SELECT typeof(storage_uuid),storage_uuid,typeof(network_uuid),network_uuid,typeof(source_uuid),source_uu"
+            "id,typeof(target_uuid),target_uuid FROM hydraulic_network_references WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND network_uuid=? AND "
+            "source_uuid=? AND target_uuid=? LIMIT 1")))
         return false;
     query.addBindValue(revision.toRfc4122());
     query.addBindValue(network.toRfc4122());
@@ -66,7 +69,16 @@ bool referenceUuidStorage(QSqlDatabase &inspector, const QUuid &revision,
     query.addBindValue(target.toRfc4122());
     if (!query.exec() || !query.next())
         return false;
-    const QUuid uuids[]{revision, network, source, target};
+    QSqlQuery storage(inspector);
+    if (!storage.prepare(QStringLiteral(
+            "SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'")))
+        return false;
+    storage.addBindValue(revision.toRfc4122());
+    if (!storage.exec() || !storage.next())
+        return false;
+    const QUuid uuids[]{QUuid::fromRfc4122(storage.value(0).toByteArray()),
+                        network, source, target};
     for (int index = 0; index < 4; ++index)
     {
         if (query.value(index * 2).toString() != QStringLiteral("blob") ||
@@ -243,8 +255,9 @@ int main(int argc, char **argv)
         REQUIRE(inspector.open());
         QSqlQuery count(inspector);
         REQUIRE(count.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND network_uuid=?")));
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND network_uuid=?")));
         count.addBindValue(batch_project->working_revision_uuid.toRfc4122());
         count.addBindValue(large_network.uuid.toRfc4122());
         REQUIRE(count.exec() && count.next());

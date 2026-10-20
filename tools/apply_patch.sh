@@ -6,6 +6,18 @@ if [[ $# -ne 1 ]]; then
     exit 2
 fi
 
+# AOWIS-SERVER-DB accepts SQL-backend patches only. Check the archive's
+# basename before resolving or opening it, so a renamed or misplaced patch is
+# rejected without changing the worktree.
+patch_name="${1##*/}"
+case "$patch_name" in
+    aowis-db-sql-?*.zip) ;;
+    *)
+        printf 'Error: patch ZIP filename must start with aowis-db-sql- and end with .zip: %s\n' "$patch_name" >&2
+        exit 2
+        ;;
+esac
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(cd -- "$script_dir/.." && pwd -P)"
 parent="$(dirname -- "$project_root")"

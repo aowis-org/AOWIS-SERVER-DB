@@ -8,12 +8,15 @@ STARTED=false
 
 usage() {
     cat <<'HELP'
-Usage: ./tools/benchmark_network_postgres.sh [PIPE_COUNT] [--revisions N] [--memory] [--deep-verify] [--profile]
+Usage: ./tools/benchmark_network_postgres.sh [PIPE_COUNT] [--revisions N] [--edits N] [--compare] [--memory] [--deep-verify] [--profile]
 
 Run the opt-in AOWIS network-persistence benchmark against a disposable
 PostgreSQL 17 Docker Compose instance. Defaults to 1000 pipes. The container,
 test schema and all benchmark data are destroyed at exit. By default the
 benchmark finalizes one revision; --revisions N permits 1..100 revisions.
+--edits N changes N distinct junctions per revision (default 1).
+--compare measures divergent-branch ancestry and three-way merge preview;
+requires at least 2 pipes and --revisions 2 or greater.
 --memory records AOWIS client RSS checkpoints and high-water mark (Linux).
 --deep-verify replays object journals against finalized Merkle snapshots.
 --profile emits opt-in detailed storage phase timings to stderr.
@@ -31,7 +34,10 @@ fi
 count=1000
 count_seen=false
 revision_seen=false
+edits_seen=false
+compare_seen=false
 revision_args=()
+edits_args=()
 extra_args=()
 while (( $# > 0 )); do
     case "$1" in
@@ -45,6 +51,26 @@ while (( $# > 0 )); do
             revision_seen=true
             revision_args=(--revisions "$2")
             shift 2
+            ;;
+        --edits)
+            if [[ "$edits_seen" == true ]] || (( $# < 2 )) ||
+               [[ ! "$2" =~ ^[1-9][0-9]*$ ]] || (( ${#2} > 6 )) ||
+               (( 10#$2 > 100000 )); then
+                usage >&2
+                exit 2
+            fi
+            edits_seen=true
+            edits_args=(--edits "$2")
+            shift 2
+            ;;
+        --compare)
+            if [[ "$compare_seen" == true ]]; then
+                usage >&2
+                exit 2
+            fi
+            compare_seen=true
+            extra_args+=(--compare)
+            shift
             ;;
         --memory|--deep-verify|--profile)
             for existing in "${extra_args[@]}"; do
@@ -130,4 +156,4 @@ if [[ ! -f "${build_dir}/CMakeCache.txt" ]]; then
 fi
 cmake --build "$build_dir" --target aowis-db-network-benchmark
 printf '=== PostgreSQL network benchmark: %s pipes ===\n' "$count"
-"${build_dir}/aowis-db-network-benchmark" "$count" "${revision_args[@]}" "${extra_args[@]}" --postgres
+"${build_dir}/aowis-db-network-benchmark" "$count" "${revision_args[@]}" "${edits_args[@]}" "${extra_args[@]}" --postgres

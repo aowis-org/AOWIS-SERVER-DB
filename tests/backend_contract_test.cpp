@@ -1,3 +1,4 @@
+#include "../src/working_storage.h"
 #include <aowis/db/model_persistence.h>
 #include <aowis/model/uuid.h>
 
@@ -62,6 +63,8 @@ int main(int argc, char **argv)
     REQUIRE(contract.commit(connection, &error));
     REQUIRE(contract.hasSchema(connection, &error) == true);
     REQUIRE(contract.verifySchema(connection, &error));
+    REQUIRE(contract.hasColumn(connection, QStringLiteral("branches"),
+                               QStringLiteral("working_storage_uuid"), &error) == true);
     REQUIRE(contract.hasColumn(connection, QStringLiteral("revisions"),
                                QStringLiteral("operation_history_sha256"), &error) == true);
     REQUIRE(contract.hasColumn(connection, QStringLiteral("role_assignments"),
@@ -239,6 +242,8 @@ int main(int argc, char **argv)
             REQUIRE(postgres_contract.createSchema(pg_connection, &error));
             REQUIRE(postgres_contract.hasSchema(pg_connection, &error) == true);
             REQUIRE(postgres_contract.verifySchema(pg_connection, &error));
+            REQUIRE(postgres_contract.hasColumn(pg_connection, QStringLiteral("branches"),
+                                                QStringLiteral("working_storage_uuid"), &error) == true);
             REQUIRE(postgres_contract.hasColumn(pg_connection, QStringLiteral("revisions"),
                                                 QStringLiteral("operation_history_sha256"), &error) == true);
             REQUIRE(postgres_contract.hasColumn(pg_connection, QStringLiteral("users"),
@@ -286,6 +291,7 @@ int main(int argc, char **argv)
             const QUuid project_uuid = QUuid::createUuid();
             const QUuid branch_uuid = QUuid::createUuid();
             const QUuid revision_uuid = QUuid::createUuid();
+            const QUuid working_storage_uuid = QUuid::createUuid();
             const QUuid successor_uuid = QUuid::createUuid();
             const QUuid role_uuid = QUuid::createUuid();
             const QUuid system_grant_uuid = QUuid::createUuid();
@@ -312,10 +318,12 @@ int main(int argc, char **argv)
             ddl.finish();
 
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                "INSERT INTO branches(uuid,project_uuid,name,created_by_uuid) VALUES (?,?,?,?)")));
+                "INSERT INTO branches(uuid,project_uuid,name,working_storage_uuid,created_by_uuid) "
+                "VALUES (?,?,?,?,?)")));
             ddl.addBindValue(postgres_contract.bindUuid(branch_uuid));
             ddl.addBindValue(postgres_contract.bindUuid(project_uuid));
             ddl.addBindValue(QStringLiteral("main"));
+            ddl.addBindValue(postgres_contract.bindUuid(working_storage_uuid));
             ddl.addBindValue(postgres_contract.bindUuid(actor_uuid));
             REQUIRE_SQL(ddl, ddl.exec());
             ddl.finish();
@@ -337,6 +345,13 @@ int main(int argc, char **argv)
             ddl.addBindValue(postgres_contract.bindUuid(branch_uuid));
             REQUIRE_SQL(ddl, ddl.exec());
             ddl.finish();
+            // Resolution succeeds only for the current working branch head,
+            // and always returns the independent permanent storage UUID.
+            const std::optional<QUuid> resolved_storage = aowis::db::resolveWorkingStorageUuid(
+                pg_connection, postgres_contract, revision_uuid, &error);
+            REQUIRE(resolved_storage && *resolved_storage == working_storage_uuid);
+            REQUIRE(!aowis::db::resolveWorkingStorageUuid(
+                pg_connection, postgres_contract, QUuid::createUuid(), nullptr));
             REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
                 "INSERT INTO snapshots(revision_uuid,content) VALUES (?,?)")));
             ddl.addBindValue(postgres_contract.bindUuid(revision_uuid));
@@ -360,9 +375,9 @@ int main(int argc, char **argv)
             {
                 QSqlQuery objects(pg_connection);
                 REQUIRE_SQL(objects, objects.prepare(QStringLiteral(
-                    "INSERT INTO revision_objects"
-                    "(revision_uuid,object_uuid,kind,content,version,deleted) "
-                    "VALUES(?,?,?,?,1,0)")));
+                    "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES((SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,1,0)")));
                 for (qsizetype index = 0; index < working_object_ids.size(); ++index)
                 {
                     const QString kind = index == 0 ? QStringLiteral("network")
@@ -377,8 +392,9 @@ int main(int argc, char **argv)
                 objects.finish();
                 QSqlQuery members(pg_connection);
                 REQUIRE_SQL(members, members.prepare(QStringLiteral(
-                    "INSERT INTO hydraulic_network_members"
-                    "(revision_uuid,network_uuid,entity_uuid) VALUES(?,?,?)")));
+                    "INSERT INTO hydraulic_network_members(storage_uuid,network_uuid,entity_uuid) VALUES((SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?)")));
                 for (const QUuid &member_uuid : {member_a_uuid, member_b_uuid})
                 {
                     members.bindValue(0, postgres_contract.bindUuid(revision_uuid));
@@ -389,9 +405,9 @@ int main(int argc, char **argv)
                 members.finish();
                 QSqlQuery refs(pg_connection);
                 REQUIRE_SQL(refs, refs.prepare(QStringLiteral(
-                    "INSERT INTO hydraulic_network_references"
-                    "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
-                    "VALUES(?,?,?,?,?)")));
+                    "INSERT INTO hydraulic_network_references(storage_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "VALUES((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?)")));
                 for (const QString &field : {QStringLiteral("upstream"), QStringLiteral("downstream")})
                 {
                     refs.bindValue(0, postgres_contract.bindUuid(revision_uuid));
@@ -482,7 +498,7 @@ int main(int argc, char **argv)
             // All seven PostgreSQL statement-level immutability guards must
             // reject real modifications, not merely no-op statements. A
             // rejected statement must not partially change any row set.
-            const QString finalized_id = revision_uuid.toString(QUuid::WithoutBraces);
+            const QString finalized_id = working_storage_uuid.toString(QUuid::WithoutBraces);
             const QString network_id = network_object_uuid.toString(QUuid::WithoutBraces);
             const QString spare_id = spare_member_uuid.toString(QUuid::WithoutBraces);
             const QString member_a_id = member_a_uuid.toString(QUuid::WithoutBraces);
@@ -491,25 +507,19 @@ int main(int argc, char **argv)
             const QString new_object_b = QUuid::createUuid().toString(QUuid::WithoutBraces);
             const QStringList blocked_statements{
                 QStringLiteral("UPDATE revision_objects SET content=decode('55','hex') "
-                    "WHERE revision_uuid='%1' AND kind='orphan'").arg(finalized_id),
+                    "WHERE storage_uuid='%1' AND kind='orphan'").arg(finalized_id),
                 QStringLiteral("DELETE FROM revision_objects "
-                    "WHERE revision_uuid='%1' AND kind='orphan'").arg(finalized_id),
-                QStringLiteral("INSERT INTO revision_objects"
-                    "(revision_uuid,object_uuid,kind,content,version,deleted) VALUES "
-                    "('%1','%2','entity',decode('11','hex'),1,0),"
-                    "('%1','%3','entity',decode('22','hex'),1,0)")
+                    "WHERE storage_uuid='%1' AND kind='orphan'").arg(finalized_id),
+                QStringLiteral("INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES "
+            "('%1','%2','entity',decode('11','hex'),1,0),('%1','%3','entity',decode('22','hex'),1,0)")
                     .arg(finalized_id, new_object_a, new_object_b),
                 QStringLiteral("DELETE FROM hydraulic_network_members "
-                    "WHERE revision_uuid='%1'").arg(finalized_id),
-                QStringLiteral("INSERT INTO hydraulic_network_members "
-                    "(revision_uuid,network_uuid,entity_uuid) VALUES "
-                    "('%1','%2','%3')").arg(finalized_id, network_id, spare_id),
+                    "WHERE storage_uuid='%1'").arg(finalized_id),
+                QStringLiteral("INSERT INTO hydraulic_network_members(storage_uuid,network_uuid,entity_uuid) VALUES ('%1','%2','%3')").arg(finalized_id, network_id, spare_id),
                 QStringLiteral("DELETE FROM hydraulic_network_references "
-                    "WHERE revision_uuid='%1'").arg(finalized_id),
-                QStringLiteral("INSERT INTO hydraulic_network_references "
-                    "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES "
-                    "('%1','%2','%3','%4','new-upstream'),"
-                    "('%1','%2','%3','%4','new-downstream')")
+                    "WHERE storage_uuid='%1'").arg(finalized_id),
+                QStringLiteral("INSERT INTO hydraulic_network_references(storage_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "VALUES ('%1','%2','%3','%4','new-upstream'),('%1','%2','%3','%4','new-downstream')")
                     .arg(finalized_id, network_id, member_a_id, member_b_id)
             };
             for (const QString &blocked_statement : blocked_statements)
@@ -523,9 +533,9 @@ int main(int argc, char **argv)
                 ddl.finish();
             }
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
-                "SELECT (SELECT count(*) FROM revision_objects WHERE revision_uuid='%1')=6 "
-                "AND (SELECT count(*) FROM hydraulic_network_members WHERE revision_uuid='%1')=2 "
-                "AND (SELECT count(*) FROM hydraulic_network_references WHERE revision_uuid='%1')=2")
+                "SELECT (SELECT count(*) FROM revision_objects WHERE storage_uuid='%1')=6 "
+                "AND (SELECT count(*) FROM hydraulic_network_members WHERE storage_uuid='%1')=2 "
+                "AND (SELECT count(*) FROM hydraulic_network_references WHERE storage_uuid='%1')=2")
                 .arg(finalized_id)));
             REQUIRE_SQL(ddl, ddl.next());
             REQUIRE(ddl.value(0).toBool());
@@ -555,40 +565,58 @@ int main(int argc, char **argv)
             ddl.addBindValue(postgres_contract.bindUuid(branch_uuid));
             REQUIRE_SQL(ddl, ddl.exec());
             ddl.finish();
+            // The same branch keeps its permanent storage identity as the
+            // revision head advances. Historical revisions are never valid
+            // mutable-storage lookup keys.
+            REQUIRE(!aowis::db::resolveWorkingStorageUuid(
+                pg_connection, postgres_contract, revision_uuid, nullptr));
+            const std::optional<QUuid> successor_storage = aowis::db::resolveWorkingStorageUuid(
+                pg_connection, postgres_contract, successor_uuid, &error);
+            REQUIRE(successor_storage && *successor_storage == working_storage_uuid);
+
             // A statement that mixes finalized and working rows must fail
             // atomically. Valid successor writes must still be accepted.
-            const QString successor_id = successor_uuid.toString(QUuid::WithoutBraces);
+            const QString successor_id = working_storage_uuid.toString(QUuid::WithoutBraces);
             const QString mixed_old_id = QUuid::createUuid().toString(QUuid::WithoutBraces);
             const QString mixed_new_id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QUuid dormant_branch_uuid = QUuid::createUuid();
+            const QUuid dormant_storage_uuid = QUuid::createUuid();
+            REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                "INSERT INTO branches(uuid,project_uuid,name,working_storage_uuid,created_by_uuid) "
+                "VALUES(?,?,'dormant-contract-branch',?,?)")));
+            ddl.addBindValue(postgres_contract.bindUuid(dormant_branch_uuid));
+            ddl.addBindValue(postgres_contract.bindUuid(project_uuid));
+            ddl.addBindValue(postgres_contract.bindUuid(dormant_storage_uuid));
+            ddl.addBindValue(postgres_contract.bindUuid(actor_uuid));
+            REQUIRE_SQL(ddl, ddl.exec());
+            ddl.finish();
+            const QString dormant_id = dormant_storage_uuid.toString(QUuid::WithoutBraces);
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SAVEPOINT mixed_immutable_rows")));
             REQUIRE_SQL(ddl, !ddl.exec(QStringLiteral(
-                "INSERT INTO revision_objects"
-                "(revision_uuid,object_uuid,kind,content,version,deleted) VALUES "
-                "('%1','%2','entity',decode('01','hex'),1,0),"
-                "('%3','%4','entity',decode('02','hex'),1,0)")
-                .arg(successor_id, mixed_new_id, finalized_id, mixed_old_id)));
+                "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES "
+            "('%1','%2','entity',decode('01','hex'),1,0),('%3','%4','entity',decode('02','hex'),1,0)")
+                .arg(successor_id, mixed_new_id, dormant_id, mixed_old_id)));
             REQUIRE(ddl.lastError().text().contains(QStringLiteral("immutable")));
             ddl.finish();
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("ROLLBACK TO SAVEPOINT mixed_immutable_rows")));
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("RELEASE SAVEPOINT mixed_immutable_rows")));
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
-                "SELECT count(*) FROM revision_objects WHERE revision_uuid='%1'")
+                "SELECT count(*) FROM revision_objects WHERE storage_uuid='%1'")
                 .arg(successor_id)));
             REQUIRE_SQL(ddl, ddl.next());
-            REQUIRE(ddl.value(0).toInt() == 0);
+            REQUIRE(ddl.value(0).toInt() == 6);
             ddl.finish();
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
-                "INSERT INTO revision_objects"
-                "(revision_uuid,object_uuid,kind,content,version,deleted) "
-                "VALUES('%1','%2','entity',decode('01','hex'),1,0)")
+                "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) "
+            "VALUES('%1','%2','entity',decode('01','hex'),1,0)")
                 .arg(successor_id, mixed_new_id)));
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
                 "UPDATE revision_objects SET content=decode('ff','hex') "
-                "WHERE revision_uuid='%1' AND object_uuid='%2'")
+                "WHERE storage_uuid='%1' AND object_uuid='%2'")
                 .arg(successor_id, mixed_new_id)));
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
                 "DELETE FROM revision_objects "
-                "WHERE revision_uuid='%1' AND object_uuid='%2'")
+                "WHERE storage_uuid='%1' AND object_uuid='%2'")
                 .arg(successor_id, mixed_new_id)));
 
             REQUIRE_SQL(ddl, ddl.exec(QStringLiteral(
@@ -874,8 +902,9 @@ int main(int argc, char **argv)
                 // independent QPSQL connection to verify native UUID columns.
                 REQUIRE_SQL(ddl, ddl.exec(QStringLiteral("SET search_path TO %1").arg(core_schema)));
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT pg_typeof(entity_uuid)::text FROM hydraulic_network_members "
-                    "WHERE revision_uuid=? AND network_uuid=? LIMIT 1")));
+                    "SELECT pg_typeof(entity_uuid)::text FROM hydraulic_network_members WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND network_uuid=? LIMIT 1")));
                 ddl.addBindValue(postgres_contract.bindUuid(hydraulic_revision));
                 ddl.addBindValue(postgres_contract.bindUuid(network.uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
@@ -883,7 +912,7 @@ int main(int argc, char **argv)
                 REQUIRE(ddl.value(0).toString() == QStringLiteral("uuid"));
                 ddl.finish();
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")));
+                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid FROM " "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? " "AND r.state='working') AND network_uuid=?")));
                 ddl.addBindValue(postgres_contract.bindUuid(hydraulic_revision));
                 ddl.addBindValue(postgres_contract.bindUuid(network.uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
@@ -891,7 +920,7 @@ int main(int argc, char **argv)
                 REQUIRE(ddl.value(0).toInt() == 4);
                 ddl.finish();
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM hydraulic_network_references WHERE revision_uuid=? AND network_uuid=?")));
+                    "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid " "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE " "r.uuid=? AND r.state='working') AND network_uuid=?")));
                 ddl.addBindValue(postgres_contract.bindUuid(hydraulic_revision));
                 ddl.addBindValue(postgres_contract.bindUuid(network.uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
@@ -948,24 +977,33 @@ int main(int argc, char **argv)
                     *model_manifest, QCryptographicHash::Sha256));
                 REQUIRE(reopened.verifyProject(actor, hydraulic_project->project_uuid).valid);
                 REQUIRE(reopened.verifyProjectJournal(actor, hydraulic_project->project_uuid).valid);
-                // Finalized models exist ONLY as immutable Merkle roots; no
-                // revision-wide SQL copies survive finalization. The new
-                // working head retains fast editable SQL rows and indexes.
-                for (const QString &table : {
-                    QStringLiteral("revision_objects"),
-                    QStringLiteral("hydraulic_network_members"),
-                    QStringLiteral("hydraulic_network_references")})
-                {
-                    REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                        "SELECT COUNT(*) FROM %1 WHERE revision_uuid=?").arg(table)));
-                    ddl.addBindValue(postgres_contract.bindUuid(hydraulic_revision));
-                    REQUIRE_SQL(ddl, ddl.exec());
-                    REQUIRE_SQL(ddl, ddl.next());
-                    REQUIRE(ddl.value(0).toLongLong() == 0);
-                    ddl.finish();
-                }
+                // The finalized revision retains its immutable Merkle root,
+                // while the successor reuses the same branch-owned SQL
+                // storage. Historical revision UUIDs must never be used as
+                // physical working-table keys.
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+                    "SELECT r.state,b.working_storage_uuid FROM revisions r "
+                    "JOIN branches b ON b.uuid=r.branch_uuid AND b.project_uuid=r.project_uuid "
+                    "WHERE r.uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(hydraulic_revision));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toString() == QStringLiteral("finalized"));
+                const QUuid finalized_branch_storage = postgres_contract.readUuid(ddl.value(1));
+                REQUIRE(!finalized_branch_storage.isNull());
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT r.state,b.working_storage_uuid FROM revisions r "
+                    "JOIN branches b ON b.uuid=r.branch_uuid AND b.project_uuid=r.project_uuid "
+                    "WHERE r.uuid=?")));
+                ddl.addBindValue(postgres_contract.bindUuid(model_seal->new_working_revision_uuid));
+                REQUIRE_SQL(ddl, ddl.exec());
+                REQUIRE_SQL(ddl, ddl.next());
+                REQUIRE(ddl.value(0).toString() == QStringLiteral("working"));
+                REQUIRE(postgres_contract.readUuid(ddl.value(1)) == finalized_branch_storage);
+                ddl.finish();
+                REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
+                    "SELECT COUNT(*) FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working')")));
                 ddl.addBindValue(postgres_contract.bindUuid(model_seal->new_working_revision_uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
                 REQUIRE_SQL(ddl, ddl.next());
@@ -975,14 +1013,14 @@ int main(int argc, char **argv)
                 // Merkle rehydration pass. SQL handoff and sealed Merkle reads
                 // must have identical hydraulic membership and references.
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE revision_uuid=?")));
+                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid FROM " "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? " "AND r.state='working')")));
                 ddl.addBindValue(postgres_contract.bindUuid(model_seal->new_working_revision_uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
                 REQUIRE_SQL(ddl, ddl.next());
                 REQUIRE(ddl.value(0).toLongLong() == 4);
                 ddl.finish();
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM hydraulic_network_references WHERE revision_uuid=?")));
+                    "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid " "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE " "r.uuid=? AND r.state='working')")));
                 ddl.addBindValue(postgres_contract.bindUuid(model_seal->new_working_revision_uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
                 REQUIRE_SQL(ddl, ddl.next());
@@ -1078,8 +1116,9 @@ int main(int argc, char **argv)
                 REQUIRE(reloaded_batch->links_pipes.size() == 260);
                 REQUIRE(reloaded_batch->nodes_junctions.size() == 260);
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM hydraulic_network_references "
-                    "WHERE revision_uuid=? AND network_uuid=?")));
+                    "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND network_uuid=?")));
                 ddl.addBindValue(postgres_contract.bindUuid(batch_project->working_revision_uuid));
                 ddl.addBindValue(postgres_contract.bindUuid(batch_network.uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
@@ -1153,13 +1192,11 @@ int main(int argc, char **argv)
                 // describe precisely the same immutable state, even across
                 // all full and partial PostgreSQL import batches.
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM object_events e "
-                    "JOIN revision_objects o ON o.revision_uuid=e.revision_uuid "
-                    "AND o.object_uuid=e.object_uuid "
-                    "WHERE e.revision_uuid=? AND e.action='put' "
-                    "AND e.before_version=-1 AND e.after_version=1 "
-                    "AND e.kind=o.kind AND e.after_content=o.content "
-                    "AND o.version=1 AND o.deleted=0")));
+                    "SELECT COUNT(*) FROM object_events e JOIN revision_objects o ON o.storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=e.revision_uuid AND r.state='working') AND "
+            "o.object_uuid=e.object_uuid WHERE e.revision_uuid=? AND e.action='put' AND e.before_version=-1 AND "
+            "e.after_version=1 AND e.kind=o.kind AND e.after_content=o.content AND o.version=1 AND o.deleted=0")));
                 ddl.addBindValue(postgres_contract.bindUuid(batch_project->working_revision_uuid));
                 REQUIRE_SQL(ddl, ddl.exec());
                 REQUIRE_SQL(ddl, ddl.next());
@@ -1183,7 +1220,7 @@ int main(int argc, char **argv)
                 REQUIRE(batch_fork_model->nodes_junctions.size() == 260);
                 REQUIRE(batch_fork_model->links_pipes.size() == 260);
                 REQUIRE_SQL(ddl, ddl.prepare(QStringLiteral(
-                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")));
+                    "SELECT COUNT(*) FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid FROM " "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? " "AND r.state='working') AND network_uuid=?")));
                 ddl.addBindValue(postgres_contract.bindUuid(batch_fork->head_revision_uuid));
                 ddl.addBindValue(postgres_contract.bindUuid(batch_network.uuid));
                 REQUIRE_SQL(ddl, ddl.exec());

@@ -207,11 +207,20 @@ struct ObjectMergePreview
     // merge operation must check these generations again under its write lock.
     qint64 left_generation = 0;
     qint64 right_generation = 0;
-    // Transient SHA-256 of every physical left object row, including version
-    // and tombstone data. Captured with the preview's SQLite read snapshot.
+    // Transient left-state SHA-256: for working tips, hashes every physical
+    // object row (including versions and tombstones) to guard merge commit;
+    // for finalized tips, a domain-separated fingerprint of the immutable
+    // Merkle root. Never persisted as a revision's integrity hash.
     QByteArray left_physical_sha256;
     QVector<ObjectMergeChange> changes; // Sorted by UUID bytes.
     qsizetype conflict_count = 0;
+    // Diagnostic counters for finalized-tip previews. Merkle changes include
+    // version-only edits and tombstones; they are candidate UUIDs, not the
+    // number of logical ObjectMergeChange entries. Zero for working-tip scans.
+    bool merkle_candidate_scan_used = false;
+    quint64 merkle_candidate_keys = 0;
+    quint64 merkle_tree_nodes_loaded = 0;
+    quint64 merkle_shared_subtrees_skipped = 0;
 };
 
 struct ObjectChange
@@ -449,11 +458,13 @@ public:
         const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
         QString *error = nullptr) const;
 
-    // Memory-bounded three-way preview for remote clients. Streams unchanged
-    // entities without retaining them, rejects once either limit is reached,
-    // and returns no partial result. The payload budget counts canonical
-    // content from all three states of each changed entity. This does not
-    // change the unrestricted core merge-commit behavior.
+    // Memory-bounded three-way preview for remote clients. Uses at most a
+    // bounded set of Merkle candidate UUIDs for finalized tips, falling back
+    // to streaming full cursors if that set would exceed the cap. Streams
+    // unchanged entities without retaining them, rejects once either result
+    // limit is reached, and returns no partial result. The payload budget
+    // counts canonical content from all three states of each changed entity.
+    // This does not change unrestricted core merge-commit behavior.
     std::optional<ObjectMergePreview> previewObjectMergeBounded(const OperationContext &actor,
         const QUuid &left_revision_uuid, const QUuid &right_revision_uuid,
         qsizetype max_changes, qsizetype max_changed_payload_bytes,

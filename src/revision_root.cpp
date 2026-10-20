@@ -143,8 +143,9 @@ bool prepareObjectScan(QSqlQuery &query, const StorageBackend &backend,
                        const QUuid &revision_uuid, QString *error)
 {
     if (!query.prepare(QStringLiteral(
-            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
-            "WHERE revision_uuid=? ORDER BY object_uuid")))
+            "SELECT object_uuid,kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') ORDER BY object_uuid")))
     {
         setError(error, query.lastError().text());
         return false;
@@ -177,14 +178,15 @@ std::optional<QByteArray> buildRevisionRoot(const QSqlDatabase &database,
     else
     {
         // All supported object mutations have append-only object_events.
-        // New working revisions are copied from their first finalized parent.
+        // New working revisions inherit the immutable root of their first finalized parent.
         // Reusing that parent's Merkle root makes finalization proportional
         // to the changed UUIDs, not the full object count.
         if (!objects.prepare(QStringLiteral(
-                "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
-                "FROM revision_objects o WHERE o.revision_uuid=? AND o.object_uuid IN ("
-                "SELECT DISTINCT object_uuid FROM object_events WHERE revision_uuid=?) "
-                "ORDER BY o.object_uuid")))
+                "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted FROM revision_objects o WHERE "
+            "o.storage_uuid=(SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON "
+            "r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND "
+            "o.object_uuid IN (SELECT DISTINCT object_uuid FROM object_events WHERE revision_uuid=?) ORDER BY "
+            "o.object_uuid")))
         {
             setError(error, objects.lastError().text());
             return std::nullopt;
@@ -519,7 +521,7 @@ bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
     }
     destination.finish();
     if (!destination.prepare(QStringLiteral(
-            "SELECT 1 FROM revision_objects WHERE revision_uuid=?")))
+            "SELECT 1 FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches b JOIN " "revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working')")))
     {
         setError(error, destination.lastError().text());
         return false;
@@ -549,11 +551,12 @@ bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
     if (postgres)
     {
         if (!insert.prepare(QStringLiteral(
-                "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-                "SELECT CAST(? AS uuid), CAST(src.object_uuid AS uuid), src.kind, "
-                "CASE WHEN src.deleted=1 THEN NULL ELSE decode(src.content_b64,'base64') END, "
-                "src.version, src.deleted FROM jsonb_to_recordset(CAST(? AS jsonb)) "
-                "AS src(object_uuid text,kind text,content_b64 text,version bigint,deleted bigint)")))
+                "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) SELECT (SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=CAST(? AS uuid) AND r.state='working'), "
+            "CAST(src.object_uuid AS uuid), src.kind, CASE WHEN src.deleted=1 THEN NULL ELSE "
+            "decode(src.content_b64,'base64') END, src.version, src.deleted FROM jsonb_to_recordset(CAST(? AS "
+            "jsonb)) AS src(object_uuid text,kind text,content_b64 text,version bigint,deleted bigint)")))
         {
             setError(error, insert.lastError().text());
             return false;
@@ -617,11 +620,10 @@ bool materializeWorkingObjectsFromRoot(const QSqlDatabase &database,
                 const qsizetype count = qMin(sqlite_insert_batch, records->size() - offset);
                 QString placeholders;
                 for (qsizetype item = 0; item < count; ++item)
-                    placeholders += item == 0 ? QStringLiteral("(?,?,?,?,?,?)")
-                                              : QStringLiteral(",(?,?,?,?,?,?)");
+                    placeholders += item == 0 ? QStringLiteral("((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND " "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?,?)")
+                                              : QStringLiteral(",((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND " "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?,?)");
                 if (!insert.prepare(QStringLiteral(
-                        "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-                        "VALUES %1").arg(placeholders)))
+                        "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES %1").arg(placeholders)))
                 {
                     setError(error, insert.lastError().text());
                     return false;

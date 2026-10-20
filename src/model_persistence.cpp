@@ -107,9 +107,10 @@ bool fetchObjectsForNetworkSave(const StorageBackend &backend, const QSqlDatabas
     {
         QSqlQuery query(database);
         if (!query.prepare(QStringLiteral(
-                "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
-                "WHERE revision_uuid=CAST(? AS UUID) "
-                "AND object_uuid=ANY(CAST(? AS UUID[]))")))
+                "SELECT object_uuid,kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=CAST(? AS UUID) AND r.state='working') AND "
+            "object_uuid=ANY(CAST(? AS UUID[]))")))
         {
             assignError(error, query.lastError().text());
             return false;
@@ -146,8 +147,9 @@ bool fetchObjectsForNetworkSave(const StorageBackend &backend, const QSqlDatabas
             placeholders += i == 0 ? QStringLiteral("?") : QStringLiteral(",?");
         QSqlQuery query(database);
         if (!query.prepare(QStringLiteral(
-                "SELECT object_uuid,kind,content,version,deleted FROM revision_objects "
-                "WHERE revision_uuid=? AND object_uuid IN (%1)").arg(placeholders)))
+                "SELECT object_uuid,kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND object_uuid IN (%1)").arg(placeholders)))
         {
             assignError(error, query.lastError().text());
             return false;
@@ -194,11 +196,11 @@ bool fetchIndexedNetworkObjectsForSave(const StorageBackend &backend,
     QSet<QUuid> missing = old_ids;
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
-            "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
-            "FROM hydraulic_network_members m "
-            "JOIN revision_objects o ON o.revision_uuid=m.revision_uuid "
-            "AND o.object_uuid=m.entity_uuid "
-            "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+            "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted FROM hydraulic_network_members m JOIN "
+            "revision_objects o ON o.storage_uuid=m.storage_uuid AND o.object_uuid=m.entity_uuid WHERE "
+            "m.storage_uuid=(SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON "
+            "r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND "
+            "m.network_uuid=?")))
     {
         assignError(error, query.lastError().text());
         return false;
@@ -223,7 +225,7 @@ bool fetchIndexedNetworkObjectsForSave(const StorageBackend &backend,
     query.finish();
 
     // The indexed join proves ownership for every old UUID it returned:
-    // hydraulic_network_members has a unique (revision_uuid,entity_uuid)
+    // hydraulic_network_members has a unique (storage_uuid,entity_uuid)
     // key, so an entity cannot simultaneously belong to another network.
     // Explicitly check ownership only where that proof is unavailable:
     // newly introduced UUIDs, the root, and missing/corrupt index entries.
@@ -328,8 +330,9 @@ bool insertFreshNetworkObjects(const StorageBackend &backend,
     QSqlQuery generation(database);
     QSqlQuery event(database);
     if (!insert.prepare(QStringLiteral(
-            "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-            "VALUES (?,?,?,?,1,0)")) ||
+            "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES ((SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,1,0)")) ||
         !generation.prepare(QStringLiteral(
             "UPDATE revisions SET generation=generation+1 WHERE uuid=? AND state='working'")) ||
         !event.prepare(QStringLiteral(
@@ -399,10 +402,11 @@ bool insertFreshNetworkMembership(const StorageBackend &backend,
 {
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
-            "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
-            "SELECT ?,?,object_uuid FROM object_events "
-            "WHERE revision_uuid=? AND sequence>? AND sequence<=? "
-            "AND action='put' AND before_version=-1 AND object_uuid<>?")))
+            "INSERT INTO hydraulic_network_members(storage_uuid,network_uuid,entity_uuid) SELECT (SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,object_uuid FROM object_events "
+            "WHERE revision_uuid=? AND sequence>? AND sequence<=? AND action='put' AND before_version=-1 AND "
+            "object_uuid<>?")))
     {
         assignError(error, query.lastError().text());
         return false;
@@ -445,8 +449,9 @@ bool checkIncomingNetworkOwnership(const StorageBackend &backend, const QSqlData
             placeholders += i == 0 ? QStringLiteral("?") : QStringLiteral(",?");
         QSqlQuery query(database);
         if (!query.prepare(QStringLiteral(
-                "SELECT network_uuid FROM hydraulic_network_members "
-                "WHERE revision_uuid=? AND entity_uuid IN (%1)").arg(placeholders)))
+                "SELECT network_uuid FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND entity_uuid IN (%1)").arg(placeholders)))
         {
             assignError(error, query.lastError().text());
             return false;
@@ -1028,12 +1033,12 @@ bool insertFreshHydraulicReferences(const StorageBackend &backend,
                 tuples += QStringLiteral("(%1,%1,?)").arg(uuid_parameter);
             }
             if (!insert.prepare(QStringLiteral(
-                    "WITH owner(revision_uuid,network_uuid) AS (VALUES (%1,%1)), "
-                    "incoming(source_uuid,target_uuid,field) AS (VALUES %2) "
-                    "INSERT INTO hydraulic_network_references "
-                    "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
-                    "SELECT owner.revision_uuid,owner.network_uuid,incoming.source_uuid,"
-                    "incoming.target_uuid,incoming.field FROM owner CROSS JOIN incoming"
+                    "WITH owner(revision_uuid,network_uuid) AS (VALUES (%1,%1)), incoming(source_uuid,target_uuid,field) "
+            "AS (VALUES %2) INSERT INTO hydraulic_network_references(storage_uuid,network_uuid,source_uuid,target_uui"
+            "d,field) SELECT (SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON "
+            "r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=owner.revision_uuid AND "
+            "r.state='working'),owner.network_uuid,incoming.source_uuid,incoming.target_uuid,incoming.field FROM "
+            "owner CROSS JOIN incoming"
                     ).arg(uuid_parameter, tuples)))
             {
                 assignError(error, insert.lastError().text());
@@ -1072,9 +1077,9 @@ bool Database::rebuildWorkingHydraulicIndexes(
 {
     QSqlQuery roots(this->database_);
     if (!roots.prepare(QStringLiteral(
-            "SELECT object_uuid,content FROM revision_objects "
-            "WHERE revision_uuid=? AND kind='hydraulic.network' AND deleted=0 "
-            "ORDER BY object_uuid")))
+            "SELECT object_uuid,content FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND kind='hydraulic.network' AND deleted=0 ORDER BY object_uuid")))
     {
         assignError(error, roots.lastError().text());
         return false;
@@ -1141,10 +1146,12 @@ bool Database::rebuildWorkingHydraulicIndexes(
         {
             QSqlQuery insert(this->database_);
             if (!insert.prepare(QStringLiteral(
-                    "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
-                    "SELECT CAST(? AS UUID),CAST(? AS UUID),object_uuid "
-                    "FROM revision_objects WHERE revision_uuid=CAST(? AS UUID) "
-                    "AND object_uuid=ANY(CAST(? AS UUID[])) AND deleted=0")))
+                    "INSERT INTO hydraulic_network_members(storage_uuid,network_uuid,entity_uuid) SELECT (SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=CAST(? AS UUID) AND r.state='working'),CAST(? AS "
+            "UUID),object_uuid FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM "
+            "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=CAST(? AS UUID) AND r.state='working') AND object_uuid=ANY(CAST(? AS UUID[])) AND deleted=0")))
             {
                 assignError(error, insert.lastError().text());
                 return false;
@@ -1176,9 +1183,12 @@ bool Database::rebuildWorkingHydraulicIndexes(
                 }
                 QSqlQuery insert(this->database_);
                 if (!insert.prepare(QStringLiteral(
-                        "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
-                        "SELECT %1,%1,object_uuid FROM revision_objects "
-                        "WHERE revision_uuid=%1 AND deleted=0 AND object_uuid IN (%2)")
+                        "INSERT INTO hydraulic_network_members(storage_uuid,network_uuid,entity_uuid) SELECT (SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=%1 AND r.state='working'),%1,object_uuid FROM "
+            "revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches b JOIN revisions r "
+            "ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=%1 AND r.state='working') AND "
+            "deleted=0 AND object_uuid IN (%2)")
                         .arg(uuid_placeholder, placeholders)))
                 {
                     assignError(error, insert.lastError().text());
@@ -1244,8 +1254,9 @@ bool Database::replaceHydraulicReferences(const QUuid &revision_uuid,
     QSet<QByteArray> previous;
     QSqlQuery existing(this->database_);
     if (!existing.prepare(QStringLiteral(
-            "SELECT source_uuid,target_uuid,field FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND network_uuid=?")))
+            "SELECT source_uuid,target_uuid,field FROM hydraulic_network_references WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND network_uuid=?")))
     {
         assignError(error, existing.lastError().text());
         return false;
@@ -1271,8 +1282,9 @@ bool Database::replaceHydraulicReferences(const QUuid &revision_uuid,
 
     QSqlQuery remove(this->database_);
     if (!remove.prepare(QStringLiteral(
-            "DELETE FROM hydraulic_network_references WHERE revision_uuid=? "
-            "AND network_uuid=? AND source_uuid=? AND target_uuid=? AND field=?")))
+            "DELETE FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid FROM "
+            "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? "
+            "AND r.state='working') AND network_uuid=? AND source_uuid=? AND target_uuid=? AND field=?")))
     {
         assignError(error, remove.lastError().text());
         return false;
@@ -1303,12 +1315,12 @@ bool Database::replaceHydraulicReferences(const QUuid &revision_uuid,
         const QList<QByteArray> keys = wanted.values();
         QString tuples;
         for (qsizetype item = 0; item < reference_batch_size; ++item)
-            tuples += (item == 0 ? QStringLiteral("(?,?,?,?,?)")
-                                 : QStringLiteral(",(?,?,?,?,?)"));
+            tuples += (item == 0 ? QStringLiteral("((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND " "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?)")
+                                 : QStringLiteral(",((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND " "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?)"));
         QSqlQuery batch(this->database_);
         if (!batch.prepare(QStringLiteral(
-                "INSERT INTO hydraulic_network_references "
-                "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES %1").arg(tuples)))
+                "INSERT INTO hydraulic_network_references(storage_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "VALUES %1").arg(tuples)))
         {
             assignError(error, batch.lastError().text());
             return false;
@@ -1338,8 +1350,9 @@ bool Database::replaceHydraulicReferences(const QUuid &revision_uuid,
         // The remaining fewer-than-64 rows use a single prepared statement.
         QSqlQuery remainder(this->database_);
         if (!remainder.prepare(QStringLiteral(
-                "INSERT INTO hydraulic_network_references "
-                "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES(?,?,?,?,?)")))
+                "INSERT INTO hydraulic_network_references(storage_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "VALUES((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?)")))
         {
             assignError(error, remainder.lastError().text());
             return false;
@@ -1363,8 +1376,9 @@ bool Database::replaceHydraulicReferences(const QUuid &revision_uuid,
 
     QSqlQuery insert(this->database_);
     if (!insert.prepare(QStringLiteral(
-            "INSERT INTO hydraulic_network_references "
-            "(revision_uuid,network_uuid,source_uuid,target_uuid,field) VALUES(?,?,?,?,?)")))
+            "INSERT INTO hydraulic_network_references(storage_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "VALUES((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?)")))
     {
         assignError(error, insert.lastError().text());
         return false;
@@ -1396,7 +1410,7 @@ bool Database::replaceNetworkMembership(const QUuid &revision_uuid,
 {
     QSqlQuery remove(this->database_);
     if (!remove.prepare(QStringLiteral(
-            "DELETE FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")))
+            "DELETE FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working') AND network_uuid=?")))
     {
         assignError(error, remove.lastError().text());
         return false;
@@ -1410,8 +1424,9 @@ bool Database::replaceNetworkMembership(const QUuid &revision_uuid,
     }
     QSqlQuery insert(this->database_);
     if (!insert.prepare(QStringLiteral(
-            "INSERT INTO hydraulic_network_members(revision_uuid,network_uuid,entity_uuid) "
-            "VALUES(?,?,?)")))
+            "INSERT INTO hydraulic_network_members(storage_uuid,network_uuid,entity_uuid) VALUES((SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?)")))
     {
         assignError(error, insert.lastError().text());
         return false;
@@ -1498,8 +1513,9 @@ bool Database::saveHydraulicNetwork(const OperationContext &actor,
         QSet<QUuid> old_ids;
         QSqlQuery root(this->database_);
         if (!root.prepare(QStringLiteral(
-                "SELECT kind,content FROM revision_objects "
-                "WHERE revision_uuid=? AND object_uuid=? AND deleted=0")))
+                "SELECT kind,content FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM "
+            "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? "
+            "AND r.state='working') AND object_uuid=? AND deleted=0")))
         {
             assignError(error, root.lastError().text()); break;
         }
@@ -1772,8 +1788,9 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
         // networks in the same revision are never deserialized on a local edit.
         QSqlQuery root(this->database_);
         if (!root.prepare(QStringLiteral(
-                "SELECT content FROM revision_objects WHERE revision_uuid=? AND object_uuid=? "
-                "AND kind='hydraulic.network' AND deleted=0")))
+                "SELECT content FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches "
+            "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND "
+            "r.state='working') AND object_uuid=? AND kind='hydraulic.network' AND deleted=0")))
         {
             assignError(error, root.lastError().text());
             return std::nullopt;
@@ -1821,10 +1838,11 @@ std::optional<NetworkHydraulic> Database::loadHydraulicNetworkUnchecked(
         {
             QSqlQuery members(this->database_);
             if (!members.prepare(QStringLiteral(
-                    "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted "
-                    "FROM hydraulic_network_members m JOIN revision_objects o "
-                    "ON o.revision_uuid=m.revision_uuid AND o.object_uuid=m.entity_uuid "
-                    "WHERE m.revision_uuid=? AND m.network_uuid=?")))
+                    "SELECT o.object_uuid,o.kind,o.content,o.version,o.deleted FROM hydraulic_network_members m JOIN "
+            "revision_objects o ON o.storage_uuid=m.storage_uuid AND o.object_uuid=m.entity_uuid WHERE "
+            "m.storage_uuid=(SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON "
+            "r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND "
+            "m.network_uuid=?")))
             {
                 assignError(error, members.lastError().text());
                 return std::nullopt;
@@ -2047,8 +2065,9 @@ bool Database::canSkipHydraulicRevalidation(const QUuid &revision_uuid,
 {
     QSqlQuery current(this->database_);
     if (!current.prepare(QStringLiteral(
-            "SELECT kind,content,deleted FROM revision_objects "
-            "WHERE revision_uuid=? AND object_uuid=?")))
+            "SELECT kind,content,deleted FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND object_uuid=?")))
     {
         assignError(error, current.lastError().text());
         return false;
@@ -2109,11 +2128,11 @@ bool locallyOwnedObject(const StorageBackend &backend, const QSqlDatabase &datab
 {
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
-            "SELECT o.kind,o.content FROM hydraulic_network_members AS m "
-            "JOIN revision_objects AS o ON o.revision_uuid=m.revision_uuid "
-            "AND o.object_uuid=m.entity_uuid "
-            "WHERE m.revision_uuid=? AND m.network_uuid=? AND m.entity_uuid=? "
-            "AND o.deleted=0")))
+            "SELECT o.kind,o.content FROM hydraulic_network_members AS m JOIN revision_objects AS o ON "
+            "o.storage_uuid=m.storage_uuid AND o.object_uuid=m.entity_uuid WHERE m.storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND m.network_uuid=? AND "
+            "m.entity_uuid=? AND o.deleted=0")))
     {
         assignError(error, query.lastError().text());
         return false;
@@ -2208,8 +2227,9 @@ bool updateLocalReferenceSource(const StorageBackend &backend, const QSqlDatabas
     }
     QSqlQuery existing(database);
     if (!existing.prepare(QStringLiteral(
-            "SELECT target_uuid,field FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND network_uuid=? AND source_uuid=?")))
+            "SELECT target_uuid,field FROM hydraulic_network_references WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND network_uuid=? AND source_uuid=?")))
     {
         assignError(error, existing.lastError().text());
         return false;
@@ -2235,12 +2255,13 @@ bool updateLocalReferenceSource(const StorageBackend &backend, const QSqlDatabas
     QSqlQuery remove(database);
     QSqlQuery insert(database);
     if (!remove.prepare(QStringLiteral(
-            "DELETE FROM hydraulic_network_references WHERE revision_uuid=? "
-            "AND network_uuid=? AND source_uuid=? AND target_uuid=? AND field=?")) ||
+            "DELETE FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid FROM "
+            "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? "
+            "AND r.state='working') AND network_uuid=? AND source_uuid=? AND target_uuid=? AND field=?")) ||
         !insert.prepare(QStringLiteral(
-            "INSERT INTO hydraulic_network_references "
-            "(revision_uuid,network_uuid,source_uuid,target_uuid,field) "
-            "VALUES(?,?,?,?,?)")))
+            "INSERT INTO hydraulic_network_references(storage_uuid,network_uuid,source_uuid,target_uuid,field) "
+            "VALUES((SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?)")))
     {
         assignError(error, remove.lastError().isValid() ? remove.lastError().text()
                                                          : insert.lastError().text());
@@ -2290,11 +2311,13 @@ LocalStructureCheck checkLocalPipeAndAttachments(const StorageBackend &backend, 
     QSqlQuery owner(database);
     QSqlQuery previous(database);
     if (!state.prepare(QStringLiteral(
-            "SELECT kind,content,deleted FROM revision_objects "
-            "WHERE revision_uuid=? AND object_uuid=?")) ||
+            "SELECT kind,content,deleted FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND object_uuid=?")) ||
         !owner.prepare(QStringLiteral(
-            "SELECT network_uuid FROM hydraulic_network_members "
-            "WHERE revision_uuid=? AND entity_uuid=?")) ||
+            "SELECT network_uuid FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND entity_uuid=?")) ||
         !previous.prepare(QStringLiteral(
             "SELECT before_content,before_deleted FROM object_events "
             "WHERE revision_uuid=? AND object_uuid=? ORDER BY sequence DESC LIMIT 1")))
@@ -2442,9 +2465,10 @@ LocalStructureCheck checkLocalPipeAndAttachments(const StorageBackend &backend, 
     // of this group. This closes the endpoint/assigned-junction dependency.
     QSqlQuery dependents(database);
     if (!dependents.prepare(QStringLiteral(
-            "SELECT DISTINCT r.source_uuid,r.network_uuid FROM hydraulic_network_references AS r "
-            "WHERE r.revision_uuid=? AND r.target_uuid=? "
-            "AND r.field LIKE 'demand_point%attachment.pipe_uuid'")))
+            "SELECT DISTINCT r.source_uuid,r.network_uuid FROM hydraulic_network_references AS r WHERE "
+            "r.storage_uuid=(SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON "
+            "r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND "
+            "r.target_uuid=? AND r.field LIKE 'demand_point%attachment.pipe_uuid'")))
     {
         assignError(error, dependents.lastError().text());
         return LocalStructureCheck::SqlError;
@@ -2509,16 +2533,18 @@ bool Database::validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
     // without scanning and deserializing every root in the project.
     QSqlQuery owner(this->database_);
     if (!owner.prepare(QStringLiteral(
-            "SELECT network_uuid FROM hydraulic_network_members "
-            "WHERE revision_uuid=? AND entity_uuid=?")))
+            "SELECT network_uuid FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND entity_uuid=?")))
     {
         assignError(error, owner.lastError().text());
         return false;
     }
     QSqlQuery touched_row(this->database_);
     if (!touched_row.prepare(QStringLiteral(
-            "SELECT kind,content,deleted FROM revision_objects "
-            "WHERE revision_uuid=? AND object_uuid=?")))
+            "SELECT kind,content,deleted FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND object_uuid=?")))
     {
         assignError(error, touched_row.lastError().text());
         return false;
@@ -2571,15 +2597,16 @@ bool Database::validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
     // authoritative for the old root index and survives failed edits.
     QSqlQuery old_members(this->database_);
     if (!old_members.prepare(QStringLiteral(
-            "SELECT entity_uuid FROM hydraulic_network_members "
-            "WHERE revision_uuid=? AND network_uuid=?")))
+            "SELECT entity_uuid FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND network_uuid=?")))
     {
         assignError(error, old_members.lastError().text());
         return false;
     }
     QSqlQuery entity(this->database_);
     if (!entity.prepare(QStringLiteral(
-            "SELECT deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")))
+            "SELECT deleted FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working') AND object_uuid=?")))
     {
         assignError(error, entity.lastError().text());
         return false;
@@ -2677,7 +2704,7 @@ bool Database::validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
         {
             QSqlQuery state(this->database_);
             if (!state.prepare(QStringLiteral(
-                    "SELECT deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")))
+                    "SELECT deleted FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working') AND object_uuid=?")))
             {
                 assignError(error, state.lastError().text());
                 return false;
@@ -2710,7 +2737,7 @@ bool Database::validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
     // Delete references for roots removed in this transaction as well.
     QSqlQuery delete_references(this->database_);
     if (!delete_references.prepare(QStringLiteral(
-            "DELETE FROM hydraulic_network_references WHERE revision_uuid=? AND network_uuid=?")))
+            "DELETE FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid FROM " "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? " "AND r.state='working') AND network_uuid=?")))
     {
         assignError(error, delete_references.lastError().text());
         return false;
@@ -2722,7 +2749,7 @@ bool Database::validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
             continue;
         QSqlQuery state(this->database_);
         if (!state.prepare(QStringLiteral(
-                "SELECT deleted FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")))
+                "SELECT deleted FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working') AND object_uuid=?")))
         {
             assignError(error, state.lastError().text());
             return false;
@@ -2750,7 +2777,7 @@ bool Database::validateTouchedHydraulicNetworks(const QUuid &revision_uuid,
     // in one atomic group has no artificial transient UNIQUE violation.
     QSqlQuery remove(this->database_);
     if (!remove.prepare(QStringLiteral(
-            "DELETE FROM hydraulic_network_members WHERE revision_uuid=? AND network_uuid=?")))
+            "DELETE FROM hydraulic_network_members WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working') AND network_uuid=?")))
     {
         assignError(error, remove.lastError().text());
         return false;

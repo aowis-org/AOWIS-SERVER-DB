@@ -20,8 +20,19 @@ cmake --build build-linux-tests --target aowis-db-network-benchmark
 ```
 
 The synthetic model contains one reservoir, N junctions and N connected pipes.
-Each successive revision edits a junction and finalizes it. The benchmark
-measures database work, not fixture creation. SQLite runs use an isolated
+Each successive revision edits the configured number of distinct junctions
+(default one) and finalizes it. The benchmark measures database work, not
+fixture creation. The optional `--compare` workload forks from the first
+finalized revision, edits a different junction, finalizes the fork and measures
+revision-DAG ancestry comparison and a read-only three-way object merge preview.
+For finalized tips the preview uses Merkle differences to select changed
+object candidates rather than decode all three models. A domain-separated
+fingerprint of the finalized left root replaces the previous full-left-model
+physical digest pass; only its root node is read and verified separately.
+Working-tip previews still scan physical SQL rows for the preview-to-commit
+compare-and-swap guard. A fast preview is not a full corruption audit: run
+project verification to check all immutable descendants. Historical
+pre-optimization runs provide the full-scan baseline. SQLite runs use an isolated
 temporary database and do not modify configured projects.
 
 For a small baseline or a larger stress workload:
@@ -31,8 +42,25 @@ For a small baseline or a larger stress workload:
 ./build-linux-tests/aowis-db-network-benchmark 100000 --revisions 1
 ```
 
-`--revisions` accepts 1–100. A 100,000-pipe model consumes substantial time,
-CPU, disk and memory; start with a single revision.
+`--revisions` accepts 1–100 and `--edits` accepts 1–PIPE_COUNT. A 100,000-pipe
+model consumes substantial time, CPU, disk and memory; start with a single
+revision. `--compare` requires at least two revisions and two pipes, and it
+creates one additional finalized revision on the forked branch.
+
+For a reproducible sparse-vs-dense-edit baseline, execute each workload several
+times, without other heavy jobs on the host, and retain separate run logs:
+
+```bash
+./build-linux-tests/aowis-db-network-benchmark 1000 --revisions 3 --edits 1 --compare
+./build-linux-tests/aowis-db-network-benchmark 1000 --revisions 3 --edits 10 --compare
+./build-linux-tests/aowis-db-network-benchmark 1000 --revisions 3 --edits 1000 --compare
+./build-linux-tests/aowis-db-network-benchmark 10000 --revisions 3 --edits 10 --compare
+```
+
+These runs edit only junctions; total stored entities also include the pipes,
+reservoir and network object. Changing `--edits` affects the edit and seal
+workloads together, so compare individual output fields rather than treating
+overall runtime as a finalization-only measurement.
 
 ## PostgreSQL benchmark
 
@@ -42,6 +70,7 @@ executes the same workload, and cleans up:
 ```bash
 ./tools/benchmark_network_postgres.sh 1000 --revisions 10
 ./tools/benchmark_network_postgres.sh 10000 --revisions 1
+./tools/benchmark_network_postgres.sh 1000 --revisions 3 --edits 10 --compare
 ```
 
 Docker is required for the disposable runner. Alternatively, the binary can
@@ -57,7 +86,8 @@ or any other database.
 | --- | --- |
 | `initial_save_ms` | Saving the complete initial model |
 | `load_ms`, `unchanged_save_ms` | Loading and resaving without model changes |
-| `single_entity_edit_ms` | An edit to one existing junction |
+| `single_entity_edit_ms` | First individual junction edit (even when `--edits` is greater than one) |
+| `changes_per_revision`, `first_revision_edit_total_ms` | Batch size and sum of first-revision individual edit timings |
 | `finalize_ms` | Initial finalization, including immutable root creation |
 | `create_branch_ms` | Materializing an independent branch from a finalized state |
 | `verify_history_ms` | Ordinary finalized-history integrity checks |
@@ -65,9 +95,28 @@ or any other database.
 | `repeat_edit_total_ms` | Sum of later individual edit durations |
 | `revision_samples_number_edit_ms_finalize_ms` | Per-revision edit/finalization breakdown |
 | `revision_object_rows` | SQL working-object rows retained at the end, **not** all historical objects |
+| `hydraulic_network_member_rows`, `hydraulic_network_reference_rows` | Retained derived hydraulic-index rows |
+| `revision_rows`, `object_event_rows` | SQL revision and recorded object-event rows |
+| `content_blob_rows`, `content_tree_node_rows` | Distinct immutable content blobs and Merkle tree nodes, including any unreachable intermediate nodes |
+| `content_payload_bytes` | Sum of raw persisted content payload lengths; excludes SQL row/index/storage overhead |
+| `comparison_enabled`, `merge_preview_changes`, `merge_preview_conflicts` | Whether a divergent branch was created; preview result counts |
+| `divergent_branch_finalize_ms` | Finalization of the optional forked working branch |
+| `ancestry_comparison_ms` | Revision graph common-ancestor comparison; **not** a model diff |
+| `merge_preview_ms` | Read-only three-way entity-level comparison between divergent finalized revisions; sealed-left fingerprint derived from immutable root instead of a full-model physical digest |
+| `merge_preview_merkle_used`, `merge_preview_merkle_candidates` | Whether changed-object candidate filtering was used, and the number of unique candidate UUIDs (including version-only differences) |
+| `merge_preview_merkle_nodes_loaded`, `merge_preview_shared_subtrees_skipped` | Combined Merkle diff node loads and subtree skips across the two base-to-tip comparisons; excludes the one-node finalized-left fingerprint validation |
 | `sqlite_file_bytes` | On-disk SQLite file bytes, including potentially reusable allocated pages |
 | `postgres_schema_bytes` | PostgreSQL test-schema relation storage |
 | `verify_journal_ms` | Optional forensic journal replay with `--deep-verify` |
+
+The content counts and payload lengths are collected **after timed operations**
+using a separate read-only-in-purpose SQL connection, so the cost of scanning
+the storage tables is not included in the model timings. `content_payload_bytes`
+is logical stored payload size, not filesystem allocation, PostgreSQL WAL, TOAST
+or page/index overhead. The metric does not distinguish live and unreachable
+immutable nodes. `finalized_revisions` counts mainline revisions only; the
+optional comparison fork adds one finalized revision, also reflected in
+`revision_rows` and integrity verification.
 
 These are end-to-end wall-clock observations. Results depend on the host,
 filesystem, caches, model complexity, backend and contention. Run comparable
@@ -116,6 +165,13 @@ and commit. `aowis_network_load_profile` includes membership lookup, direct
 object lookup and decoding. For a single save outside the benchmark, set
 `AOWIS_DB_PROFILE_SAVE=1` in the environment.
 
+Object-mode finalization no longer copies or deletes the complete SQL
+working model and hydraulic indexes. The `finalize` phase
+`retain_branch_working_storage` marks the metadata-only handoff; the old
+`finalize_working_transfer` and `finalize_working_cleanup` events are removed.
+The previously collected transfer/delete profiles remain useful as the
+pre-cutover PostgreSQL baseline, not as current operations.
+
 Profile timings are diagnostic and may add overhead. Some spans nest inside
 others: **do not add a parent and its child spans together**. Use unprofiled
 `finalize_ms` and `create_branch_ms` for end-to-end comparisons.
@@ -124,9 +180,9 @@ others: **do not add a parent and its child spans together**. Use unprofiled
 
 - The first finalized object-mode state builds its complete immutable root.
   Subsequent revisions can reuse unchanged content and UUID-keyed tree paths.
-- Repeated finalization transactionally hands SQL working objects and derived
-  hydraulic indexes to the successor. The handoff still handles the complete
-  working state with set-based SQL.
+- Repeated finalization seals the revision and advances the working head,
+  retaining the same branch-owned SQL objects and indexes without a full-copy
+  handoff.
 - Creating an independent branch reads the finalized model and builds its own
   working state and indexes, with structural and reference validation.
 - Historical point lookups follow the immutable snapshot index and do not
@@ -135,6 +191,12 @@ others: **do not add a parent and its child spans together**. Use unprofiled
 - PostgreSQL import and large-model reads use bounded/set-based SQL paths
   where appropriate. Driver/network overhead and server query plans remain
   measurable costs.
+
+The available instrumentation does not count every SQL statement issued by
+Qt. Repeated finalization no longer runs working-model transfer/deletion SQL;
+any remaining PostgreSQL latency must be attributed to its other profile
+phases (Merkle sealing, immutable history, publication or commit). Compare
+identical workloads rather than extrapolating from the old SQL-delete spikes.
 
 Do not infer specific latency, storage reduction or scaling guarantees without
 running an equivalent benchmark. See [Versioned storage](versioned-storage.md)

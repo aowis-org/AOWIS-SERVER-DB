@@ -25,6 +25,7 @@ const char *const statements[] = {
     uuid UUID PRIMARY KEY NOT NULL,
     project_uuid UUID NOT NULL,
     name TEXT NOT NULL,
+    working_storage_uuid UUID NOT NULL UNIQUE,
     head_revision_uuid UUID,
     created_by_uuid UUID,
     UNIQUE(project_uuid, name),
@@ -53,18 +54,18 @@ const char *const statements[] = {
     disabled_at_ms BIGINT
 ))SQL",
     R"SQL(CREATE TABLE hydraulic_network_members (
-    revision_uuid UUID NOT NULL,
+    storage_uuid UUID NOT NULL,
     network_uuid UUID NOT NULL,
     entity_uuid UUID NOT NULL,
-    PRIMARY KEY(revision_uuid,entity_uuid)
+    PRIMARY KEY(storage_uuid,entity_uuid)
 ))SQL",
     R"SQL(CREATE TABLE hydraulic_network_references (
-    revision_uuid UUID NOT NULL,
+    storage_uuid UUID NOT NULL,
     network_uuid UUID NOT NULL,
     source_uuid UUID NOT NULL,
     target_uuid UUID NOT NULL,
     field TEXT NOT NULL,
-    PRIMARY KEY(revision_uuid,network_uuid,source_uuid,target_uuid,field)
+    PRIMARY KEY(storage_uuid,network_uuid,source_uuid,target_uuid,field)
 ))SQL",
     R"SQL(CREATE TABLE object_events (
     uuid UUID PRIMARY KEY NOT NULL,
@@ -156,13 +157,13 @@ const char *const statements[] = {
     created_by_uuid UUID
 ))SQL",
     R"SQL(CREATE TABLE revision_objects (
-    revision_uuid UUID NOT NULL,
+    storage_uuid UUID NOT NULL,
     object_uuid UUID NOT NULL,
     kind TEXT NOT NULL CHECK(length(kind)>0 AND length(kind)<=128),
     content BYTEA,
     version BIGINT NOT NULL CHECK(version>=1),
     deleted BIGINT NOT NULL CHECK(deleted IN (0,1)),
-    PRIMARY KEY(revision_uuid,object_uuid),
+    PRIMARY KEY(storage_uuid,object_uuid),
     CHECK((deleted=1 AND content IS NULL) OR (deleted=0 AND content IS NOT NULL))
 ))SQL",
     R"SQL(CREATE TABLE revision_parents (
@@ -275,11 +276,11 @@ const char *const statements[] = {
     R"SQL(ALTER TABLE group_memberships ADD CONSTRAINT aowis_group_memberships_fk_2 FOREIGN KEY (user_uuid) REFERENCES users(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE group_memberships ADD CONSTRAINT aowis_group_memberships_fk_3 FOREIGN KEY (created_by_uuid) REFERENCES users(uuid))SQL",
     R"SQL(ALTER TABLE group_memberships ADD CONSTRAINT aowis_group_memberships_fk_4 FOREIGN KEY (revoked_by_uuid) REFERENCES users(uuid))SQL",
-    R"SQL(ALTER TABLE hydraulic_network_members ADD CONSTRAINT aowis_hydraulic_network_members_fk_1 FOREIGN KEY (revision_uuid) REFERENCES revisions(uuid) ON DELETE RESTRICT)SQL",
-    R"SQL(ALTER TABLE hydraulic_network_members ADD CONSTRAINT aowis_hydraulic_network_members_fk_2 FOREIGN KEY(revision_uuid,network_uuid) REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT)SQL",
-    R"SQL(ALTER TABLE hydraulic_network_members ADD CONSTRAINT aowis_hydraulic_network_members_fk_3 FOREIGN KEY(revision_uuid,entity_uuid) REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT)SQL",
-    R"SQL(ALTER TABLE hydraulic_network_references ADD CONSTRAINT aowis_hydraulic_network_references_fk_1 FOREIGN KEY (revision_uuid) REFERENCES revisions(uuid) ON DELETE RESTRICT)SQL",
-    R"SQL(ALTER TABLE hydraulic_network_references ADD CONSTRAINT aowis_hydraulic_network_references_fk_2 FOREIGN KEY(revision_uuid,network_uuid) REFERENCES revision_objects(revision_uuid,object_uuid) ON DELETE RESTRICT)SQL",
+    R"SQL(ALTER TABLE hydraulic_network_members ADD CONSTRAINT aowis_hydraulic_network_members_fk_1 FOREIGN KEY (storage_uuid) REFERENCES branches(working_storage_uuid) ON DELETE RESTRICT)SQL",
+    R"SQL(ALTER TABLE hydraulic_network_members ADD CONSTRAINT aowis_hydraulic_network_members_fk_2 FOREIGN KEY(storage_uuid,network_uuid) REFERENCES revision_objects(storage_uuid,object_uuid) ON DELETE RESTRICT)SQL",
+    R"SQL(ALTER TABLE hydraulic_network_members ADD CONSTRAINT aowis_hydraulic_network_members_fk_3 FOREIGN KEY(storage_uuid,entity_uuid) REFERENCES revision_objects(storage_uuid,object_uuid) ON DELETE RESTRICT)SQL",
+    R"SQL(ALTER TABLE hydraulic_network_references ADD CONSTRAINT aowis_hydraulic_network_references_fk_1 FOREIGN KEY (storage_uuid) REFERENCES branches(working_storage_uuid) ON DELETE RESTRICT)SQL",
+    R"SQL(ALTER TABLE hydraulic_network_references ADD CONSTRAINT aowis_hydraulic_network_references_fk_2 FOREIGN KEY(storage_uuid,network_uuid) REFERENCES revision_objects(storage_uuid,object_uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE object_events ADD CONSTRAINT aowis_object_events_fk_1 FOREIGN KEY (revision_uuid) REFERENCES revisions(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE object_events ADD CONSTRAINT aowis_object_events_fk_2 FOREIGN KEY (actor_uuid) REFERENCES users(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE object_group_events ADD CONSTRAINT aowis_object_group_events_fk_1 FOREIGN KEY (group_uuid) REFERENCES object_groups(uuid) ON DELETE RESTRICT)SQL",
@@ -295,7 +296,7 @@ const char *const statements[] = {
     R"SQL(ALTER TABLE password_recovery_tokens ADD CONSTRAINT aowis_password_recovery_tokens_fk_1 FOREIGN KEY (user_uuid) REFERENCES users(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE password_recovery_tokens ADD CONSTRAINT aowis_password_recovery_tokens_fk_2 FOREIGN KEY (issued_by_uuid) REFERENCES users(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE projects ADD CONSTRAINT aowis_projects_fk_1 FOREIGN KEY (created_by_uuid) REFERENCES users(uuid))SQL",
-    R"SQL(ALTER TABLE revision_objects ADD CONSTRAINT aowis_revision_objects_fk_1 FOREIGN KEY (revision_uuid) REFERENCES revisions(uuid) ON DELETE RESTRICT)SQL",
+    R"SQL(ALTER TABLE revision_objects ADD CONSTRAINT aowis_revision_objects_fk_1 FOREIGN KEY (storage_uuid) REFERENCES branches(working_storage_uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE revision_parents ADD CONSTRAINT aowis_revision_parents_fk_1 FOREIGN KEY (revision_uuid) REFERENCES revisions(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE revision_parents ADD CONSTRAINT aowis_revision_parents_fk_2 FOREIGN KEY (parent_revision_uuid) REFERENCES revisions(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(ALTER TABLE revisions ADD CONSTRAINT aowis_revisions_fk_1 FOREIGN KEY (created_by_uuid) REFERENCES users(uuid))SQL",
@@ -315,8 +316,8 @@ const char *const statements[] = {
     R"SQL(ALTER TABLE user_sessions ADD CONSTRAINT aowis_user_sessions_fk_2 FOREIGN KEY (created_by_uuid) REFERENCES users(uuid) ON DELETE RESTRICT)SQL",
     R"SQL(CREATE UNIQUE INDEX group_membership_active_unique
         ON group_memberships(group_uuid,user_uuid) WHERE revoked_at_ms IS NULL)SQL",
-    R"SQL(CREATE INDEX hydraulic_members_by_network ON hydraulic_network_members(revision_uuid,network_uuid))SQL",
-    R"SQL(CREATE INDEX hydraulic_references_by_target ON hydraulic_network_references(revision_uuid,target_uuid))SQL",
+    R"SQL(CREATE INDEX hydraulic_members_by_network ON hydraulic_network_members(storage_uuid,network_uuid))SQL",
+    R"SQL(CREATE INDEX hydraulic_references_by_target ON hydraulic_network_references(storage_uuid,target_uuid))SQL",
     R"SQL(CREATE INDEX object_groups_by_revision
               ON object_groups(revision_uuid,last_sequence))SQL",
     R"SQL(CREATE UNIQUE INDEX one_working_revision_per_branch
@@ -324,7 +325,7 @@ const char *const statements[] = {
     R"SQL(CREATE INDEX operation_events_by_project ON operation_events(project_uuid,occurred_at_ms))SQL",
     R"SQL(CREATE INDEX recovery_tokens_by_user ON password_recovery_tokens(user_uuid))SQL",
     R"SQL(CREATE INDEX revision_objects_by_kind
-              ON revision_objects(revision_uuid,kind,object_uuid))SQL",
+              ON revision_objects(storage_uuid,kind,object_uuid))SQL",
     R"SQL(CREATE INDEX revisions_by_project ON revisions(project_uuid))SQL",
     R"SQL(CREATE UNIQUE INDEX role_assignment_active_unique ON role_assignments (
         principal_kind,principal_uuid,role_uuid,scope_kind,COALESCE(scope_uuid::text,''))
@@ -351,6 +352,15 @@ BEGIN
 END
 $aowis$)SQL",
     R"SQL(CREATE TRIGGER branch_creator_required BEFORE INSERT ON branches FOR EACH ROW EXECUTE FUNCTION aowis_guard_branch_creator_required())SQL",
+    R"SQL(CREATE FUNCTION aowis_guard_branch_working_storage_readonly() RETURNS trigger LANGUAGE plpgsql AS $aowis$
+BEGIN
+    IF OLD.working_storage_uuid != NEW.working_storage_uuid THEN
+        RAISE EXCEPTION 'branch working storage identity is immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$aowis$)SQL",
+    R"SQL(CREATE TRIGGER branch_working_storage_readonly BEFORE UPDATE OF working_storage_uuid ON branches FOR EACH ROW EXECUTE FUNCTION aowis_guard_branch_working_storage_readonly())SQL",
     R"SQL(CREATE FUNCTION aowis_guard_branch_head_must_be_working() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
     IF NEW.head_revision_uuid IS NOT NULL AND NOT EXISTS (
@@ -397,8 +407,7 @@ $aowis$)SQL",
 BEGIN
     IF EXISTS (
         SELECT 1 FROM old_rows AS affected
-        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
-        WHERE revision.state='finalized'
+        WHERE NOT EXISTS (SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=affected.storage_uuid AND r.state='working')
     ) THEN
         RAISE EXCEPTION 'finalized network membership is immutable' USING ERRCODE = '23514';
     END IF;
@@ -415,8 +424,7 @@ $aowis$)SQL",
 BEGIN
     IF EXISTS (
         SELECT 1 FROM new_rows AS affected
-        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
-        WHERE revision.state='finalized'
+        WHERE NOT EXISTS (SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=affected.storage_uuid AND r.state='working')
     ) THEN
         RAISE EXCEPTION 'finalized network membership is immutable' USING ERRCODE = '23514';
     END IF;
@@ -433,8 +441,7 @@ $aowis$)SQL",
 BEGIN
     IF EXISTS (
         SELECT 1 FROM old_rows AS affected
-        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
-        WHERE revision.state='finalized'
+        WHERE NOT EXISTS (SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=affected.storage_uuid AND r.state='working')
     ) THEN
         RAISE EXCEPTION 'finalized hydraulic references are immutable' USING ERRCODE = '23514';
     END IF;
@@ -451,8 +458,7 @@ $aowis$)SQL",
 BEGIN
     IF EXISTS (
         SELECT 1 FROM new_rows AS affected
-        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
-        WHERE revision.state='finalized'
+        WHERE NOT EXISTS (SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=affected.storage_uuid AND r.state='working')
     ) THEN
         RAISE EXCEPTION 'finalized hydraulic references are immutable' USING ERRCODE = '23514';
     END IF;
@@ -469,8 +475,7 @@ $aowis$)SQL",
 BEGIN
     IF EXISTS (
         SELECT 1 FROM old_rows AS affected
-        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
-        WHERE revision.state='finalized'
+        WHERE NOT EXISTS (SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=affected.storage_uuid AND r.state='working')
     ) THEN
         RAISE EXCEPTION 'finalized objects are immutable' USING ERRCODE = '23514';
     END IF;
@@ -487,8 +492,7 @@ $aowis$)SQL",
 BEGIN
     IF EXISTS (
         SELECT 1 FROM new_rows AS affected
-        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
-        WHERE revision.state='finalized'
+        WHERE NOT EXISTS (SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=affected.storage_uuid AND r.state='working')
     ) THEN
         RAISE EXCEPTION 'finalized objects are immutable' USING ERRCODE = '23514';
     END IF;
@@ -505,8 +509,7 @@ $aowis$)SQL",
 BEGIN
     IF EXISTS (
         SELECT 1 FROM old_rows AS affected
-        JOIN revisions AS revision ON revision.uuid=affected.revision_uuid
-        WHERE revision.state='finalized'
+        WHERE NOT EXISTS (SELECT 1 FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE b.working_storage_uuid=affected.storage_uuid AND r.state='working')
     ) THEN
         RAISE EXCEPTION 'finalized objects are immutable' USING ERRCODE = '23514';
     END IF;
@@ -675,8 +678,8 @@ BEGIN
     -- bounded set-based INSERT avoids invoking the SQL executor separately
     -- for every model entity while retaining all row-level constraints,
     -- identity guards and foreign-key checks.
-    INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted)
-    SELECT p_revision_uuid,(incoming.value->>'object_uuid')::UUID,
+    INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted)
+    SELECT (SELECT b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=p_revision_uuid AND r.state='working'),(incoming.value->>'object_uuid')::UUID,
            incoming.value->>'kind',
            decode(incoming.value->>'content_b64', 'base64'),1,0
     FROM jsonb_array_elements(p_rows) AS incoming(value);
@@ -794,7 +797,7 @@ $aowis$)SQL",
     R"SQL(CREATE TRIGGER object_group_update_guard BEFORE UPDATE ON object_groups FOR EACH ROW EXECUTE FUNCTION aowis_guard_object_group_update_guard())SQL",
     R"SQL(CREATE FUNCTION aowis_guard_object_identity_readonly() RETURNS trigger LANGUAGE plpgsql AS $aowis$
 BEGIN
-    IF OLD.revision_uuid!=NEW.revision_uuid OR OLD.object_uuid!=NEW.object_uuid
+    IF OLD.storage_uuid!=NEW.storage_uuid OR OLD.object_uuid!=NEW.object_uuid
                  OR OLD.kind!=NEW.kind THEN
         RAISE EXCEPTION 'object identity and type are immutable' USING ERRCODE = '23514';
     END IF;
@@ -1124,6 +1127,7 @@ bool PostgresBackend::verifySchema(const QSqlDatabase &database, QString *error)
     const QStringList triggers = {
         QStringLiteral("branch_creator_required"),
         QStringLiteral("branch_head_must_be_working"),
+        QStringLiteral("branch_working_storage_readonly"),
         QStringLiteral("content_objects_no_update"),
         QStringLiteral("content_objects_no_delete"),
         QStringLiteral("finalize_actor_required"),

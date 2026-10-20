@@ -55,10 +55,12 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     REQUIRE(execute(query, error));
     query.finish();
     REQUIRE(query.prepare(QStringLiteral(
-        "INSERT INTO branches(uuid,project_uuid,name,created_by_uuid) VALUES (?,?,?,?)")));
+        "INSERT INTO branches(uuid,project_uuid,name,working_storage_uuid,created_by_uuid) "
+        "VALUES (?,?,?,?,?)")));
     query.addBindValue(backend.bindUuid(branch));
     query.addBindValue(backend.bindUuid(project));
     query.addBindValue(QStringLiteral("main"));
+    query.addBindValue(backend.bindUuid(QUuid::createUuid()));
     query.addBindValue(backend.bindUuid(actor));
     REQUIRE(execute(query, error));
     query.finish();
@@ -73,8 +75,9 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     REQUIRE(execute(query, error));
     query.finish();
     REQUIRE(query.prepare(QStringLiteral(
-        "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-        "VALUES (?,?,?,?,?,?)")));
+        "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES ((SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?,?)")));
     for (const QUuid &key : {pipe, junction})
     {
         query.bindValue(0, backend.bindUuid(revision));
@@ -158,7 +161,7 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     error.clear();
 
     REQUIRE(query.prepare(QStringLiteral(
-        "UPDATE revision_objects SET content=?,version=2 WHERE revision_uuid=? AND object_uuid=?")));
+        "UPDATE revision_objects SET content=?,version=2 WHERE storage_uuid=(SELECT b.working_storage_uuid " "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE " "r.uuid=? AND r.state='working') AND object_uuid=?")));
     query.addBindValue(QByteArray("new pipe"));
     query.addBindValue(backend.bindUuid(revision));
     query.addBindValue(backend.bindUuid(pipe));
@@ -213,8 +216,9 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     // Tombstones must be committed to the root: a delete changes content
     // without deleting the identity or throwing away its object version.
     REQUIRE(query.prepare(QStringLiteral(
-        "UPDATE revision_objects SET content=NULL,version=3,deleted=1 "
-        "WHERE revision_uuid=? AND object_uuid=?")));
+        "UPDATE revision_objects SET content=NULL,version=3,deleted=1 WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND object_uuid=?")));
     query.addBindValue(backend.bindUuid(revision));
     query.addBindValue(backend.bindUuid(pipe));
     REQUIRE(execute(query, error));
@@ -268,7 +272,7 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
 
     // Missing and extra immutable entries both invalidate a revision root.
     REQUIRE(query.prepare(QStringLiteral(
-        "DELETE FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")));
+        "DELETE FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches b JOIN " "revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working') AND object_uuid=?")));
     query.addBindValue(backend.bindUuid(revision));
     query.addBindValue(backend.bindUuid(pipe));
     REQUIRE(execute(query, error));
@@ -282,10 +286,12 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     const QUuid fork_branch = QUuid::createUuid();
     const QUuid fork_revision = QUuid::createUuid();
     REQUIRE(query.prepare(QStringLiteral(
-        "INSERT INTO branches(uuid,project_uuid,name,created_by_uuid) VALUES (?,?,?,?)")));
+        "INSERT INTO branches(uuid,project_uuid,name,working_storage_uuid,created_by_uuid) "
+        "VALUES (?,?,?,?,?)")));
     query.addBindValue(backend.bindUuid(fork_branch));
     query.addBindValue(backend.bindUuid(project));
     query.addBindValue(QStringLiteral("materialized-fork"));
+    query.addBindValue(backend.bindUuid(QUuid::createUuid()));
     query.addBindValue(backend.bindUuid(actor));
     REQUIRE(execute(query, error));
     query.finish();
@@ -334,8 +340,9 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     REQUIRE(error.contains(QStringLiteral("not empty")));
     error.clear();
     REQUIRE(query.prepare(QStringLiteral(
-        "SELECT kind,content,version,deleted FROM revision_objects "
-        "WHERE revision_uuid=? AND object_uuid=?")));
+        "SELECT kind,content,version,deleted FROM revision_objects WHERE storage_uuid=(SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working') AND object_uuid=?")));
     query.addBindValue(backend.bindUuid(fork_revision));
     query.addBindValue(backend.bindUuid(pipe));
     REQUIRE(execute(query, error));
@@ -369,8 +376,9 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     // INSERT batches and the 256-object Merkle content fetch boundaries.
     // Keep tombstones and exact versions in the reconstructed state.
     REQUIRE(query.prepare(QStringLiteral(
-        "INSERT INTO revision_objects(revision_uuid,object_uuid,kind,content,version,deleted) "
-        "VALUES (?,?,?,?,?,?)")));
+        "INSERT INTO revision_objects(storage_uuid,object_uuid,kind,content,version,deleted) VALUES ((SELECT "
+            "b.working_storage_uuid FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND "
+            "r.project_uuid=b.project_uuid WHERE r.uuid=? AND r.state='working'),?,?,?,?,?)")));
     QVector<QUuid> added;
     for (int index = 0; index < 261; ++index)
     {
@@ -392,10 +400,12 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     const QUuid large_branch = QUuid::createUuid();
     const QUuid large_revision = QUuid::createUuid();
     REQUIRE(query.prepare(QStringLiteral(
-        "INSERT INTO branches(uuid,project_uuid,name,created_by_uuid) VALUES (?,?,?,?)")));
+        "INSERT INTO branches(uuid,project_uuid,name,working_storage_uuid,created_by_uuid) "
+        "VALUES (?,?,?,?,?)")));
     query.addBindValue(backend.bindUuid(large_branch));
     query.addBindValue(backend.bindUuid(project));
     query.addBindValue(QStringLiteral("large-materialized-fork"));
+    query.addBindValue(backend.bindUuid(QUuid::createUuid()));
     query.addBindValue(backend.bindUuid(actor));
     REQUIRE(execute(query, error));
     query.finish();
@@ -414,7 +424,7 @@ bool exercise(const QSqlDatabase &database, const StorageBackend &backend, QStri
     REQUIRE(aowis::db::verifyWorkingObjectsAgainstRoot(
         database, backend, large_revision, *large_root, &error));
     REQUIRE(query.prepare(QStringLiteral(
-        "SELECT COUNT(*) FROM revision_objects WHERE revision_uuid=?")));
+        "SELECT COUNT(*) FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM branches " "b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? AND " "r.state='working')")));
     query.addBindValue(backend.bindUuid(large_revision));
     REQUIRE(execute(query, error));
     REQUIRE(query.next() && query.value(0).toInt() == 263);
@@ -460,10 +470,14 @@ int main(int argc, char **argv)
         QSqlDatabase db;
         const QString connection_name = QStringLiteral("revision-root-postgres");
         {
+            // These assertions use a fresh, transaction-local PostgreSQL schema.
+            // Do not acquire the public-schema advisory write lock: that
+            // would needlessly serialize unrelated parallel CTest fixtures.
+            // beginWrite() lock behavior is tested in backend_contract_test.
             if (!postgres.open(db, connection_name, QString::fromUtf8(pg_name), &error) ||
-                !postgres.configure(db, &error) || !postgres.beginWrite(db, &error))
+                !postgres.configure(db, &error) || !db.transaction())
             {
-                qCritical().noquote() << "PostgreSQL revision root setup:" << error;
+                qCritical().noquote() << "PostgreSQL revision root setup:" << error << db.lastError().text();
                 return 1;
             }
             QSqlQuery query(db);
@@ -475,11 +489,11 @@ int main(int argc, char **argv)
                 !exercise(db, postgres, error))
             {
                 qCritical().noquote() << "PostgreSQL revision Merkle root test:" << error;
-                postgres.rollback(db);
+                db.rollback();
                 return 1;
             }
             query = QSqlQuery();
-            postgres.rollback(db); // Drop the transaction-local test schema.
+            db.rollback(); // Drop the transaction-local test schema.
             db.close();
         }
         QSqlDatabase::removeDatabase(connection_name);

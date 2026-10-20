@@ -397,6 +397,237 @@ std::optional<QByteArray> buildRange(const QVector<BuildEntry> &items,
     return hash;
 }
 
+// Changes within one subtree are processed together, rather than writing a
+// new immutable path for every UUID. All candidate nodes are staged in memory
+// and only nodes reachable from the final root are inserted into SQL.
+struct BatchEntry
+{
+    QByteArray key;
+    std::optional<QByteArray> value;
+};
+
+struct BatchState
+{
+    const QSqlDatabase &database;
+    const QVector<BatchEntry> &changes;
+    QVector<content_store::PreparedContent> prepared;
+    QHash<QByteArray, qsizetype> prepared_index;
+    QHash<QByteArray, QByteArray> loaded_payloads;
+    QString *error;
+};
+
+std::optional<QByteArray> stageNode(BatchState &state, const Node &node,
+                                     int depth)
+{
+    if (!validShape(node, depth, depth == 0, state.error))
+        return std::nullopt;
+    content_store::PreparedContent item(content_store::Kind::Tree, encode(node));
+    const QByteArray digest = item.sha256();
+    if (!state.prepared_index.contains(digest))
+    {
+        state.prepared_index.insert(digest, state.prepared.size());
+        state.prepared.append(std::move(item));
+    }
+    return digest;
+}
+
+std::optional<Node> readBatchNode(BatchState &state, const QByteArray &hash,
+                                   int depth)
+{
+    const QHash<QByteArray, qsizetype>::const_iterator staged =
+        state.prepared_index.constFind(hash);
+    if (staged != state.prepared_index.cend())
+        return decode(state.prepared.at(staged.value()).payload(), depth,
+                      depth == 0, state.error);
+    QHash<QByteArray, QByteArray>::const_iterator cached =
+        state.loaded_payloads.constFind(hash);
+    if (cached == state.loaded_payloads.cend())
+    {
+        const std::optional<QByteArray> payload = content_store::get(
+            state.database, content_store::Kind::Tree, hash, state.error);
+        if (!payload)
+            return std::nullopt;
+        state.loaded_payloads.insert(hash, *payload);
+        cached = state.loaded_payloads.constFind(hash);
+    }
+    return decode(cached.value(), depth, depth == 0, state.error);
+}
+
+std::optional<QByteArray> buildBatchRange(BatchState &state, qsizetype begin,
+                                           qsizetype end, int depth)
+{
+    QVector<BuildEntry> entries;
+    entries.reserve(end - begin);
+    for (qsizetype i = begin; i < end; ++i)
+    {
+        const BatchEntry &change = state.changes.at(i);
+        if (change.value)
+            entries.append(BuildEntry{change.key, *change.value});
+    }
+    if (entries.isEmpty())
+        return QByteArray();
+    QVector<content_store::PreparedContent> built;
+    const std::optional<QByteArray> hash = buildRange(
+        entries, 0, entries.size(), depth, built, state.error);
+    if (!hash)
+        return std::nullopt;
+    for (content_store::PreparedContent &item : built)
+    {
+        if (!state.prepared_index.contains(item.sha256()))
+        {
+            state.prepared_index.insert(item.sha256(), state.prepared.size());
+            state.prepared.append(std::move(item));
+        }
+    }
+    return hash;
+}
+
+// Turns a branch with one remaining child into a single compressed node.
+// A child may already be staged, but it is never necessary to insert it in
+// SQL merely to compute the parent's canonical hash.
+std::optional<QByteArray> finishBatchNode(BatchState &state, Node node,
+                                           int depth)
+{
+    const int count = childrenCount(node);
+    if (count == 0)
+        return QByteArray();
+    if (count == 1)
+    {
+        const int edge = singleChildIndex(node);
+        const int child_depth = depth + node.prefix.size() + 1;
+        const std::optional<Node> child = readBatchNode(
+            state, node.children[edge], child_depth);
+        if (!child)
+            return std::nullopt;
+        Node combined = *child;
+        combined.prefix = node.prefix + QByteArray(1, static_cast<char>(edge)) +
+                          child->prefix;
+        return stageNode(state, combined, depth);
+    }
+    return stageNode(state, node, depth);
+}
+
+std::optional<QByteArray> rewriteBatchSubtree(BatchState &state,
+                                               const QByteArray &current_hash,
+                                               int depth, qsizetype begin,
+                                               qsizetype end)
+{
+    if (begin == end)
+        return current_hash;
+    if (current_hash.isEmpty())
+        return buildBatchRange(state, begin, end, depth);
+    const std::optional<Node> original = readBatchNode(state, current_hash, depth);
+    if (!original)
+        return std::nullopt;
+
+    // If inserts diverge from a compressed prefix, split exactly at the
+    // earliest divergence. Existing keys on the old edge are still processed
+    // recursively, so an insert and delete can share the same batch.
+    const int common = std::min(
+        commonPrefix(state.changes.at(begin).key, depth, original->prefix),
+        commonPrefix(state.changes.at(end - 1).key, depth, original->prefix));
+    if (common < original->prefix.size())
+    {
+        const int fork_depth = depth + common;
+        const int old_edge = static_cast<quint8>(original->prefix.at(common));
+        Node old_suffix = *original;
+        old_suffix.prefix = original->prefix.mid(common + 1);
+        const std::optional<QByteArray> old_suffix_hash = stageNode(
+            state, old_suffix, fork_depth + 1);
+        if (!old_suffix_hash)
+            return std::nullopt;
+        Node fork;
+        fork.prefix = original->prefix.left(common);
+        fork.children[old_edge] = *old_suffix_hash;
+        qsizetype cursor = begin;
+        while (cursor < end)
+        {
+            const int edge = static_cast<quint8>(
+                state.changes.at(cursor).key.at(fork_depth));
+            qsizetype next = cursor + 1;
+            while (next < end && static_cast<quint8>(
+                    state.changes.at(next).key.at(fork_depth)) == edge)
+                ++next;
+            const std::optional<QByteArray> changed = rewriteBatchSubtree(
+                state, fork.children[edge], fork_depth + 1, cursor, next);
+            if (!changed)
+                return std::nullopt;
+            fork.children[edge] = *changed;
+            cursor = next;
+        }
+        return finishBatchNode(state, std::move(fork), depth);
+    }
+
+    const int next_depth = depth + original->prefix.size();
+    if (next_depth == key_nibbles)
+    {
+        // Unique keys were checked before calling this method.
+        if (!state.changes.at(begin).value)
+            return QByteArray();
+        Node leaf_node = *original;
+        leaf_node.value = *state.changes.at(begin).value;
+        return stageNode(state, leaf_node, depth);
+    }
+    if (childrenCount(*original) == 0) // Canonical empty root.
+        return buildBatchRange(state, begin, end, depth);
+
+    Node replacement = *original;
+    qsizetype cursor = begin;
+    while (cursor < end)
+    {
+        const int edge = static_cast<quint8>(
+            state.changes.at(cursor).key.at(next_depth));
+        qsizetype next = cursor + 1;
+        while (next < end && static_cast<quint8>(
+                state.changes.at(next).key.at(next_depth)) == edge)
+            ++next;
+        const std::optional<QByteArray> changed = rewriteBatchSubtree(
+            state, replacement.children[edge], next_depth + 1, cursor, next);
+        if (!changed)
+            return std::nullopt;
+        replacement.children[edge] = *changed;
+        cursor = next;
+    }
+    return finishBatchNode(state, std::move(replacement), depth);
+}
+
+bool collectBatchReachable(BatchState &state, const QByteArray &hash,
+                            QSet<QByteArray> &visited,
+                            QVector<content_store::PreparedContent> &out)
+{
+    const QHash<QByteArray, qsizetype>::const_iterator found =
+        state.prepared_index.constFind(hash);
+    if (found == state.prepared_index.cend() || visited.contains(hash))
+        return true;
+    visited.insert(hash);
+    const content_store::PreparedContent &item = state.prepared.at(found.value());
+    // This is an encoded node created by stageNode/buildRange, with a valid
+    // canonical shape at its actual depth. The bitmap and child hashes are
+    // extracted from the staged payload without touching stored subtrees.
+    const QByteArray &bytes = item.payload();
+    int pos = header_bytes;
+    const int prefix_count = static_cast<quint8>(bytes.at(pos++));
+    pos += (prefix_count + 1) / 2;
+    const bool has_value = bytes.at(pos++) != 0;
+    if (has_value)
+        pos += hash_bytes;
+    const quint16 bitmap = static_cast<quint16>(
+        (static_cast<quint8>(bytes.at(pos)) << 8) |
+        static_cast<quint8>(bytes.at(pos + 1)));
+    pos += 2;
+    for (int edge = 0; edge < branches; ++edge)
+    {
+        if ((bitmap & (1U << edge)) == 0)
+            continue;
+        const QByteArray child = bytes.mid(pos, hash_bytes);
+        pos += hash_bytes;
+        if (!collectBatchReachable(state, child, visited, out))
+            return false;
+    }
+    out.append(item);
+    return true;
+}
+
 // Breadth-first batched traversal: at each level, fetch all referenced
 // immutable tree nodes in bounded SQL batches. This avoids a separate remote
 // PostgreSQL query for every Merkle node in a full snapshot enumeration.
@@ -473,6 +704,109 @@ bool scanBatched(const QSqlDatabase &database, const QByteArray &root,
     return true;
 }
 
+// A cursor can refer either to a real immutable tree node or to a virtual
+// position partway through its compressed prefix. Virtual positions are never
+// materialized or stored: they let two differently shaped radix trees align
+// at each UUID nibble without enumerating their unchanged leaves.
+struct DiffCursor
+{
+    QByteArray digest; // Empty means there is no subtree here.
+    Node node;
+    int node_depth = 0;
+    int prefix_consumed = 0;
+    bool loaded = false;
+};
+
+bool loadDiffCursor(const QSqlDatabase &database, DiffCursor &cursor,
+                    DiffStats *stats, QString *error)
+{
+    if (cursor.digest.isEmpty() || cursor.loaded)
+        return true;
+    const std::optional<Node> loaded = read(database, cursor.digest,
+                                             cursor.node_depth,
+                                             cursor.node_depth == 0, error);
+    if (!loaded)
+        return false;
+    cursor.node = *loaded;
+    cursor.loaded = true;
+    if (stats != nullptr)
+        ++stats->tree_nodes_loaded;
+    return true;
+}
+
+DiffCursor diffChild(const DiffCursor &cursor, int edge, int depth)
+{
+    DiffCursor child;
+    if (cursor.digest.isEmpty())
+        return child;
+    if (cursor.prefix_consumed < cursor.node.prefix.size())
+    {
+        if (static_cast<quint8>(cursor.node.prefix.at(cursor.prefix_consumed)) == edge)
+        {
+            child = cursor;
+            ++child.prefix_consumed;
+        }
+        return child;
+    }
+    child.digest = cursor.node.children[edge];
+    child.node_depth = depth + 1;
+    return child;
+}
+
+bool diffWalk(const QSqlDatabase &database, DiffCursor before, DiffCursor after,
+              QByteArray &key_path, const DifferenceVisitor &visitor,
+              DiffStats *stats, QString *error)
+{
+    if (before.digest.isEmpty() && after.digest.isEmpty())
+        return true;
+    // Both cursors represent exactly the same remaining key space. There is
+    // no need to read this subtree, let alone its model-object payloads.
+    if (!before.digest.isEmpty() && before.digest == after.digest &&
+        before.node_depth == after.node_depth &&
+        before.prefix_consumed == after.prefix_consumed)
+    {
+        if (stats != nullptr)
+            ++stats->shared_subtrees_skipped;
+        return true;
+    }
+    if (!loadDiffCursor(database, before, stats, error) ||
+        !loadDiffCursor(database, after, stats, error))
+        return false;
+
+    if (key_path.size() == key_nibbles)
+    {
+        const std::optional<QByteArray> before_value =
+            before.digest.isEmpty() ? std::nullopt : before.node.value;
+        const std::optional<QByteArray> after_value =
+            after.digest.isEmpty() ? std::nullopt : after.node.value;
+        if (before_value == after_value)
+            return true;
+        if (!visitor(Difference{packKey(key_path), before_value, after_value}))
+        {
+            setError(error, QStringLiteral("Merkle diff visitor stopped the scan"));
+            return false;
+        }
+        if (stats != nullptr)
+            ++stats->differences_emitted;
+        return true;
+    }
+
+    for (int edge = 0; edge < branches; ++edge)
+    {
+        DiffCursor left = diffChild(before, edge, key_path.size());
+        DiffCursor right = diffChild(after, edge, key_path.size());
+        if (left.digest.isEmpty() && right.digest.isEmpty())
+            continue;
+        key_path.append(static_cast<char>(edge));
+        const bool ok = diffWalk(database, std::move(left), std::move(right),
+                                  key_path, visitor, stats, error);
+        key_path.chop(1);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 } // namespace
 
 std::optional<QByteArray> emptyRoot(const QSqlDatabase &database, QString *error)
@@ -480,6 +814,44 @@ std::optional<QByteArray> emptyRoot(const QSqlDatabase &database, QString *error
     if (error != nullptr)
         error->clear();
     return save(database, Node{}, 0, true, error);
+}
+
+bool diff(const QSqlDatabase &database, const QByteArray &before_root,
+          const QByteArray &after_root, const DifferenceVisitor &visitor,
+          QString *error, DiffStats *stats)
+{
+    if (error != nullptr)
+        error->clear();
+    if (stats != nullptr)
+        *stats = DiffStats{};
+    if (!visitor)
+    {
+        setError(error, QStringLiteral("Merkle diff requires a visitor"));
+        return false;
+    }
+    if (before_root.size() != hash_bytes || after_root.size() != hash_bytes)
+    {
+        setError(error, QStringLiteral("Invalid Merkle diff root digest length"));
+        return false;
+    }
+    DiffCursor before;
+    before.digest = before_root;
+    if (!loadDiffCursor(database, before, stats, error))
+        return false;
+    if (before_root == after_root)
+    {
+        if (stats != nullptr)
+            ++stats->shared_subtrees_skipped;
+        return true;
+    }
+    DiffCursor after;
+    after.digest = after_root;
+    if (!loadDiffCursor(database, after, stats, error))
+        return false;
+    QByteArray key_path;
+    key_path.reserve(key_nibbles);
+    return diffWalk(database, std::move(before), std::move(after),
+                    key_path, visitor, stats, error);
 }
 
 std::optional<QByteArray> lookup(const QSqlDatabase &database, const QByteArray &root,
@@ -630,13 +1002,14 @@ std::optional<QByteArray> update(const QSqlDatabase &database, const QByteArray 
 std::optional<QByteArray> apply(const QSqlDatabase &database, const QByteArray &root,
                                 const QVector<Change> &changes, QString *error)
 {
+    performance_profile::PhaseTimer phases("merkle_batch_apply");
     if (error != nullptr)
         error->clear();
     QVector<Change> sorted = changes;
     std::sort(sorted.begin(), sorted.end(), [](const Change &left, const Change &right) {
         return left.key.toRfc4122() < right.key.toRfc4122();
     });
-    for (int i = 1; i < sorted.size(); ++i)
+    for (qsizetype i = 1; i < sorted.size(); ++i)
     {
         if (sorted.at(i - 1).key == sorted.at(i).key)
         {
@@ -644,18 +1017,73 @@ std::optional<QByteArray> apply(const QSqlDatabase &database, const QByteArray &
             return std::nullopt;
         }
     }
-    QByteArray current = root;
+    // Check each referenced blob once, rather than issuing one SQL lookup per
+    // modification. Content digests are verified by the content-store API.
+    QVector<QByteArray> blob_hashes;
+    QSet<QUuid> requested;
     for (const Change &change : sorted)
     {
-        const std::optional<QByteArray> next = update(database, current, change, error);
-        if (!next)
-            return std::nullopt;
-        current = *next;
+        requested.insert(change.key);
+        if (change.blob_sha256)
+            blob_hashes.append(*change.blob_sha256);
     }
-    // Even empty batches must verify the supplied root is a valid tree.
-    if (sorted.isEmpty() && !read(database, root, 0, true, error))
+    if (!content_store::getMany(database, content_store::Kind::Blob,
+                                blob_hashes, error))
         return std::nullopt;
-    return current;
+    phases.mark("validate_blobs", blob_hashes.size());
+    // lookupMany verifies the root and affected paths even for no-op changes.
+    // Suppress absent deletions and identical writes before touching a tree:
+    // they must not create any new nodes, and cannot force needless splits.
+    const std::optional<QHash<QUuid, QByteArray>> existing =
+        requested.isEmpty()
+            ? std::optional<QHash<QUuid, QByteArray>>(QHash<QUuid, QByteArray>{})
+            : lookupMany(database, root, requested, error);
+    if (!existing)
+        return std::nullopt;
+    if (requested.isEmpty() && !read(database, root, 0, true, error))
+        return std::nullopt;
+
+    QVector<BatchEntry> filtered;
+    filtered.reserve(sorted.size());
+    for (const Change &change : sorted)
+    {
+        const QHash<QUuid, QByteArray>::const_iterator found = existing->constFind(change.key);
+        if (!change.blob_sha256 && found == existing->cend())
+            continue;
+        if (change.blob_sha256 && found != existing->cend() &&
+            found.value() == *change.blob_sha256)
+            continue;
+        filtered.append(BatchEntry{unpackKey(change.key), change.blob_sha256});
+    }
+    phases.mark("lookup_and_filter_changes", filtered.size());
+    if (filtered.isEmpty())
+        return root;
+
+    BatchState state{database, filtered, {}, {}, {}, error};
+    const std::optional<QByteArray> rewritten = rewriteBatchSubtree(
+        state, root, 0, 0, filtered.size());
+    if (!rewritten)
+        return std::nullopt;
+    QByteArray result = *rewritten;
+    if (result.isEmpty())
+    {
+        const std::optional<QByteArray> empty = stageNode(state, Node{}, 0);
+        if (!empty)
+            return std::nullopt;
+        result = *empty;
+    }
+    phases.mark("build_replacement_tree", state.prepared.size());
+    QSet<QByteArray> visited;
+    QVector<content_store::PreparedContent> reachable;
+    reachable.reserve(state.prepared.size());
+    if (!collectBatchReachable(state, result, visited, reachable))
+        return std::nullopt;
+    phases.mark("select_reachable_tree_nodes", reachable.size());
+    if (!content_store::putManyPrepared(database, content_store::Kind::Tree,
+                                        reachable, error))
+        return std::nullopt;
+    phases.mark("store_reachable_tree_nodes", reachable.size());
+    return result;
 }
 
 static std::optional<QByteArray> buildImpl(const QSqlDatabase &database,

@@ -29,8 +29,9 @@ int referenceCount(const QSqlDatabase &database, const QUuid &revision,
 {
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND target_uuid=?")))
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND target_uuid=?")))
         return -1;
     query.addBindValue(revision.toRfc4122());
     query.addBindValue(target.toRfc4122());
@@ -42,8 +43,9 @@ int networkReferenceCount(const QSqlDatabase &database, const QUuid &revision,
 {
     QSqlQuery query(database);
     if (!query.prepare(QStringLiteral(
-            "SELECT COUNT(*) FROM hydraulic_network_references "
-            "WHERE revision_uuid=? AND network_uuid=?")))
+            "SELECT COUNT(*) FROM hydraulic_network_references WHERE storage_uuid=(SELECT b.working_storage_uuid "
+            "FROM branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE "
+            "r.uuid=? AND r.state='working') AND network_uuid=?")))
         return -1;
     query.addBindValue(revision.toRfc4122());
     query.addBindValue(network.toRfc4122());

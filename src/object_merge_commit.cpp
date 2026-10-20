@@ -267,7 +267,7 @@ std::optional<Finalization> Database::mergeObjectRevisions(const OperationContex
         return fail();
     QSqlQuery lookup(this->database_);
     if (!lookup.prepare(QStringLiteral(
-            "SELECT version,kind FROM revision_objects WHERE revision_uuid=? AND object_uuid=?")))
+            "SELECT version,kind FROM revision_objects WHERE storage_uuid=(SELECT b.working_storage_uuid FROM " "branches b JOIN revisions r ON r.branch_uuid=b.uuid AND r.project_uuid=b.project_uuid WHERE r.uuid=? " "AND r.state='working') AND object_uuid=?")))
     {
         setError(error, lookup.lastError().text());
         return fail();

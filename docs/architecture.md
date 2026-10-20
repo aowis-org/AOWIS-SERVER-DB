@@ -43,10 +43,11 @@ snapshot trees. Revisions share unchanged content rather than retaining
 separate historical SQL model rows. Finalized roots carry object versions and
 tombstones. Historical reads, model loading and merge inputs use these roots.
 
-Working revisions have materialized SQL rows and hydraulic membership/reference
-indexes for efficient transactional edits. Finalization hands the validated
-working state to the next working revision inside the same transaction, while
-removing SQL model/index rows from the sealed predecessor. Creating a new
+Working revisions use branch-owned SQL rows and hydraulic membership/reference
+indexes for transactional edits. All three tables are keyed by the branch's
+immutable `working_storage_uuid`. Finalization advances the revision identity
+without copying or deleting these mutable rows: the sealed predecessor is
+served from its immutable Merkle root. Creating a new
 branch instead materializes an independent working state from its finalized
 base root. See [Versioned storage](versioned-storage.md) for the canonical
 byte-level format and integrity contract.

@@ -27,8 +27,12 @@ Hydraulic networks contain typed reservoirs, junctions, tanks, pipes, pumps,
 valves, demand points, curves, patterns, controls, metadata and configuration.
 Objects have UUIDs, object kinds, expected-version counters and deletion state.
 The persistence layer maintains derived network membership and reverse-reference
-indexes for validating edits efficiently. Referenced objects cannot simply be
-removed while they remain in use; mutations are checked transactionally.
+indexes for validating edits efficiently. These editable rows are owned by
+the branch's permanent `working_storage_uuid`, not by a particular revision.
+Finalization does not rebuild or transfer them; independent branch creation
+does construct its own isolated working state from the selected finalized root.
+Referenced objects cannot simply be removed while they remain in use;
+mutations are checked transactionally.
 
 The network update path supports indexed saves and incremental object groups.
 Dependency-local checks cover structural changes to pipes and demand points,
